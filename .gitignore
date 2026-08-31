@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+checkpoints/
+outputs/
+data/vstar/images/
+data/vstar/*.parquet
+data/vision_opd/*.parquet
+
+# The nested Vision-OPD (VOPD) runtime has its own Git history.
+TMP/runtime/
+TMP/references/
+TMP/probe_experiments/outputs/

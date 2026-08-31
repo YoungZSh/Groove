@@ -1,0 +1,83 @@
+project:
+  name: mmcot-visual-seed
+  rollout_count: 8
+  mixed_groups_only: false
+
+dataset:
+  name: Vision-OPD-6K
+  source_rows: 6241
+  split_seed: 42
+  train_rows: 5928
+  test_rows: 313
+  student_image_policy: unboxed_original_images_only
+  oracle_metadata_visible_to_model: false
+
+objective:
+  grpo_scope: all_rollouts
+  opd_scope: all_rollouts_in_evidence_groups
+  reward_complement_mask: false
+  opd_loss_coef: 0.01
+  opd_gate_beta: 5.0
+
+terminal_reward:
+  answer_reward_weight: 0.9
+  format_reward_weight: 0.1
+  final_answer_format: "FINAL: X"
+
+analyzer:
+  provider: openai_compatible
+  model_env: ANALYZER_MODEL
+  base_url_env: ANALYZER_BASE_URL
+  api_key_env: ANALYZER_API_KEY
+  ground_truth_visible: false
+  temperature: 0.0
+  max_completion_tokens: 2048
+  api_retries: 5
+
+seed_aligned_training:
+  learning_rate: 1.0e-6
+  ppo_clip_ratio: 0.2
+  ppo_epochs: 1
+  entropy_coef: 0.0
+  reference_kl_coef: 0.001
+  reference_kl_type: low_var_kl
+  norm_adv_by_group_std: true
+  total_training_epochs: 1
+  full_split_steps_at_batch_2: 2964
+  pilot_training_steps: 150
+  hardware_adjusted_train_batch_size: 2
+
+grounding:
+  model: IDEA-Research/grounding-dino-base
+  max_objects: 3
+  crop_mode: per_object
+  context_margin_source: analyzer
+  min_short_side: 768
+
+teacher:
+  model_source: current_student
+  prefix: original_image_plus_focus_text_plus_independent_crops
+  interleaved_reasoning: false
+
+student:
+  prompt: original_image_only
+  thinking_mode: false
+
+memory_schedule:
+  hybrid_actor_rollout_colocation: true
+  vllm_sleep_level: 2
+  release_rollout_weights_and_kv_before_training: true
+  disable_cuda_graph_for_full_release: true
+  actor_param_cpu_offload: true
+  actor_optimizer_cpu_offload: true
+  actor_activation_cpu_offload: true
+  reference_param_cpu_offload: true
+  gradient_checkpointing: true
+  fused_lm_head: true
+  fused_adamw: true
+  per_gpu_micro_batch_size: 1
+  host_memory_cap_gib: 220
+  ray_guard_headroom_gib: 4
+  ray_usage_threshold_ceiling: 0.95
+  ray_object_store_gib: 8
+  ray_monitor_refresh_ms: 100
