@@ -1,0 +1,1271 @@
+diff --git a/verl/trainer/config/actor/actor.yaml b/verl/trainer/config/actor/actor.yaml
+index 143d055..dd53334 100644
+--- a/verl/trainer/config/actor/actor.yaml
++++ b/verl/trainer/config/actor/actor.yaml
+@@ -81,7 +81,7 @@ self_distillation:
+   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+   _target_: verl.workers.config.SelfDistillationConfig
+ 
+-  # Distillation is enabled when policy_loss.loss_mode is "vopd"
++  # Distillation is enabled when policy_loss.loss_mode is "vopd" or "visual_seed"
+ 
+   # Whether to use full-logit KL distillation
+   full_logit_distillation: True
+@@ -160,6 +160,12 @@ self_distillation:
+   # Optional directory for dumping per-step student/teacher distillation log-probs
+   log_prob_dump_dir: null
+ 
++  # Weight for SEED-style sampled-token OPD in visual_seed mode
++  opd_loss_coef: 0.01
++
++  # Sigmoid sharpness for stopgrad(log p_teacher - log p_student)
++  opd_gate_beta: 5.0
++
+   # IS clip for loss; null disables IS weighting
+   is_clip: 2
+ 
+diff --git a/verl/trainer/config/data/legacy_data.yaml b/verl/trainer/config/data/legacy_data.yaml
+index 60818f9..92fb11f 100644
+--- a/verl/trainer/config/data/legacy_data.yaml
++++ b/verl/trainer/config/data/legacy_data.yaml
+@@ -70,6 +70,9 @@ dataloader_num_workers: 8
+ # image patch size
+ image_patch_size: 14
+ 
++# Optional maximum pixel area passed to Qwen smart_resize for each student image.
++image_max_pixels: null
++
+ # Whether to shuffle the validation set.
+ validation_shuffle: False
+ 
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index 01bc6d0..908a162 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -129,7 +129,9 @@ class TaskRunner:
+         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+         self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+-        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "vopd"
++        self_distillation_needs_ref = (
++            self_distillation_cfg is not None and loss_mode in {"vopd", "visual_seed"}
++        )
+         teacher_model_source = self_distillation_cfg.get("teacher_model_source", "legacy") if self_distillation_cfg else None
+         if self_distillation_needs_ref and need_reference_policy(config) and teacher_model_source == "legacy":
+             raise ValueError(
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index fbc3472..2bb21d9 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -1082,6 +1082,117 @@ def agg_loss(
+     return loss
+ 
+ 
++def compute_seed_opd_loss(
++    student_log_probs: torch.Tensor,
++    teacher_log_probs: torch.Tensor,
++    response_mask: torch.Tensor,
++    self_distillation_mask: Optional[torch.Tensor] = None,
++    gate_beta: float = 5.0,
++    loss_agg_mode: str = "token-mean",
++    batch_num_tokens: Optional[int] = None,
++    global_batch_size: Optional[int] = None,
++    loss_scale_factor: Optional[int] = None,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Compute SEED's sampled-token, confidence-gated OPD objective.
++
++    The teacher and the sigmoid gate are stop-gradient targets.  Only the
++    student's log probability for the already sampled response token receives
++    gradients.  ``self_distillation_mask`` means "teacher evidence exists";
++    it is deliberately independent of per-rollout correctness and is *not*
++    multiplied by ``(1 - reward)``.
++    """
++    if student_log_probs.shape != teacher_log_probs.shape:
++        raise ValueError(
++            "student and teacher sampled-token log-probs must have the same shape, "
++            f"got {tuple(student_log_probs.shape)} and {tuple(teacher_log_probs.shape)}"
++        )
++    if student_log_probs.shape != response_mask.shape:
++        raise ValueError(
++            "sampled-token log-probs and response_mask must have the same shape, "
++            f"got {tuple(student_log_probs.shape)} and {tuple(response_mask.shape)}"
++        )
++    if gate_beta <= 0:
++        raise ValueError(f"gate_beta must be positive, got {gate_beta}")
++
++    loss_mask = response_mask.to(dtype=student_log_probs.dtype)
++    if self_distillation_mask is not None:
++        sample_mask = self_distillation_mask.to(
++            device=student_log_probs.device, dtype=student_log_probs.dtype
++        )
++        if sample_mask.ndim == 1:
++            if sample_mask.shape[0] != loss_mask.shape[0]:
++                raise ValueError("self_distillation_mask batch dimension does not match log-probs")
++            sample_mask = sample_mask.unsqueeze(1)
++        elif sample_mask.shape != loss_mask.shape:
++            raise ValueError(
++                "self_distillation_mask must be sample-level [B] or token-level [B,T], "
++                f"got {tuple(sample_mask.shape)}"
++            )
++        loss_mask = loss_mask * sample_mask
++
++    teacher_target = teacher_log_probs.detach()
++    teacher_gap = (teacher_target - student_log_probs.detach()).detach()
++    gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
++    loss_mat = gate * (teacher_target - student_log_probs)
++
++    active_tokens = loss_mask.sum()
++    if active_tokens.item() == 0:
++        loss = student_log_probs.sum() * 0.0
++        zero = student_log_probs.new_tensor(0.0)
++        return loss, {
++            "actor/seed_opd_active_token_ratio": zero.item(),
++            "actor/seed_opd_gate_mean": zero.item(),
++            "actor/seed_opd_gate_active_ratio": zero.item(),
++            "actor/seed_opd_teacher_gap_mean": zero.item(),
++            "actor/seed_opd_gate_std": zero.item(),
++            "actor/seed_opd_gate_p10": zero.item(),
++            "actor/seed_opd_gate_p50": zero.item(),
++            "actor/seed_opd_gate_p90": zero.item(),
++            "actor/seed_opd_teacher_gap_std": zero.item(),
++            "actor/seed_opd_teacher_gap_p10": zero.item(),
++            "actor/seed_opd_teacher_gap_p50": zero.item(),
++            "actor/seed_opd_teacher_gap_p90": zero.item(),
++            "actor/seed_opd_gate_top10_mass_fraction": zero.item(),
++        }
++
++    loss = agg_loss(
++        loss_mat=loss_mat,
++        loss_mask=loss_mask,
++        loss_agg_mode=loss_agg_mode,
++        batch_num_tokens=batch_num_tokens,
++        global_batch_size=global_batch_size,
++        loss_scale_factor=loss_scale_factor,
++    )
++    valid_gate = gate[loss_mask > 0].float()
++    valid_gap = teacher_gap[loss_mask > 0].float()
++    gate_quantiles = torch.quantile(valid_gate, valid_gate.new_tensor([0.1, 0.5, 0.9]))
++    gap_quantiles = torch.quantile(valid_gap, valid_gap.new_tensor([0.1, 0.5, 0.9]))
++    topk_count = max(1, (valid_gate.numel() + 9) // 10)
++    top10_gate_mass = torch.topk(valid_gate, k=topk_count, sorted=False).values.sum()
++    metrics = {
++        "actor/seed_opd_active_token_ratio": (loss_mask > 0).float().mean().detach().item(),
++        "actor/seed_opd_gate_mean": verl_F.masked_mean(gate, loss_mask).detach().item(),
++        "actor/seed_opd_gate_active_ratio": verl_F.masked_mean(
++            (gate > 0.5).float(), loss_mask
++        ).detach().item(),
++        "actor/seed_opd_teacher_gap_mean": verl_F.masked_mean(
++            teacher_gap, loss_mask
++        ).detach().item(),
++        "actor/seed_opd_gate_std": valid_gate.std(unbiased=False).detach().item(),
++        "actor/seed_opd_gate_p10": gate_quantiles[0].detach().item(),
++        "actor/seed_opd_gate_p50": gate_quantiles[1].detach().item(),
++        "actor/seed_opd_gate_p90": gate_quantiles[2].detach().item(),
++        "actor/seed_opd_teacher_gap_std": valid_gap.std(unbiased=False).detach().item(),
++        "actor/seed_opd_teacher_gap_p10": gap_quantiles[0].detach().item(),
++        "actor/seed_opd_teacher_gap_p50": gap_quantiles[1].detach().item(),
++        "actor/seed_opd_teacher_gap_p90": gap_quantiles[2].detach().item(),
++        "actor/seed_opd_gate_top10_mass_fraction": (
++            top10_gate_mass / valid_gate.sum().clamp_min(1e-12)
++        ).detach().item(),
++    }
++    return loss, metrics
++
++
+ def compute_self_distillation_loss(
+     student_log_probs: torch.Tensor,
+     teacher_log_probs: torch.Tensor,
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 1a0bd33..3720850 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -535,6 +535,12 @@ class RayPPOTrainer:
+             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+ 
+             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
++            if "rollout_sample_id" in batch.batch:
++                reward_extra_infos_to_dump["rollout_sample_id"] = (
++                    batch.batch["rollout_sample_id"].detach().cpu().tolist()
++                )
++            if "uid" in batch.non_tensor_batch:
++                reward_extra_infos_to_dump["uid"] = [str(value) for value in batch.non_tensor_batch["uid"]]
+             if "request_id" in batch.non_tensor_batch:
+                 reward_extra_infos_dict.setdefault(
+                     "request_id",
+@@ -712,21 +718,40 @@ class RayPPOTrainer:
+ 
+     @staticmethod
+     def _normalize_teacher_image(image: Any) -> Image.Image:
++        max_pixels = None
+         if isinstance(image, Image.Image):
+-            return image.convert("RGB")
+-        if isinstance(image, str):
++            normalized = image.convert("RGB")
++        elif isinstance(image, str):
+             with Image.open(image) as pil_image:
+-                return pil_image.convert("RGB")
+-        if isinstance(image, dict):
++                normalized = pil_image.convert("RGB")
++        elif isinstance(image, dict):
++            max_pixels = image.get("max_pixels")
+             if "image" in image:
+-                return RayPPOTrainer._normalize_teacher_image(image["image"])
+-            image_bytes = image.get("bytes", None)
+-            if image_bytes is not None:
+-                return Image.open(BytesIO(image_bytes)).convert("RGB")
+-            if "path" in image:
++                normalized = RayPPOTrainer._normalize_teacher_image(image["image"])
++            elif image.get("bytes") is not None:
++                normalized = Image.open(BytesIO(image["bytes"])).convert("RGB")
++            elif "path" in image:
+                 with Image.open(image["path"]) as pil_image:
+-                    return pil_image.convert("RGB")
+-        raise TypeError(f"Unsupported teacher image type: {type(image)}")
++                    normalized = pil_image.convert("RGB")
++            else:
++                raise TypeError(f"Unsupported teacher image dictionary: {image.keys()}")
++        else:
++            raise TypeError(f"Unsupported teacher image type: {type(image)}")
++
++        if max_pixels is None:
++            return normalized
++        try:
++            max_pixels = int(max_pixels)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"teacher image max_pixels must be an integer, got {max_pixels!r}") from exc
++        if max_pixels <= 0 or normalized.width * normalized.height <= max_pixels:
++            return normalized
++        scale = (max_pixels / (normalized.width * normalized.height)) ** 0.5
++        size = (
++            max(1, round(normalized.width * scale)),
++            max(1, round(normalized.height * scale)),
++        )
++        return normalized.resize(size, Image.Resampling.LANCZOS)
+ 
+     def _swap_images_in_messages(self, messages: list[dict], teacher_images: list[Any]) -> list[dict]:
+         teacher_messages = deepcopy(messages)
+@@ -969,6 +994,160 @@ class RayPPOTrainer:
+         )
+         return torch.cat((text_position_ids, prompt_position_ids), dim=0)
+ 
++    @staticmethod
++    def _resize_teacher_images(images: list[Image.Image], scale: float) -> list[Image.Image]:
++        """Resize multimodal teacher images by a common area scale.
++
++        Qwen-VL expands every image placeholder into a number of image tokens
++        proportional to the processed image area.  Keeping a common scale for
++        the original image and its evidence crops preserves their relative
++        resolution while allowing the complete multimodal prompt to fit the
++        reprompt budget.
++        """
++        if scale >= 0.999:
++            return images
++
++        resized: list[Image.Image] = []
++        for image in images:
++            width = max(1, round(image.width * scale))
++            height = max(1, round(image.height * scale))
++            if (width, height) == image.size:
++                resized.append(image)
++            else:
++                resized.append(image.resize((width, height), Image.Resampling.LANCZOS))
++        return resized
++
++    @staticmethod
++    def _replace_teacher_message_images(
++        messages: list[dict], images: list[Image.Image]
++    ) -> list[dict]:
++        """Return messages whose image parts refer to ``images`` in order."""
++        updated_messages = deepcopy(messages)
++        image_offset = 0
++        for message in updated_messages:
++            content = message.get("content")
++            if not isinstance(content, list):
++                continue
++            for item in content:
++                if not isinstance(item, dict) or item.get("type") != "image":
++                    continue
++                if image_offset >= len(images):
++                    raise ValueError(
++                        "Teacher image count is smaller than message image placeholders: "
++                        f"{len(images)=}, {image_offset=}"
++                    )
++                # Remove path/bytes/max_pixels metadata so the processor sees
++                # exactly the resized PIL image selected by the token budget.
++                item.pop("path", None)
++                item.pop("bytes", None)
++                item.pop("max_pixels", None)
++                item["image"] = images[image_offset]
++                image_offset += 1
++
++        if image_offset != len(images):
++            raise ValueError(
++                "Teacher image count does not match message image placeholders: "
++                f"{len(images)=}, {image_offset=}"
++            )
++        return updated_messages
++
++    def _process_teacher_multimodal_prompt(
++        self,
++        messages: list[dict],
++        prompt_images: list[Image.Image],
++        apply_kwargs: dict[str, Any],
++        max_prompt_len: int,
++    ) -> tuple[str, dict[str, torch.Tensor]]:
++        """Process a multimodal Teacher prompt without truncating image tokens.
++
++        ``ProcessorMixin`` validates that the number of image tokens in the
++        rendered text equals the number in ``input_ids``.  Tokenizer-side
++        truncation can cut an expanded image block and make that invariant
++        false.  We therefore render/process without truncation and, if the
++        complete prompt is too long, downscale all images and try again.
++        """
++        if max_prompt_len <= 0:
++            raise ValueError(f"max_prompt_len must be positive, got {max_prompt_len}")
++
++        candidate_images = list(prompt_images)
++        candidate_messages = (
++            self._replace_teacher_message_images(messages, candidate_images)
++            if candidate_images
++            else messages
++        )
++        last_prompt_len = None
++        max_attempts = 8
++
++        # There is no image-token invariant to preserve for a text-only
++        # processor call, so retain the normal tokenizer truncation behavior.
++        if not candidate_images:
++            raw_prompt = self.processor.apply_chat_template(
++                candidate_messages,
++                tokenize=False,
++                add_generation_prompt=True,
++                **apply_kwargs,
++            )
++            model_inputs = dict(
++                self.processor(
++                    text=[raw_prompt],
++                    images=None,
++                    videos=None,
++                    return_tensors="pt",
++                    truncation=True,
++                    max_length=max_prompt_len,
++                )
++            )
++            return raw_prompt, model_inputs
++
++        for attempt in range(max_attempts):
++            raw_prompt = self.processor.apply_chat_template(
++                candidate_messages,
++                tokenize=False,
++                add_generation_prompt=True,
++                **apply_kwargs,
++            )
++            model_inputs = dict(
++                self.processor(
++                    text=[raw_prompt],
++                    images=candidate_images or None,
++                    videos=None,
++                    return_tensors="pt",
++                    # Never truncate a multimodal prompt: Qwen-VL's processor
++                    # expands image placeholders before tokenizer validation.
++                    truncation=False,
++                )
++            )
++            prompt_len = int(model_inputs["input_ids"].shape[-1])
++            last_prompt_len = prompt_len
++            if prompt_len <= max_prompt_len:
++                return raw_prompt, model_inputs
++
++            if not candidate_images:
++                raise ValueError(
++                    "Teacher prompt exceeds max_prompt_len without images: "
++                    f"{prompt_len} > {max_prompt_len}"
++                )
++
++            # Image-token count is approximately proportional to image area.
++            # Leave a small margin for processor rounding to patch grids and
++            # rerender the chat template after each resize so its image-token
++            # placeholders and image_grid_thw stay synchronized.
++            scale = (max_prompt_len / prompt_len) ** 0.5 * 0.97
++            scale = min(scale, 0.90)
++            next_images = self._resize_teacher_images(candidate_images, scale)
++            if all(next_image.size == image.size for next_image, image in zip(next_images, candidate_images)):
++                break
++            candidate_images = next_images
++            candidate_messages = self._replace_teacher_message_images(
++                messages,
++                candidate_images,
++            )
++
++        raise ValueError(
++            "Teacher multimodal prompt still exceeds max_prompt_len after safe image resizing: "
++            f"{last_prompt_len} > {max_prompt_len}"
++        )
++
+     def _build_teacher_prompt_inputs(
+         self,
+         messages: list[dict],
+@@ -978,25 +1157,15 @@ class RayPPOTrainer:
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict[str, torch.Tensor]]]:
+         apply_kwargs = dict(self.config.data.apply_chat_template_kwargs or {})
+         processing_class = self.processor or self.tokenizer
+-        raw_prompt = processing_class.apply_chat_template(
+-            messages,
+-            tokenize=False,
+-            add_generation_prompt=True,
+-            **apply_kwargs,
+-        )
+ 
+         teacher_multi_modal_inputs = None
+         if self.processor is not None:
+             prompt_images = self._extract_images_from_messages(messages)
+-            model_inputs = dict(
+-                self.processor(
+-                    text=[raw_prompt],
+-                    images=prompt_images or None,
+-                    videos=None,
+-                    return_tensors="pt",
+-                    truncation=True,
+-                    max_length=max_prompt_len,
+-                )
++            raw_prompt, model_inputs = self._process_teacher_multimodal_prompt(
++                messages,
++                prompt_images,
++                apply_kwargs,
++                max_prompt_len,
+             )
+             teacher_multi_modal_inputs = model_inputs.copy()
+             prompt_input_ids = teacher_multi_modal_inputs.pop("input_ids").squeeze(0)
+@@ -1065,6 +1234,12 @@ class RayPPOTrainer:
+             else:
+                 prompt_position_ids = compute_position_id_with_mask(prompt_attention_mask.unsqueeze(0)).squeeze(0)
+         else:
++            raw_prompt = processing_class.apply_chat_template(
++                messages,
++                tokenize=False,
++                add_generation_prompt=True,
++                **apply_kwargs,
++            )
+             teacher_prompt = self.tokenizer.apply_chat_template(
+                 messages,
+                 tokenize=True,
+@@ -1142,7 +1317,7 @@ class RayPPOTrainer:
+     ) -> Optional[tuple[DataProto, dict[str, float]]]:
+         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+-        if self_distillation_cfg is None or loss_mode != "vopd":
++        if self_distillation_cfg is None or loss_mode not in {"vopd", "visual_seed"}:
+             return None
+ 
+         device = batch.batch["input_ids"].device
+@@ -2404,6 +2579,11 @@ class RayPPOTrainer:
+                     # repeat to align with repeated responses in rollout
+                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                     batch = batch.union(gen_batch_output)
++                    # Stable step-local identifier used to join rollout JSONL
++                    # records with per-rank OPD token dumps after DP balancing.
++                    batch.batch["rollout_sample_id"] = torch.arange(
++                        len(batch), device=batch.batch["responses"].device, dtype=torch.long
++                    )
+ 
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
+diff --git a/verl/utils/activation_offload.py b/verl/utils/activation_offload.py
+index 2358b8c..31dc884 100644
+--- a/verl/utils/activation_offload.py
++++ b/verl/utils/activation_offload.py
+@@ -327,7 +327,14 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
+ 
+         # Window map data structure helps us synchronize based on number
+         # of layers offloaded
+-        if self.layer_window_map[self.offloaded_group_count] == current_group:
++        # Qwen3.5's multimodal forward can emit one final group-commit after
++        # all transformer-layer groups have been scheduled.  It has no
++        # corresponding offload window; treating it as one caused an out of
++        # range lookup (`KeyError: 55`) in visual Teacher batches.
++        if (
++            self.offloaded_group_count < self.num_offload_group
++            and self.layer_window_map[self.offloaded_group_count] == current_group
++        ):
+             # Stream synchronization both ways
+             self.d2h_stream.wait_stream(get_torch_device().current_stream())
+             get_torch_device().current_stream().wait_stream(self.d2h_stream)
+@@ -378,7 +385,10 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
+         assert self.current_group >= 0
+ 
+         # Layer window data structure helps us to reload at right times
+-        if self.layer_window_map[self.offloaded_group_count - 1] == self.current_group:
++        if (
++            self.offloaded_group_count > 0
++            and self.layer_window_map[self.offloaded_group_count - 1] == self.current_group
++        ):
+             # Stream synchronization both ways
+             self.h2d_stream.wait_stream(get_torch_device().current_stream())
+             get_torch_device().current_stream().wait_stream(self.h2d_stream)
+@@ -398,9 +408,14 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
+ def get_activation_offload_context(
+     num_layers: int = 1, model_layers: int = 1, tensor_need_offloading_checker=(lambda t: True)
+ ):
+-    cpu_offload_handler = AsyncDoubleBufferGroupOffloadHandler(
++    # Qwen3.5 interleaves DeltaNet, full-attention and vision blocks.  Its
++    # checkpoint graph can contain an extra final group, which violates the
++    # async prefetch handler's fixed layer-window bookkeeping.  The synchronous
++    # handler offloads/reloads each saved tensor directly, avoiding that group
++    # assumption while preserving the exact activation values.
++    del model_layers
++    cpu_offload_handler = SynchronizedGroupOffloadHandler(
+         num_offload_group=num_layers,
+-        num_model_group=model_layers,
+         tensor_need_offloading_checker=tensor_need_offloading_checker,
+     )
+ 
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index 2bd57d9..7d2d14c 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -134,14 +134,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             if self.should_load_model:
+                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                 local_model_path = copy_to_local(remote_model_path)
+-                model_state_dict = torch.load(local_model_path, weights_only=False)
++                # Checkpoints may have CUDA-backed storages.  Loading them to the
++                # active training device first transiently duplicates the full
++                # model beside FSDP/vLLM and can OOM before FSDP consumes it.
++                model_state_dict = torch.load(local_model_path, map_location="cpu", weights_only=False)
+                 self.model.load_state_dict(model_state_dict)
+                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
+ 
+             if self.should_load_optimizer:
+                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+                 local_optim_path = copy_to_local(remote_optim_path)
+-                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
++                optimizer_state_dict = torch.load(local_optim_path, map_location="cpu", weights_only=False)
+                 self.optimizer.load_state_dict(optimizer_state_dict)
+                 log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+ 
+@@ -150,7 +153,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+                 local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
+             )
+             local_extra_state_path = copy_to_local(remote_extra_state_path)
+-            extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
++            extra_state_dict = torch.load(local_extra_state_path, map_location="cpu", weights_only=False)
+             # recover random state
+             if "rng" in extra_state_dict:
+                 # 'rng' may not exist for backward compatibility
+diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
+index 52fa4ee..467df44 100644
+--- a/verl/utils/dataset/rl_dataset.py
++++ b/verl/utils/dataset/rl_dataset.py
+@@ -107,6 +107,11 @@ class RLHFDataset(Dataset):
+         self.image_key = config.get("image_key", "images")
+         self.video_key = config.get("video_key", "videos")
+         self.image_patch_size = config.get("image_patch_size", 14)
++        self.image_max_pixels = config.get("image_max_pixels", None)
++        if self.image_max_pixels is not None:
++            self.image_max_pixels = int(self.image_max_pixels)
++            if self.image_max_pixels <= 0:
++                raise ValueError("data.image_max_pixels must be positive when provided")
+         self.max_prompt_length = config.get("max_prompt_length", 1024)
+         self.return_raw_chat = config.get("return_raw_chat", False)
+         self.return_full_prompt = config.get("return_full_prompt", False)
+@@ -204,7 +209,11 @@ class RLHFDataset(Dataset):
+                         )
+                         if image_key in doc and doc[image_key]:
+                             images = [
+-                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
++                                process_image(
++                                    self._with_image_limits(image),
++                                    image_patch_size=self.image_patch_size,
++                                )
++                                for image in doc[image_key]
+                             ]
+                         else:
+                             images = None
+@@ -321,7 +330,7 @@ class RLHFDataset(Dataset):
+                         image = image.convert("RGB")
+                         content_list.append({"type": "image", "image": image})
+                     elif isinstance(image, dict):
+-                        image = dict(image)
++                        image = self._with_image_limits(image)
+                         image_bytes = image.get("bytes", None)
+                         if image_bytes is not None:
+                             image["image"] = Image.open(BytesIO(image_bytes))
+@@ -343,6 +352,14 @@ class RLHFDataset(Dataset):
+         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
+         return messages
+ 
++    def _with_image_limits(self, image: dict | Image.Image) -> dict | Image.Image:
++        """Attach Qwen smart-resize limits without modifying source dataset rows."""
++        if isinstance(image, Image.Image) or self.image_max_pixels is None:
++            return image
++        limited = dict(image)
++        limited.setdefault("max_pixels", self.image_max_pixels)
++        return limited
++
+     def __getitem__(self, item):
+         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
+         row_dict: dict = self.dataframe[item]
+diff --git a/verl/utils/fsdp_utils.py b/verl/utils/fsdp_utils.py
+index 071ae24..e8a711e 100644
+--- a/verl/utils/fsdp_utils.py
++++ b/verl/utils/fsdp_utils.py
+@@ -551,6 +551,11 @@ def apply_fsdp2(model, fsdp_kwargs, config):
+ 
+     if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
+         fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
++    elif isinstance(fsdp_transformer_layer_cls_to_wrap, set):
++        # Qwen3.5's FSDP wrap-policy helper returns a set of class names.
++        # FSDP2 only needs membership checks, so normalize it before the
++        # legacy first-element sanity check below.
++        fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
+ 
+     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
+ 
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index 1d22b58..c3a8f21 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -30,7 +30,13 @@ from torch.distributed.tensor import DTensor
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl import DataProto
+-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
++from verl.trainer.ppo.core_algos import (
++    agg_loss,
++    compute_seed_opd_loss,
++    compute_self_distillation_loss,
++    get_policy_loss_fn,
++    kl_penalty,
++)
+ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+ from verl.utils.device import get_device_id, get_device_name
+ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+@@ -134,7 +140,7 @@ class DataParallelPPOActor(BasePPOActor):
+     def _update_teacher(self) -> None:
+         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+-        if not self_distillation_cfg or loss_mode != "vopd":
++        if not self_distillation_cfg or loss_mode not in {"vopd", "visual_seed"}:
+             return
+         teacher_model_source = getattr(self_distillation_cfg, "teacher_model_source", "legacy")
+         if teacher_model_source != "legacy":
+@@ -278,18 +284,38 @@ class DataParallelPPOActor(BasePPOActor):
+         os.makedirs(save_dir, exist_ok=True)
+         save_path = os.path.join(save_dir, f"{int(global_step)}.rank{rank}.pt")
+ 
+-        student_log_probs = torch.cat([chunk["student_log_probs"] for chunk in dump_chunks], dim=0)
+-        teacher_log_probs = torch.cat([chunk["teacher_log_probs"] for chunk in dump_chunks], dim=0)
++        tensor_keys = (
++            "student_log_probs",
++            "teacher_log_probs",
++            "token_ids",
++            "response_positions",
++            "sample_ids",
++            "outcomes",
++            "advantages",
++            "teacher_gaps",
++            "gates",
++            "opd_gradient_weights",
++            "rollout_log_probs",
++            "ref_log_probs",
++        )
++        tensors = {
++            key: torch.cat([chunk[key] for chunk in dump_chunks if key in chunk], dim=0)
++            for key in tensor_keys
++            if any(key in chunk for chunk in dump_chunks)
++        }
++        student_log_probs = tensors["student_log_probs"]
++        teacher_log_probs = tensors["teacher_log_probs"]
+ 
+         torch.save(
+             {
+-                "student_log_probs": student_log_probs,
+-                "teacher_log_probs": teacher_log_probs,
++                **tensors,
+                 "global_step": int(global_step),
+                 "rank": rank,
+                 "experiment_name": experiment_name,
+                 "distribution_size": int(student_log_probs.shape[-1]),
+                 "num_valid_tokens": int(student_log_probs.shape[0]),
++                "num_samples": sum(int(chunk["num_samples"]) for chunk in dump_chunks),
++                "gate_beta": float(self_distillation_cfg.get("opd_gate_beta", 5.0)),
+                 "distillation_topk": self_distillation_cfg.get("distillation_topk", None),
+                 "distillation_add_tail": bool(self_distillation_cfg.get("distillation_add_tail", False)),
+             },
+@@ -851,7 +877,9 @@ class DataParallelPPOActor(BasePPOActor):
+         pad_token_id = data.meta_info.get("pad_token_id", 0)
+         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+ 
+-        self_distillation_enabled = loss_mode == "vopd"
++        is_vopd = loss_mode == "vopd"
++        is_visual_seed = loss_mode == "visual_seed"
++        self_distillation_enabled = is_vopd or is_visual_seed
+         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+         if self_distillation_enabled:
+             if self_distillation_cfg is None:
+@@ -881,6 +909,10 @@ class DataParallelPPOActor(BasePPOActor):
+             select_keys.append("ref_log_prob")
+         if self_distillation_enabled:
+             select_keys.extend(list(self_distillation_required_keys))
++        if is_visual_seed and "visual_seed_outcome" in data.batch.keys():
++            select_keys.append("visual_seed_outcome")
++        if is_visual_seed and "rollout_sample_id" in data.batch.keys():
++            select_keys.append("rollout_sample_id")
+         # Include pre-computed IS weights if present in batch
+         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+         if "rollout_is_weights" in data.batch.keys():
+@@ -917,8 +949,12 @@ class DataParallelPPOActor(BasePPOActor):
+         }
+         if self_distillation_enabled:
+             metrics["actor/grpo_loss"] = 0.0
+-            metrics["actor/vopd_loss"] = 0.0
+-            metrics["actor/vopd_loss_weighted"] = 0.0
++            if is_vopd:
++                metrics["actor/vopd_loss"] = 0.0
++                metrics["actor/vopd_loss_weighted"] = 0.0
++            else:
++                metrics["actor/seed_opd_loss"] = 0.0
++                metrics["actor/seed_opd_loss_weighted"] = 0.0
+         distill_dump_chunks = []
+         stage_wall_time_totals = None
+         if self_distillation_enabled:
+@@ -929,6 +965,7 @@ class DataParallelPPOActor(BasePPOActor):
+                 "timing_s/update_actor/backward": 0.0,
+                 "timing_s/update_actor/optimizer_step": 0.0,
+                 "timing_s/update_actor/teacher_ema_update": 0.0,
++                "timing_s/update_actor/opd_token_dump": 0.0,
+             }
+         did_update = False
+         for _ in range(self.config.ppo_epochs):
+@@ -958,7 +995,7 @@ class DataParallelPPOActor(BasePPOActor):
+                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                     policy_fallback_mask = None
+-                    if self_distillation_enabled and self_distillation_mask is not None:
++                    if is_vopd and self_distillation_mask is not None:
+                         policy_fallback_mask = (self_distillation_mask <= 0.5).to(response_mask.dtype)
+                         micro_batch_metrics["actor/policy_fallback_fraction"] = (
+                             policy_fallback_mask.float().mean().detach().item()
+@@ -975,8 +1012,16 @@ class DataParallelPPOActor(BasePPOActor):
+                     if use_trust_region_teacher and self.use_fused_kernels:
+                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                     # all return: (bsz, response_length)
+-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
+-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
++                    return_all_logps = (
++                        is_vopd
++                        and self_distillation_cfg.full_logit_distillation
++                        and not self_distillation_cfg.distillation_topk
++                    )
++                    distill_topk = (
++                        self_distillation_cfg.distillation_topk
++                        if is_vopd and self_distillation_cfg.full_logit_distillation
++                        else None
++                    )
+                     student_forward_start = time.perf_counter()
+                     outputs = self._forward_micro_batch(
+                         model_inputs,
+@@ -1041,7 +1086,10 @@ class DataParallelPPOActor(BasePPOActor):
+                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                         if self_distillation_cfg.get("log_prob_dump_dir", None):
+-                            if distill_topk:
++                            if is_visual_seed:
++                                student_distill_log_probs = log_prob
++                                teacher_distill_log_probs = teacher_log_prob
++                            elif distill_topk:
+                                 student_distill_log_probs = student_topk_logps
+                                 teacher_distill_log_probs = teacher_topk_logps
+                                 if self_distillation_cfg.distillation_add_tail:
+@@ -1059,58 +1107,203 @@ class DataParallelPPOActor(BasePPOActor):
+                                 loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+                             valid_rows = loss_mask > 0
+                             if valid_rows.any():
+-                                distill_dump_chunks.append(
+-                                    {
+-                                        "student_log_probs": student_distill_log_probs[valid_rows].detach().cpu().to(torch.float32),
+-                                        "teacher_log_probs": teacher_distill_log_probs[valid_rows].detach().cpu().to(torch.float32),
+-                                    }
++                                num_samples = int(valid_rows.shape[0])
++                                response_positions = torch.arange(
++                                    valid_rows.shape[1], device=valid_rows.device, dtype=torch.long
++                                ).unsqueeze(0).expand_as(valid_rows)
++                                stable_ids = model_inputs.get("rollout_sample_id")
++                                if stable_ids is None:
++                                    sample_offset = sum(int(chunk["num_samples"]) for chunk in distill_dump_chunks)
++                                    stable_ids = torch.arange(
++                                        num_samples, device=valid_rows.device, dtype=torch.long
++                                    ) + sample_offset
++                                sample_ids = stable_ids.to(valid_rows.device).reshape(-1, 1).expand_as(valid_rows)
++                                teacher_gap_dump = (
++                                    teacher_distill_log_probs.detach() - student_distill_log_probs.detach()
++                                )
++                                gate_dump = torch.sigmoid(
++                                    float(self_distillation_cfg.opd_gate_beta) * teacher_gap_dump
+                                 )
++                                dump_chunk = {
++                                    "student_log_probs": student_distill_log_probs[valid_rows]
++                                    .detach()
++                                    .cpu()
++                                    .to(torch.float32),
++                                    "teacher_log_probs": teacher_distill_log_probs[valid_rows]
++                                    .detach()
++                                    .cpu()
++                                    .to(torch.float32),
++                                    "token_ids": model_inputs["responses"][valid_rows].detach().cpu().to(torch.long),
++                                    "response_positions": response_positions[valid_rows].detach().cpu(),
++                                    "sample_ids": sample_ids[valid_rows].detach().cpu(),
++                                    "teacher_gaps": teacher_gap_dump[valid_rows].detach().cpu().to(torch.float32),
++                                    "gates": gate_dump[valid_rows].detach().cpu().to(torch.float32),
++                                    "opd_gradient_weights": (
++                                        float(self_distillation_cfg.opd_loss_coef) * gate_dump[valid_rows]
++                                    ).detach().cpu().to(torch.float32),
++                                    "num_samples": num_samples,
++                                }
++                                rollout_log_probs = model_inputs.get("rollout_log_probs")
++                                if rollout_log_probs is not None:
++                                    dump_chunk["rollout_log_probs"] = (
++                                        rollout_log_probs[valid_rows].detach().cpu().to(torch.float32)
++                                    )
++                                ref_log_probs = model_inputs.get("ref_log_prob")
++                                if ref_log_probs is not None:
++                                    dump_chunk["ref_log_probs"] = (
++                                        ref_log_probs[valid_rows].detach().cpu().to(torch.float32)
++                                    )
++                                outcome = model_inputs.get("visual_seed_outcome")
++                                if outcome is not None:
++                                    outcome_tokens = outcome.to(valid_rows.device).reshape(-1, 1).expand_as(valid_rows)
++                                    dump_chunk["outcomes"] = outcome_tokens[valid_rows].detach().cpu().to(torch.float32)
++                                if advantages is not None and advantages.shape == valid_rows.shape:
++                                    dump_chunk["advantages"] = advantages[valid_rows].detach().cpu().to(torch.float32)
++                                distill_dump_chunks.append(dump_chunk)
+                         loss_compute_start = time.perf_counter()
+-                        vopd_loss, vopd_metrics = compute_self_distillation_loss(
+-                            student_log_probs=log_prob,
+-                            teacher_log_probs=teacher_log_prob,
+-                            response_mask=response_mask,
+-                            self_distillation_config=self_distillation_cfg,
+-                            old_log_probs=old_log_prob,
+-                            student_all_log_probs=student_all_logps,
+-                            teacher_all_log_probs=teacher_all_logps,
+-                            student_topk_log_probs=student_topk_logps,
+-                            teacher_topk_log_probs=teacher_topk_logps,
+-                            self_distillation_mask=self_distillation_mask,
+-                            loss_agg_mode=loss_agg_mode,
+-                            rollout_is_weights=rollout_is_weights,
+-                            batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
+-                            global_batch_size=self.config.global_batch_info.get("global_batch_size"),
+-                            loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
+-                        )
+-                        loss_compute_time = time.perf_counter() - loss_compute_start
+-                        stage_wall_time_totals["timing_s/update_actor/loss_compute"] += loss_compute_time
+-
+-                        vopd_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+-                        micro_batch_metrics.update(vopd_metrics)
+-
+-                        if policy_fallback_mask is not None and policy_fallback_mask.any().item():
++                        if is_visual_seed:
+                             if advantages is None:
+-                                raise ValueError(
+-                                    "Mixed SDPO/GRPO fallback requires advantages for samples without teacher images."
+-                                )
++                                raise ValueError("visual_seed requires GRPO advantages for every rollout.")
+                             policy_loss_fn = get_policy_loss_fn("vanilla")
+                             grpo_loss, grpo_metrics = policy_loss_fn(
+                                 old_log_prob=old_log_prob,
+                                 log_prob=log_prob,
+                                 advantages=advantages,
+-                                response_mask=response_mask * policy_fallback_mask.unsqueeze(1),
++                                response_mask=response_mask,
+                                 loss_agg_mode=loss_agg_mode,
+                                 config=self.config,
+                                 rollout_is_weights=rollout_is_weights,
+                             )
+-                            pg_loss = vopd_loss + grpo_loss
+-                            micro_batch_metrics.update(
+-                                {f"actor/policy_fallback/{key.split('/', 1)[1]}": value for key, value in grpo_metrics.items()}
++                            seed_opd_loss, seed_opd_metrics = compute_seed_opd_loss(
++                                student_log_probs=log_prob,
++                                teacher_log_probs=teacher_log_prob,
++                                response_mask=response_mask,
++                                self_distillation_mask=self_distillation_mask,
++                                gate_beta=self_distillation_cfg.opd_gate_beta,
++                                loss_agg_mode=loss_agg_mode,
++                            )
++                            opd_coef = float(self_distillation_cfg.opd_loss_coef)
++                            pg_loss = grpo_loss + opd_coef * seed_opd_loss
++                            micro_batch_metrics.update(grpo_metrics)
++                            micro_batch_metrics.update(seed_opd_metrics)
++                            micro_batch_metrics["actor/seed_opd_coef"] = opd_coef
++                            micro_batch_metrics["actor/seed_opd_to_abs_grpo_loss_ratio"] = (
++                                (opd_coef * seed_opd_loss.detach().abs())
++                                / grpo_loss.detach().abs().clamp_min(1e-8)
++                            ).item()
++                            credit_mask = response_mask.to(log_prob.dtype)
++                            if self_distillation_mask is not None:
++                                credit_mask = credit_mask * self_distillation_mask.unsqueeze(1).to(log_prob.dtype)
++                            credit_valid = credit_mask > 0
++                            if credit_valid.any():
++                                credit_gap = teacher_log_prob.detach() - log_prob.detach()
++                                credit_gate = torch.sigmoid(
++                                    float(self_distillation_cfg.opd_gate_beta) * credit_gap
++                                )
++                                valid_gate = credit_gate[credit_valid].float()
++                                valid_advantage = advantages.detach()[credit_valid].float()
++                                gate_mass = valid_gate.sum().clamp_min(1e-12)
++                                gate_rms = torch.sqrt(torch.mean(valid_gate.square()))
++                                advantage_rms = torch.sqrt(torch.mean(valid_advantage.square())).clamp_min(1e-12)
++                                alignment_denom = (
++                                    torch.linalg.vector_norm(valid_gate)
++                                    * torch.linalg.vector_norm(valid_advantage)
++                                ).clamp_min(1e-12)
++                                micro_batch_metrics.update(
++                                    {
++                                        "actor/seed_opd_gradient_rms_proxy": (opd_coef * gate_rms).item(),
++                                        "actor/grpo_gradient_rms_proxy": advantage_rms.item(),
++                                        "actor/seed_opd_to_grpo_gradient_rms_ratio": (
++                                            opd_coef * gate_rms / advantage_rms
++                                        ).item(),
++                                        "actor/seed_opd_grpo_logp_gradient_cosine": (
++                                            torch.dot(valid_gate, valid_advantage) / alignment_denom
++                                        ).item(),
++                                        "actor/seed_opd_mass_positive_advantage_fraction": (
++                                            valid_gate[valid_advantage > 0].sum() / gate_mass
++                                        ).item(),
++                                        "actor/seed_opd_mass_negative_advantage_fraction": (
++                                            valid_gate[valid_advantage < 0].sum() / gate_mass
++                                        ).item(),
++                                    }
++                                )
++                            micro_batch_metrics["self_distillation/empty_target_batch"] = (
++                                self_distillation_mask.sum().item() == 0
+                             )
++                            outcome = model_inputs.get("visual_seed_outcome")
++                            if outcome is not None:
++                                detached_gap = teacher_log_prob.detach() - log_prob.detach()
++                                detached_gate = torch.sigmoid(
++                                    float(self_distillation_cfg.opd_gate_beta) * detached_gap
++                                )
++                                probability_ratio = torch.exp(detached_gap.clamp(min=-20.0, max=20.0))
++                                evidence_mask = self_distillation_mask.to(response_mask.dtype)
++                                for outcome_name, outcome_value in (("correct", 1.0), ("incorrect", 0.0)):
++                                    sample_mask = (
++                                        (outcome == outcome_value).to(response_mask.dtype) * evidence_mask
++                                    )
++                                    token_mask = response_mask * sample_mask.unsqueeze(1)
++                                    if token_mask.sum().item() > 0:
++                                        micro_batch_metrics[
++                                            f"actor/seed_opd_teacher_gap_{outcome_name}"
++                                        ] = verl_F.masked_mean(detached_gap, token_mask).item()
++                                        micro_batch_metrics[
++                                            f"actor/seed_opd_probability_ratio_{outcome_name}"
++                                        ] = verl_F.masked_mean(probability_ratio, token_mask).item()
++                                        micro_batch_metrics[
++                                            f"actor/seed_opd_gate_mean_{outcome_name}"
++                                        ] = verl_F.masked_mean(detached_gate, token_mask).item()
++                            vopd_loss = None
+                         else:
+-                            grpo_loss = None
+-                            pg_loss = vopd_loss
++                            vopd_loss, vopd_metrics = compute_self_distillation_loss(
++                                student_log_probs=log_prob,
++                                teacher_log_probs=teacher_log_prob,
++                                response_mask=response_mask,
++                                self_distillation_config=self_distillation_cfg,
++                                old_log_probs=old_log_prob,
++                                student_all_log_probs=student_all_logps,
++                                teacher_all_log_probs=teacher_all_logps,
++                                student_topk_log_probs=student_topk_logps,
++                                teacher_topk_log_probs=teacher_topk_logps,
++                                self_distillation_mask=self_distillation_mask,
++                                loss_agg_mode=loss_agg_mode,
++                                rollout_is_weights=rollout_is_weights,
++                                batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
++                                global_batch_size=self.config.global_batch_info.get("global_batch_size"),
++                                loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
++                            )
++                            vopd_metrics["self_distillation/empty_target_batch"] = (
++                                self_distillation_mask.sum().item() == 0
++                            )
++                            micro_batch_metrics.update(vopd_metrics)
++
++                            if policy_fallback_mask is not None and policy_fallback_mask.any().item():
++                                if advantages is None:
++                                    raise ValueError(
++                                        "Mixed SDPO/GRPO fallback requires advantages for samples without teacher images."
++                                    )
++                                policy_loss_fn = get_policy_loss_fn("vanilla")
++                                grpo_loss, grpo_metrics = policy_loss_fn(
++                                    old_log_prob=old_log_prob,
++                                    log_prob=log_prob,
++                                    advantages=advantages,
++                                    response_mask=response_mask * policy_fallback_mask.unsqueeze(1),
++                                    loss_agg_mode=loss_agg_mode,
++                                    config=self.config,
++                                    rollout_is_weights=rollout_is_weights,
++                                )
++                                pg_loss = vopd_loss + grpo_loss
++                                micro_batch_metrics.update(
++                                    {
++                                        f"actor/policy_fallback/{key.split('/', 1)[1]}": value
++                                        for key, value in grpo_metrics.items()
++                                    }
++                                )
++                            else:
++                                grpo_loss = None
++                                pg_loss = vopd_loss
++                        loss_compute_time = time.perf_counter() - loss_compute_start
++                        stage_wall_time_totals["timing_s/update_actor/loss_compute"] += loss_compute_time
+                     else:
+                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+@@ -1160,6 +1353,11 @@ class DataParallelPPOActor(BasePPOActor):
+                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
++                        micro_batch_metrics["actor/kl_loss_weighted"] = (
++                            kl_loss.detach() * self.config.kl_loss_coef
++                        ).item()
++
++                    micro_batch_metrics["actor/policy_loss_total"] = policy_loss.detach().item()
+ 
+                     if self.config.use_dynamic_bsz:
+                         # relative to the dynamic bsz
+@@ -1177,8 +1375,18 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                     if self_distillation_enabled:
+-                        metrics["actor/vopd_loss"] += vopd_loss.detach().item() * loss_scale_factor
+-                        metrics["actor/vopd_loss_weighted"] += vopd_loss.detach().item() * loss_scale_factor
++                        if is_visual_seed:
++                            metrics["actor/seed_opd_loss"] += (
++                                seed_opd_loss.detach().item() * loss_scale_factor
++                            )
++                            metrics["actor/seed_opd_loss_weighted"] += (
++                                self_distillation_cfg.opd_loss_coef
++                                * seed_opd_loss.detach().item()
++                                * loss_scale_factor
++                            )
++                        else:
++                            metrics["actor/vopd_loss"] += vopd_loss.detach().item() * loss_scale_factor
++                            metrics["actor/vopd_loss_weighted"] += vopd_loss.detach().item() * loss_scale_factor
+                         if grpo_loss is not None:
+                             metrics["actor/grpo_loss"] += grpo_loss.detach().item() * loss_scale_factor
+                     append_to_dict(metrics, micro_batch_metrics)
+@@ -1195,11 +1403,13 @@ class DataParallelPPOActor(BasePPOActor):
+                 append_to_dict(metrics, mini_batch_metrics)
+         self.actor_optimizer.zero_grad()
+         if self_distillation_enabled and distill_dump_chunks:
++            dump_start = time.perf_counter()
+             self._dump_self_distillation_log_probs(
+                 meta_info=data.meta_info,
+                 self_distillation_cfg=self_distillation_cfg,
+                 dump_chunks=distill_dump_chunks,
+             )
++            stage_wall_time_totals["timing_s/update_actor/opd_token_dump"] += time.perf_counter() - dump_start
+         if did_update:
+             teacher_update_start = time.perf_counter()
+             self._update_teacher()
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index 0a76ee0..e6c3745 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -40,7 +40,7 @@ class SelfDistillationConfig(BaseConfig):
+     """Configuration for self-distillation loss.
+ 
+     Args:
+-        Distillation is enabled when policy_loss.loss_mode is "vopd".
++        Distillation is enabled when policy_loss.loss_mode is "vopd" or "visual_seed".
+         full_logit_distillation (bool): Whether to use full-logit KL distillation.
+         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
+         gamma (float): Weight applied to the SDPO loss.
+@@ -70,6 +70,8 @@ class SelfDistillationConfig(BaseConfig):
+         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
+             policy loss for samples whose teacher_image_key column is empty.
+         log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
++        opd_loss_coef (float): Weight for SEED-style sampled-token OPD in visual_seed mode.
++        opd_gate_beta (float): Sharpness of the sigmoid teacher-student log-prob gate.
+     """
+ 
+     full_logit_distillation: bool = True
+@@ -114,12 +116,22 @@ class SelfDistillationConfig(BaseConfig):
+     )
+     fallback_to_policy_loss_on_missing_teacher: bool = False
+     log_prob_dump_dir: Optional[str] = None
++    opd_loss_coef: float = 0.01
++    opd_gate_beta: float = 5.0
+ 
+     def __post_init__(self):
+         if not 0.0 <= self.alpha <= 1.0:
+             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
+         if self.gamma < 0.0:
+             raise ValueError(f"self_distillation.gamma must be non-negative, got {self.gamma}")
++        if self.opd_loss_coef < 0.0:
++            raise ValueError(
++                f"self_distillation.opd_loss_coef must be non-negative, got {self.opd_loss_coef}"
++            )
++        if self.opd_gate_beta <= 0.0:
++            raise ValueError(
++                f"self_distillation.opd_gate_beta must be positive, got {self.opd_gate_beta}"
++            )
+         valid_teacher_regularization = ["ema", "trust-region", "progressive"]
+         if self.teacher_regularization not in valid_teacher_regularization:
+             raise ValueError(
+@@ -207,7 +219,8 @@ class PolicyLossConfig(BaseConfig):
+     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+ 
+     Args:
+-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'vopd'.
++        loss_mode (str): Loss function mode. Options include 'vanilla', 'clip-cov', 'kl-cov',
++            'gpg', 'vopd', and 'visual_seed'.
+         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
+         clip_cov_lb (float): Lower bound for clip-cov loss.
+         clip_cov_ub (float): Upper bound for clip-cov loss.
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 2be5314..3c280b2 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -705,6 +705,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+         )
+ 
++        # In the single-GPU hybrid path the FSDP full state_dict otherwise
++        # keeps a second complete copy of the policy on CUDA while vLLM wakes
++        # its weights.  Stage the transfer tensors in host memory first, then
++        # stream them one by one back to the rollout worker below.  This is the
++        # required full time-sharing path for a 4B policy on one A100.
++        if self._is_offload_param and isinstance(params, dict):
++            cpu_params = {
++                name: param.cpu() if isinstance(param, torch.Tensor) else param
++                for name, param in params.items()
++            }
++            del params
++            params = cpu_params
++
+         # Special handling for LoRA with sleep_level=2:
+         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
+         # separately collect and update LoRA weights and base model weights through their respective interfaces.
+@@ -724,6 +737,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         if self._is_offload_param:
+             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
++        aggressive_empty_cache(force_sync=True)
+ 
+         set_expandable_segments(False)
+ 
+@@ -896,7 +910,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             if self._is_actor:
+                 self_distillation_cfg = self.config.actor.get("self_distillation", None)
+                 loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+-                if self_distillation_cfg is not None and loss_mode == "vopd":
++                if self_distillation_cfg is not None and loss_mode in {"vopd", "visual_seed"}:
+                     teacher_model_source = self_distillation_cfg.get("teacher_model_source", "legacy")
+                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                     if teacher_model_source == "current":
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index f6860e8..ca6166d 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -203,7 +203,15 @@ class vLLMHttpServer:
+ 
+         self.config: RolloutConfig = omega_conf_to_dataclass(config)
+         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+-        self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
++        # Keep an explicit rollout context cap.  The upstream default replaces
++        # it with the model's full (262k for Qwen3.5) context, which is
++        # needlessly expensive for this short visual-reasoning task and defeats
++        # the caller's vLLM memory budget.
++        model_max_model_len = get_max_position_embeddings(self.model_config.hf_config)
++        if self.config.max_model_len is None:
++            self.config.max_model_len = model_max_model_len
++        else:
++            self.config.max_model_len = min(self.config.max_model_len, model_max_model_len)
+         self.rollout_mode = rollout_mode
+         self.workers = workers
+ 
+diff --git a/verl/trainer/config/visual_seed.yaml b/verl/trainer/config/visual_seed.yaml
+new file mode 100644
+--- /dev/null
++++ b/verl/trainer/config/visual_seed.yaml
+@@ -0,0 +1,81 @@
++defaults:
++  - ppo_trainer
++  - user
++  - _self_
++
++actor_rollout_ref:
++  hybrid_engine: true
++  model:
++    enable_activation_offload: true
++    use_fused_kernels: true
++    fused_kernel_options:
++      impl_backend: torch
++  actor:
++    optim:
++      lr: 1.0e-6
++      override_optimizer_config:
++        fused: true
++        foreach: false
++    ppo_epochs: 1
++    clip_ratio: 0.2
++    clip_ratio_low: 0.2
++    clip_ratio_high: 0.2
++    entropy_coeff: 0.0
++    use_kl_loss: true
++    kl_loss_coef: 0.001
++    kl_loss_type: low_var_kl
++    calculate_entropy: false
++    fsdp_config:
++      param_offload: true
++      optimizer_offload: true
++      reshard_after_forward: true
++    policy_loss:
++      loss_mode: visual_seed
++    self_distillation:
++      teacher_always_on: true
++      teacher_model_source: current
++      teacher_image_key: visual_seed_teacher_images
++      fallback_to_policy_loss_on_missing_teacher: true
++      opd_loss_coef: 0.01
++      opd_gate_beta: 5.0
++      full_logit_distillation: false
++      distillation_topk: null
++  ref:
++    log_prob_micro_batch_size_per_gpu: 1
++    fsdp_config:
++      param_offload: true
++  rollout:
++    mode: async
++    n: 8
++    calculate_log_probs: true
++    log_prob_micro_batch_size_per_gpu: 1
++    gpu_memory_utilization: 0.6
++    free_cache_engine: true
++    enable_sleep_mode: true
++    layered_summon: false
++    enforce_eager: true
++    load_format: dummy
++    enable_chunked_prefill: true
++    max_num_seqs: 16
++
++algorithm:
++  adv_estimator: grpo
++  norm_adv_by_std_in_grpo: true
++  use_kl_in_reward: false
++
++data:
++  apply_chat_template_kwargs:
++    enable_thinking: false
++
++custom_reward_function:
++  reward_kwargs:
++    answer_reward_weight: 0.9
++    format_reward_weight: 0.1
++
++trainer:
++  val_before_train: false
++
++ray_kwargs:
++  ray_init:
++    include_dashboard: false
++    object_store_memory: 8589934592
