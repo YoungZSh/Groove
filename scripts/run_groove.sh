@@ -111,6 +111,7 @@ MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-2}"
 N_GPUS="${N_GPUS:-2}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME}"
 ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME}"
+TRAINER_LOGGER="${TRAINER_LOGGER:-[\"console\"]}"
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-true}"
 ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-true}"
 TRAINING_FSDP_STRATEGY="${TRAINING_FSDP_STRATEGY:-fsdp}"
@@ -268,7 +269,7 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT" \
   trainer.project_name=groove-visual-evidence \
   trainer.experiment_name="$EXPERIMENT_NAME" \
-  trainer.logger='["console"]' \
+  trainer.logger="$TRAINER_LOGGER" \
   trainer.n_gpus_per_node="$N_GPUS" \
   trainer.nnodes=1 \
   trainer.total_epochs="$TOTAL_EPOCHS" \

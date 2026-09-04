@@ -14,7 +14,7 @@ done
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_grpo_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2200-seed20260904-b16-verl090-v2}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2199-seed20260904-b16-kl001-verl090-v3}"
 
 export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
 export PREPARE_DATA=false
@@ -22,6 +22,14 @@ export DATA_OUTPUT_DIR="$DATA_DIR"
 export TRAIN_FILE="$DATA_DIR/train.parquet"
 export TEST_FILE="$DATA_DIR/validation.parquet"
 export SEED=20260904
+
+# Keep the full training history locally without requiring network access or a
+# W&B login. The offline run can be synced after training completes.
+export TRAINER_LOGGER='["console","wandb"]'
+export WANDB_MODE=offline
+export WANDB_PROJECT=groove-visual-evidence
+export WANDB_NAME="$EXPERIMENT_NAME"
+export WANDB_DIR="$PROJECT_ROOT/outputs/wandb"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export N_GPUS=2
@@ -67,6 +75,7 @@ export ACTOR_FSDP_OFFLOAD_POLICY=false
 export OPTIMIZER_IMPL=torch.optim
 export OPTIMIZER_NAME=AdamW
 export FUSED_ADAMW=true
+export REFERENCE_KL_COEF=0.01
 
 # Use the screened-data judge protocol as the sole outcome reward. Missing
 # answer tags are diagnostic only and do not reduce the binary accuracy score.

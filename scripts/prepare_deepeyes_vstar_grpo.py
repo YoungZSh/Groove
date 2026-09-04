@@ -25,6 +25,10 @@ SYSTEM_PROMPT = (
     "Analyze the image and answer the question. "
     "Put only the final answer inside <answer>...</answer> tags."
 )
+# Manually audited source rows whose question and reference answer contradict
+# one another. Keep this exclusion in the reproducible builder so regenerating
+# the split cannot silently reintroduce the bad reward target.
+DEFAULT_EXCLUDED_SOURCE_INDICES = (10681,)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-size", type=int, default=220)
     parser.add_argument("--seed", type=int, default=20260904)
     parser.add_argument("--max-correct", type=int, default=7)
+    parser.add_argument(
+        "--exclude-source-index",
+        action="append",
+        type=int,
+        default=list(DEFAULT_EXCLUDED_SOURCE_INDICES),
+    )
     return parser.parse_args()
 
 
@@ -189,6 +199,9 @@ def main() -> None:
     train_indices, validation_indices, image_hashes = image_group_split(
         selected, rows, args.validation_size, args.seed
     )
+    selected_exclusions = set(selected) & set(args.exclude_source_index)
+    train_indices = [index for index in train_indices if index not in selected_exclusions]
+    validation_indices = [index for index in validation_indices if index not in selected_exclusions]
 
     train_records = [
         build_record(index, rows[index], "train", scores[index], image_hashes[index])
@@ -198,7 +211,8 @@ def main() -> None:
         build_record(index, rows[index], "validation", scores[index], image_hashes[index])
         for index in validation_indices
     ]
-    if len(train_records) + len(validation_records) != args.sample_size:
+    final_sample_size = args.sample_size - len(selected_exclusions)
+    if len(train_records) + len(validation_records) != final_sample_size:
         raise RuntimeError("split size mismatch")
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,7 +229,9 @@ def main() -> None:
         "seed": args.seed,
         "candidate_rule": f"0 <= correct_count <= {args.max_correct} out of 8",
         "candidate_rows": len(candidates),
-        "sample_size": args.sample_size,
+        "requested_sample_size": args.sample_size,
+        "sample_size": final_sample_size,
+        "excluded_source_indices": sorted(selected_exclusions),
         "prompt": SYSTEM_PROMPT,
         "thinking_enabled": False,
         "student_images": "original embedded images; no annotations or privileged crops",
