@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 
+from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.utils.model import compute_position_id_with_mask
 
 from .analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
 from .evidence import SAFE_FOCUS_FALLBACK, EvidenceBuilderConfig, TeacherEvidenceBuilder, teacher_payload
@@ -290,33 +296,308 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
                 metrics[f"reward/{key}_mean"] = float(numeric.mean())
         return metrics
 
-    def _maybe_build_self_distillation_batch(
+    @staticmethod
+    def _normalize_teacher_image(image: Any) -> Image.Image:
+        max_pixels = image.get("max_pixels") if isinstance(image, dict) else None
+        if isinstance(image, Image.Image):
+            normalized = image.convert("RGB")
+        elif isinstance(image, (str, os.PathLike)):
+            with Image.open(image) as value:
+                normalized = value.convert("RGB")
+        elif isinstance(image, dict):
+            if image.get("image") is not None:
+                normalized = GrooveRayPPOTrainer._normalize_teacher_image(image["image"])
+            elif image.get("bytes") is not None:
+                normalized = Image.open(BytesIO(image["bytes"])).convert("RGB")
+            elif image.get("path"):
+                normalized = GrooveRayPPOTrainer._normalize_teacher_image(image["path"])
+            else:
+                raise TypeError(f"Unsupported teacher image dictionary: {image.keys()}")
+        else:
+            raise TypeError(f"Unsupported teacher image type: {type(image)}")
+
+        if max_pixels is None or normalized.width * normalized.height <= int(max_pixels):
+            return normalized
+        scale = (int(max_pixels) / (normalized.width * normalized.height)) ** 0.5
+        size = (max(1, round(normalized.width * scale)), max(1, round(normalized.height * scale)))
+        return normalized.resize(size, Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _teacher_images_available(images: Any) -> bool:
+        if images is None:
+            return False
+        values = images.tolist() if isinstance(images, np.ndarray) else images
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        return any(value is not None for value in values)
+
+    @staticmethod
+    def _extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
+        images = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image":
+                    continue
+                images.append(GrooveRayPPOTrainer._normalize_teacher_image(item))
+        return images
+
+    @staticmethod
+    def _resize_teacher_images(images: list[Image.Image], scale: float) -> list[Image.Image]:
+        if scale >= 0.999:
+            return images
+        return [
+            image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            for image in images
+        ]
+
+    @staticmethod
+    def _replace_teacher_message_images(messages: list[dict], images: list[Image.Image]) -> list[dict]:
+        updated = deepcopy(messages)
+        image_offset = 0
+        for message in updated:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image":
+                    continue
+                if image_offset >= len(images):
+                    raise ValueError("Teacher image count is smaller than the message placeholders")
+                item.pop("path", None)
+                item.pop("bytes", None)
+                item.pop("max_pixels", None)
+                item["image"] = images[image_offset]
+                image_offset += 1
+        if image_offset != len(images):
+            raise ValueError("Teacher image count does not match the message placeholders")
+        return updated
+
+    def _build_teacher_messages_from_template(
         self,
-        batch: Any,
+        messages: list[dict],
+        images: list[Any],
+    ) -> list[dict]:
+        normalized = [self._normalize_teacher_image(image) for image in images]
+        updated = deepcopy(messages)
+        image_offset = 0
+        for message in updated:
+            if not isinstance(message.get("content"), str):
+                continue
+            parts = []
+            for segment in filter(None, re.split(r"(<image>)", message["content"])):
+                if segment == "<image>":
+                    if image_offset >= len(normalized):
+                        raise ValueError("Teacher image count is smaller than the prompt placeholders")
+                    parts.append({"type": "image", "image": normalized[image_offset]})
+                    image_offset += 1
+                else:
+                    parts.append({"type": "text", "text": segment})
+            message["content"] = parts
+        if image_offset != len(normalized):
+            raise ValueError("Teacher image count does not match the prompt placeholders")
+        return updated
+
+    def _process_teacher_multimodal_prompt(
+        self,
+        messages: list[dict],
+        prompt_images: list[Image.Image],
+        apply_kwargs: dict[str, Any],
+        max_prompt_len: int,
+    ) -> tuple[str, dict[str, torch.Tensor]]:
+        """Resize, never tokenizer-truncate, multimodal Teacher prefixes."""
+        candidate_images = list(prompt_images)
+        candidate_messages = self._replace_teacher_message_images(messages, candidate_images)
+        last_prompt_len = 0
+        for _ in range(8):
+            raw_prompt = self.processor.apply_chat_template(
+                candidate_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **apply_kwargs,
+            )
+            model_inputs = dict(
+                self.processor(
+                    text=[raw_prompt],
+                    images=candidate_images or None,
+                    videos=None,
+                    return_tensors="pt",
+                    truncation=False,
+                )
+            )
+            last_prompt_len = int(model_inputs["input_ids"].shape[-1])
+            if last_prompt_len <= max_prompt_len:
+                return raw_prompt, model_inputs
+            scale = min((max_prompt_len / last_prompt_len) ** 0.5 * 0.97, 0.90)
+            next_images = self._resize_teacher_images(candidate_images, scale)
+            if all(a.size == b.size for a, b in zip(next_images, candidate_images, strict=True)):
+                break
+            candidate_images = next_images
+            candidate_messages = self._replace_teacher_message_images(messages, candidate_images)
+        raise ValueError(f"Teacher prompt exceeds max_prompt_len: {last_prompt_len} > {max_prompt_len}")
+
+    def _build_teacher_prefix_inputs(
+        self,
+        messages: list[dict],
+        max_prompt_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        apply_kwargs = dict(self.config.data.apply_chat_template_kwargs or {})
+        prompt_images = self._extract_images_from_messages(messages)
+        _raw_prompt, model_inputs = self._process_teacher_multimodal_prompt(
+            messages,
+            prompt_images,
+            apply_kwargs,
+            max_prompt_len,
+        )
+        multi_modal_inputs = model_inputs.copy()
+        prompt_input_ids = multi_modal_inputs.pop("input_ids").squeeze(0)
+        prompt_attention_mask = multi_modal_inputs.pop("attention_mask").squeeze(0)
+
+        if hasattr(self.processor, "get_rope_index"):
+            model_type = getattr(getattr(self.processor, "config", None), "model_type", None)
+            if model_type in {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}:
+                token_types = multi_modal_inputs.pop("mm_token_type_ids", None)
+                if token_types is None:
+                    token_types = torch.zeros_like(prompt_input_ids).unsqueeze(0)
+                    token_types[0][prompt_input_ids == self.processor.image_token_id] = 1
+                position_ids = self.processor.get_rope_index(
+                    input_ids=prompt_input_ids.unsqueeze(0),
+                    mm_token_type_ids=token_types,
+                    image_grid_thw=multi_modal_inputs.get("image_grid_thw"),
+                    video_grid_thw=multi_modal_inputs.get("video_grid_thw"),
+                    attention_mask=prompt_attention_mask.unsqueeze(0),
+                )
+            else:
+                position_ids = self.processor.get_rope_index(
+                    input_ids=prompt_input_ids.unsqueeze(0),
+                    image_grid_thw=multi_modal_inputs.get("image_grid_thw"),
+                    video_grid_thw=multi_modal_inputs.get("video_grid_thw"),
+                    attention_mask=prompt_attention_mask.unsqueeze(0),
+                )
+            if isinstance(position_ids, tuple):
+                position_ids = position_ids[0]
+            if position_ids.dim() == 3 and position_ids.shape[1] == 1:
+                position_ids = position_ids.squeeze(1)
+            if model_type in {"qwen3_5", "qwen3_5_moe"} and position_ids.shape[0] == 3:
+                text_positions = torch.arange(prompt_input_ids.shape[-1]).unsqueeze(0)
+                position_ids = torch.cat((text_positions.to(position_ids), position_ids), dim=0)
+        else:
+            position_ids = compute_position_id_with_mask(prompt_attention_mask.unsqueeze(0)).squeeze(0)
+        return prompt_input_ids, prompt_attention_mask, position_ids, multi_modal_inputs
+
+    def _build_groove_teacher_batch(
+        self,
+        batch: DataProto,
+    ) -> tuple[DataProto, torch.Tensor, dict[str, float]]:
+        config = self.config.groove
+        teacher_key = config.get("teacher_image_key", "groove_teacher_images")
+        batch_size = len(batch)
+        cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]] = {}
+        prefixes = []
+        evidence_mask = []
+        for index in range(batch_size):
+            images = batch.non_tensor_batch[teacher_key][index]
+            images = images.tolist() if isinstance(images, np.ndarray) else list(images or [])
+            has_evidence = self._teacher_images_available(images)
+            evidence_mask.append(float(has_evidence))
+            uid = str(batch.non_tensor_batch.get("uid", np.arange(batch_size))[index])
+            if uid not in cache:
+                if has_evidence:
+                    template = list(batch.non_tensor_batch["teacher_prompt"][index])
+                    messages = self._build_teacher_messages_from_template(template, images)
+                else:
+                    messages = list(batch.non_tensor_batch["raw_prompt"][index])
+                cache[uid] = self._build_teacher_prefix_inputs(
+                    messages,
+                    int(config.get("max_reprompt_len", self.config.data.max_prompt_length)),
+                )
+            prefixes.append(cache[uid])
+
+        max_prefix = max(int(item[0].shape[-1]) for item in prefixes)
+        response = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
+        pad_token_id = self.tokenizer.pad_token_id or 0
+        prompt_ids = torch.full((batch_size, max_prefix), pad_token_id, dtype=response.dtype)
+        prompt_mask = torch.zeros((batch_size, max_prefix), dtype=batch.batch["attention_mask"].dtype)
+        rope_dims = prefixes[0][2].shape[0] if prefixes[0][2].dim() == 2 else None
+        if rope_dims is None:
+            prompt_positions = torch.zeros((batch_size, max_prefix), dtype=prefixes[0][2].dtype)
+        else:
+            prompt_positions = torch.zeros((batch_size, rope_dims, max_prefix), dtype=prefixes[0][2].dtype)
+        response_positions = []
+        multi_modal_inputs = np.empty(batch_size, dtype=object)
+        for index, (ids, mask, positions, mm_inputs) in enumerate(prefixes):
+            length = ids.shape[-1]
+            prompt_ids[index, -length:] = ids
+            prompt_mask[index, -length:] = mask
+            if rope_dims is None:
+                prompt_positions[index, -length:] = positions
+                start = positions[-1]
+                response_positions.append(torch.arange(response.shape[-1], dtype=positions.dtype) + start + 1)
+            else:
+                prompt_positions[index, :, -length:] = positions
+                response_positions.append(
+                    torch.arange(response.shape[-1], dtype=positions.dtype).unsqueeze(0) + positions[:, -1:] + 1
+                )
+            multi_modal_inputs[index] = mm_inputs
+        response_position_ids = torch.stack(response_positions)
+        full_position_ids = torch.cat((prompt_positions, response_position_ids), dim=-1)
+        teacher_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompt_ids,
+                "responses": response.cpu(),
+                "input_ids": torch.cat((prompt_ids, response.cpu()), dim=-1),
+                "attention_mask": torch.cat((prompt_mask, response_mask.cpu()), dim=-1),
+                "position_ids": full_position_ids,
+                "response_mask": response_mask.cpu(),
+            },
+            non_tensors={"multi_modal_inputs": multi_modal_inputs},
+        )
+        teacher_batch.meta_info = dict(batch.meta_info)
+        metrics = {
+            "groove/teacher_prefix_cache_entries": float(len(cache)),
+            "groove/teacher_evidence_fraction": float(np.mean(evidence_mask)),
+        }
+        return teacher_batch, torch.tensor(evidence_mask, dtype=torch.float32), metrics
+
+    def _postprocess_advantages(
+        self,
+        batch: DataProto,
         reward_tensor: torch.Tensor,
         reward_extra_infos_dict: dict[str, list] | None = None,
-    ):
-        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        # Vanilla GRPO has no self-distillation inputs at all. Return before
-        # delegating to verl so the base helper cannot inspect or construct any
-        # Teacher/evidence columns on the ablation path.
-        if loss_mode == "vanilla":
-            return None
-        if loss_mode != "groove":
-            return super()._maybe_build_self_distillation_batch(
-                batch, reward_tensor, reward_extra_infos_dict
-            )
+    ) -> tuple[DataProto, dict[str, float]]:
+        metrics = self._reward_component_metrics(reward_extra_infos_dict)
+        groove_config = self.config.get("groove", {}) or {}
+        if not bool(groove_config.get("enabled", False)):
+            return batch, metrics
 
-        online_metrics = self._build_online_teacher_columns(batch, reward_tensor)
-        online_metrics.update(self._reward_component_metrics(reward_extra_infos_dict))
-        result = super()._maybe_build_self_distillation_batch(
-            batch, reward_tensor, reward_extra_infos_dict
+        metrics.update(self._build_online_teacher_columns(batch, reward_tensor))
+        teacher_batch, evidence_mask, teacher_metrics = self._build_groove_teacher_batch(batch)
+        metrics.update(teacher_metrics)
+        started = time.perf_counter()
+        teacher_output, _teacher_mfu = self._compute_old_log_prob(teacher_batch)
+        metrics["timing_s/groove/teacher_log_prob"] = time.perf_counter() - started
+
+        from groove.losses import combine_grpo_opsd_advantages, groove_opsd_advantages
+
+        student_log_probs = batch.batch["old_log_probs"]
+        teacher_log_probs = teacher_output.batch["old_log_probs"].to(student_log_probs.device)
+        opsd_advantages, opsd_metrics = groove_opsd_advantages(
+            student_log_probs,
+            teacher_log_probs,
+            batch.batch["response_mask"],
+            evidence_mask=evidence_mask.to(student_log_probs.device),
+            advantage_clip=groove_config.get("opsd_advantage_clip"),
         )
-        if result is None:
-            raise RuntimeError("groove teacher batch construction unexpectedly returned None")
-        teacher_batch, metrics = result
-        teacher_batch.batch["groove_outcome"] = (
-            reward_tensor.sum(dim=-1) > 0.5
-        ).to(dtype=torch.float32, device=teacher_batch.batch["self_distillation_mask"].device)
-        metrics.update(online_metrics)
-        return teacher_batch, metrics
+        batch.batch["advantages"] = combine_grpo_opsd_advantages(
+            batch.batch["advantages"],
+            opsd_advantages,
+            opsd_coef=float(groove_config.get("opsd_advantage_coef", 0.01)),
+        )
+        metrics.update({f"actor/groove_opsd_{key}": value for key, value in opsd_metrics.__dict__.items()})
+        return batch, metrics

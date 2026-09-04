@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from groove.verl_trainer import GrooveRayPPOTrainer
 from verl import DataProto
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
 class FakeMultimodalProcessor:
@@ -47,7 +47,7 @@ class FakeMultimodalProcessor:
 class TeacherPromptTest(unittest.TestCase):
     def test_multimodal_prompt_is_resized_without_truncating_image_tokens(self):
         processor = FakeMultimodalProcessor()
-        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
         trainer.processor = processor
         original_images = [Image.new("RGB", (100, 100)), Image.new("RGB", (100, 100))]
         messages = [
@@ -91,7 +91,7 @@ class TeacherPromptTest(unittest.TestCase):
             }
         ]
 
-        updated = RayPPOTrainer._replace_teacher_message_images(messages, [replacement])
+        updated = GrooveRayPPOTrainer._replace_teacher_message_images(messages, [replacement])
         item = updated[0]["content"][0]
         self.assertIs(item["image"], replacement)
         self.assertNotIn("path", item)
@@ -103,23 +103,17 @@ class TeacherPromptTest(unittest.TestCase):
             __getattr__ = dict.__getitem__
 
         processor = FakeMultimodalProcessor()
-        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
         trainer.processor = processor
         trainer.tokenizer = SimpleNamespace(pad_token_id=0)
-        self_distillation = AttrDict(
-            teacher_always_on=True,
+        groove = AttrDict(
+            enabled=True,
             teacher_image_key="teacher_images",
-            fallback_to_policy_loss_on_missing_teacher=True,
             max_reprompt_len=64,
         )
         trainer.config = SimpleNamespace(
-            data=SimpleNamespace(apply_chat_template_kwargs={}),
-            actor_rollout_ref=SimpleNamespace(
-                actor=AttrDict(
-                    policy_loss={"loss_mode": "groove"},
-                    self_distillation=self_distillation,
-                )
-            ),
+            data=SimpleNamespace(apply_chat_template_kwargs={}, max_prompt_length=64),
+            groove=groove,
         )
 
         image = Image.new("RGB", (10, 10))
@@ -135,6 +129,7 @@ class TeacherPromptTest(unittest.TestCase):
         batch = DataProto.from_dict(
             tensors={
                 "input_ids": torch.zeros((2, 2), dtype=torch.long),
+                "attention_mask": torch.ones((2, 2), dtype=torch.long),
                 "responses": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
                 "response_mask": torch.ones((2, 2), dtype=torch.long),
             },
@@ -146,19 +141,12 @@ class TeacherPromptTest(unittest.TestCase):
             },
         )
 
-        result = trainer._maybe_build_self_distillation_batch(
-            batch,
-            reward_tensor=torch.zeros((2, 2), dtype=torch.float32),
-        )
-
-        self.assertIsNotNone(result)
+        teacher_batch, evidence_mask, _metrics = trainer._build_groove_teacher_batch(batch)
         self.assertEqual(len(processor.calls), 1)
-        teacher_batch, _metrics = result
-        starts = teacher_batch.batch["teacher_response_start_idx"].tolist()
-        self.assertEqual(starts[0], starts[1])
-        self.assertGreater(starts[0], 0)
+        self.assertEqual(evidence_mask.tolist(), [1.0, 1.0])
+        self.assertGreater(teacher_batch.batch["prompts"].shape[-1], 0)
         self.assertEqual(
-            teacher_batch.batch["teacher_input_ids"][:, -2:].tolist(),
+            teacher_batch.batch["input_ids"][:, -2:].tolist(),
             [[1, 2], [3, 4]],
         )
 

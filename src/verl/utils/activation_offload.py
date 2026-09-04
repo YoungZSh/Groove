@@ -327,14 +327,7 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 
         # Window map data structure helps us synchronize based on number
         # of layers offloaded
-        # Qwen3.5's multimodal forward can emit one final group-commit after
-        # all transformer-layer groups have been scheduled.  It has no
-        # corresponding offload window; treating it as one caused an out of
-        # range lookup (`KeyError: 55`) in visual Teacher batches.
-        if (
-            self.offloaded_group_count < self.num_offload_group
-            and self.layer_window_map[self.offloaded_group_count] == current_group
-        ):
+        if self.layer_window_map[self.offloaded_group_count] == current_group:
             # Stream synchronization both ways
             self.d2h_stream.wait_stream(get_torch_device().current_stream())
             get_torch_device().current_stream().wait_stream(self.d2h_stream)
@@ -385,10 +378,7 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
         assert self.current_group >= 0
 
         # Layer window data structure helps us to reload at right times
-        if (
-            self.offloaded_group_count > 0
-            and self.layer_window_map[self.offloaded_group_count - 1] == self.current_group
-        ):
+        if self.layer_window_map[self.offloaded_group_count - 1] == self.current_group:
             # Stream synchronization both ways
             self.h2d_stream.wait_stream(get_torch_device().current_stream())
             get_torch_device().current_stream().wait_stream(self.h2d_stream)
@@ -408,14 +398,9 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 def get_activation_offload_context(
     num_layers: int = 1, model_layers: int = 1, tensor_need_offloading_checker=(lambda t: True)
 ):
-    # Qwen3.5 interleaves DeltaNet, full-attention and vision blocks.  Its
-    # checkpoint graph can contain an extra final group, which violates the
-    # async prefetch handler's fixed layer-window bookkeeping.  The synchronous
-    # handler offloads/reloads each saved tensor directly, avoiding that group
-    # assumption while preserving the exact activation values.
-    del model_layers
-    cpu_offload_handler = SynchronizedGroupOffloadHandler(
+    cpu_offload_handler = AsyncDoubleBufferGroupOffloadHandler(
         num_offload_group=num_layers,
+        num_model_group=model_layers,
         tensor_need_offloading_checker=tensor_need_offloading_checker,
     )
 

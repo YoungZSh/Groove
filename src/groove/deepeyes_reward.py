@@ -180,3 +180,18 @@ def compute_score_batched(
     if any(score is None for score in scores):
         raise RuntimeError("remote judge returned an incomplete reward batch")
     return [score for score in scores if score is not None]
+
+
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: dict[str, Any],
+    **_: Any,
+) -> dict[str, float]:
+    """VERL 0.9 reward-loop adapter for one streamed rollout."""
+    del data_source
+    question = str((extra_info or {}).get("question", "")).strip()
+    if not question:
+        raise ValueError("DeepEyes reward requires extra_info.question")
+    return _judge_one(question, str(ground_truth), str(solution_str))
