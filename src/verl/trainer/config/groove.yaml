@@ -68,6 +68,8 @@ reward:
 # VERL's typed ActorConfig and are consumed only by the GROOVE adapter.
 groove:
   enabled: false
+  # Both contexts are scored by the pre-update actor. Targets stay detached
+  # throughout this rollout batch's PPO updates and refresh on the next batch.
   opsd_advantage_coef: 0.01
   opsd_advantage_clip: null
   teacher_image_key: groove_teacher_images

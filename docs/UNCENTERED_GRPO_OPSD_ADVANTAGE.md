@@ -29,7 +29,7 @@ A^{\mathrm{GRPO}}_i
 \beta_{\mathrm{ref}}\mathcal L_{\mathrm{ref\text{-}KL}}.
 \]
 
-这与当前运行时的
+这与历史版本的
 
 \[
 \mathcal L_{\mathrm{GRPO}}
@@ -124,29 +124,36 @@ A_i^{\mathrm{GRPO}}
 
 ### 5.1 Student 与 Teacher sampled-token log-prob
 
-Student 只看原始输入：
+每轮 rollout/update 开始时，以更新前的 actor 权重记作 \(\theta_{\mathrm{old}}\)。
+在任何 actor optimizer step 之前，用同一份权重分别计算普通输入与 privileged 输入的
+sampled-token log-prob。Student target 只看原始输入：
 
 \[
 \ell^S_{i,t}
 =
-\log\pi_\theta
+\log\pi_{\theta_{\mathrm{old}}}
 \left(
 y_{i,t}\mid h_{i,t}
 \right).
 \]
 
-Teacher 使用同一份当前 actor 权重，但额外看 privileged visual evidence，并在 `no_grad` 下前向：
+Teacher 使用同一份更新前 actor 权重，额外看 privileged visual evidence，并在 `no_grad` 下前向：
 
 \[
 \ell^T_{i,t}
 =
-\log\pi_{\operatorname{sg}(\theta)}
+\log\pi_{\operatorname{sg}(\theta_{\mathrm{old}})}
 \left(
 y_{i,t}\mid \tilde h_{i,t},E_g
 \right).
 \]
 
 Teacher 不重新生成 response。它在 privileged context 下对 Student 已经采样出的同一个 \(y_{i,t}\) 做 teacher forcing，因此 Teacher 与 Student 的 token 位置一一对齐。
+
+两组打分构造的 advantage 在本轮全部 PPO mini-batch/epoch 中保持固定。
+actor 更新时另做普通输入前向，得到有梯度的 \(\log\pi_\theta\)，用于 PPO ratio。
+下一轮再使用最新 actor 重新打分。Teacher 无独立 optimizer、不使用 EMA，
+也不在每个 mini-batch 后重新生成 target；只需缓存打分结果，无须保存额外的 Teacher 参数副本。
 
 ### 5.2 Signed evidence gap
 
@@ -277,7 +284,13 @@ D_{\mathrm{KL}}
 
 因此，本方案的 signed OPSD advantage 不是任意设计的正负 gate，而是 privileged Teacher Reverse KL 的 sampled policy-gradient coefficient。
 
-如果实际 sample 来自 \(\pi_{\mathrm{old}}\) 而不是当前 \(\pi_\theta\)，则由 PPO importance ratio \(\rho=\pi_\theta/\pi_{\mathrm{old}}\) 处理策略差异。
+上述梯度解释以固定 prefix、固定 Teacher 分布和当前策略采样为条件。
+实际实现使用固定的 \(\Delta_{\mathrm{old}}=\log\pi_T-\log\pi_{\mathrm{old}}\)，
+并通过 PPO ratio \(\rho=\pi_\theta/\pi_{\mathrm{old}}\) 更新 actor。
+忽略 clipping 时，这个固定 target surrogate 的期望为
+\(D_{\mathrm{KL}}(\pi_\theta\Vert\pi_T)-D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{old}})\)。
+它在 \(\theta=\theta_{\mathrm{old}}\) 处与 Reverse KL 有相同的一阶梯度；
+不应把整个 PPO 更新或最终 loss 数值称为精确 Reverse KL。
 
 ## 7. 合并后的 Token Advantage
 
@@ -459,8 +472,11 @@ e_i\Delta^{\mathrm{clip}}_{i,t}.
 # Existing trajectory-level GRPO advantage: [B, T]
 grpo_advantages = advantages
 
-# Both targets are detached. Teacher was produced under torch.no_grad().
-delta = (teacher_log_prob.detach() - student_log_prob.detach())
+# Score both contexts once before the actor optimizer runs.
+with torch.no_grad():
+    student_target_log_prob = score_actor(original_inputs)
+    teacher_target_log_prob = score_actor(privileged_inputs)
+    delta = teacher_target_log_prob - student_target_log_prob
 
 if delta_clip is not None:
     delta = delta.clamp(min=-delta_clip, max=delta_clip)
@@ -473,6 +489,8 @@ total_advantages = (
 )
 
 # Use one shared PPO/dual-clip loss. Do not add a separate OPD scalar loss.
+# This Student forward keeps gradients; total_advantages stays fixed.
+student_log_prob = actor_log_prob(original_inputs)
 policy_loss, metrics = policy_loss_fn(
     old_log_prob=old_log_prob,
     log_prob=student_log_prob,
@@ -544,7 +562,7 @@ policy_loss = grpo_loss + opd_coef * opd_loss
 2. 它表示 evidence 如何改变 Teacher 对 sampled token 的支持，不证明该 token 对最终 reward 的因果贡献；
 3. sampled-token OPSD 可以降低已经采样出的坏 token，但不能直接告诉 Student 应该选择哪个未采样的替代 token；
 4. Teacher 必须平均比 Student 拥有更有效的信息，否则 signed OPSD 也可能稳定地分配错误信用；
-5. Teacher 使用随训练变化的当前 actor，因此 Reverse-KL target 是逐 update 变化的 moving target，而不是全程固定分布；
+5. Teacher 使用每轮更新前的 actor，target 在本轮固定、下一轮刷新，而不是全程固定分布；
 6. 未中心化意味着 OPSD 是附加 evidence objective，不是严格的 trajectory credit-budget redistribution。
 
 ## 16. 推荐消融
@@ -559,3 +577,27 @@ policy_loss = grpo_loss + opd_coef * opd_loss
 本文方案首先回答：
 
 > 在不训练 Critic 的情况下，把 Teacher–Student sampled-token log-ratio 恢复为有正有负的 Reverse-KL evidence advantage，是否优于当前只能强化 sampled token 的单向 OPD？
+
+## 17. 当前实现与诊断约定
+
+- `src/groove/verl_trainer.py`：在 GRPO advantage 构造之后、actor 更新之前执行配对打分和合并。
+- `src/groove/losses.py`：FP32 signed gap、二值 mask、可选对称 clipping，以及 detached advantage 合并。
+- `src/groove/advantage_metrics.py`：整个 rollout batch 的 credit 诊断；reward 仅用于统计分组，不加权 OPSD。
+- `src/groove/objective.py`：检查 GRPO、统一 vanilla PPO、原始 terminal reward 和更新前打分的配置约束。
+- `src/verl/workers/utils/losses.py`：沿用现有一次 PPO loss 调用，随后加 reference KL。
+
+`OPSD_ENABLED=true` 启用联合路径，默认系数仍为 `0.01`、gap clipping 默认关闭。
+关闭联合路径时不构造 evidence 或 Teacher；整个 batch 缺证据时跳过 Teacher prompt 和前向。
+无效 response token 或缺证据行上的 NaN/Inf 不得污染回退结果；有效 evidence token 的非有限 gap 会报错。
+
+诊断键使用 `opsd/delta_*`、`opsd/advantage_rms_raw`、`opsd/advantage_rms_weighted`、
+`opsd_to_grpo_advantage_rms_ratio`、`total_advantage_*`、`opsd/grpo_cosine`、
+`opsd/grpo_sign_alignment`。RMS 对比使用同一组有效 response tokens，缺证据行的 OPSD 计为零。
+当 GRPO RMS 为零，ratio 记为 0，同时 `opsd_to_grpo_advantage_rms_ratio_defined=0`；该数值不表示 OPSD 没有信号。
+`actor/groove_opsd_*` 历史指标继续提供，其中 active-token fraction/ratio 的分母为有效 response token 数。
+
+`opsd/{correct,incorrect,mixed,all_correct,all_wrong}/` 下记录 `delta_*`、`advantage_*`、
+`trajectory_delta_*` 和 `trajectory_credit_*` 的 count、mean、std、RMS、P10/P50/P90。
+前两者按有效 evidence token 统计，后两者分别是每条轨迹的平均原始 gap 和裁剪后 OPSD credit 总和，
+按有 evidence 的有效轨迹统计。空子集的 count 和统计值为 0。
+PPO clipping fraction、reference KL 和总梯度范数继续由 actor 原有路径报告。

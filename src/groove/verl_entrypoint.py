@@ -20,6 +20,7 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
 from .verl_trainer import GrooveRayPPOTrainer
+from .objective import validate_objective_config
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -217,6 +218,7 @@ def main() -> None:
     config_name = os.environ.get("VERL_CONFIG_NAME", "groove")
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         config = compose(config_name=config_name, overrides=sys.argv[1:])
+    validate_objective_config(config)
     memory_guard = configure_ray_memory_guard(config)
     sleep_level = validate_full_time_sharing(config)
     auto_set_device(config)

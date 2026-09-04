@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -9,20 +10,26 @@ import torch
 
 @dataclass(frozen=True)
 class SignedOPSDMetrics:
-    advantage_mean: float
-    advantage_std: float
-    advantage_rms: float
-    positive_token_fraction: float
-    negative_token_fraction: float
-    zero_token_fraction: float
-    teacher_gap_mean: float
-    active_token_fraction: float
-    clipped_token_fraction: float
+    advantage_mean: float = 0.0
+    advantage_std: float = 0.0
+    advantage_rms: float = 0.0
+    positive_token_fraction: float = 0.0
+    negative_token_fraction: float = 0.0
+    zero_token_fraction: float = 0.0
+    teacher_gap_mean: float = 0.0
+    delta_std: float = 0.0
+    delta_p10: float = 0.0
+    delta_p50: float = 0.0
+    delta_p90: float = 0.0
+    active_token_fraction: float = 0.0
+    clipped_token_fraction: float = 0.0
 
 
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    denominator = mask.sum().clamp_min(1.0)
-    return (values * mask).sum() / denominator
+def _binary_mask(mask: torch.Tensor, *, name: str, device: torch.device) -> torch.Tensor:
+    mask = mask.detach().to(device=device)
+    if not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError(f"{name} must contain only 0 or 1")
+    return mask.bool()
 
 
 def groove_opsd_advantages(
@@ -41,44 +48,43 @@ def groove_opsd_advantages(
     not correctness, so correct and incorrect rollouts use the same rule.
     """
 
+    if student_log_prob.ndim != 2:
+        raise ValueError("Sampled-token log probabilities must have shape [batch, tokens]")
     if student_log_prob.shape != teacher_log_prob.shape:
         raise ValueError("Student and teacher log-probability shapes must match")
     if student_log_prob.shape != response_mask.shape:
         raise ValueError("response_mask must match log-probability shape")
-    if advantage_clip is not None and advantage_clip <= 0:
-        raise ValueError("advantage_clip must be positive when set")
+    if advantage_clip is not None and (not math.isfinite(advantage_clip) or advantage_clip <= 0):
+        raise ValueError("advantage_clip must be finite and positive when set")
 
-    mask = response_mask.to(dtype=student_log_prob.dtype)
+    response_valid = _binary_mask(response_mask, name="response_mask", device=student_log_prob.device)
+    active = response_valid.clone()
     if evidence_mask is not None:
-        if evidence_mask.ndim != 1 or evidence_mask.shape[0] != mask.shape[0]:
+        if evidence_mask.ndim != 1 or evidence_mask.shape[0] != active.shape[0]:
             raise ValueError("evidence_mask must have shape [batch]")
-        mask = mask * evidence_mask.to(device=mask.device, dtype=mask.dtype).unsqueeze(-1)
+        active &= _binary_mask(
+            evidence_mask, name="evidence_mask", device=active.device
+        ).unsqueeze(-1)
 
-    gap = (teacher_log_prob.detach() - student_log_prob.detach()).detach()
-    advantages = gap
+    # Score targets are computed before the actor update and remain fixed for
+    # all mini-batches. Accumulate the gap in FP32 even for BF16 model outputs.
+    gap = (
+        teacher_log_prob.detach().to(device=active.device, dtype=torch.float32)
+        - student_log_prob.detach().float()
+    )
+    valid_gap = gap[active]
+    if not torch.isfinite(valid_gap).all():
+        raise ValueError("Non-finite Teacher/Student log-probability gap on an evidence token")
+    # Multiplication by zero would leak NaN/Inf from padding or absent evidence.
+    advantages = torch.where(active, gap, 0.0)
     if advantage_clip is not None:
         advantages = advantages.clamp(min=-float(advantage_clip), max=float(advantage_clip))
-    advantages = (advantages * mask).detach()
 
-    active = mask > 0
-    total_tokens = torch.tensor(mask.numel(), device=mask.device, dtype=mask.dtype)
     if not active.any():
-        zero = 0.0
-        metrics = SignedOPSDMetrics(
-            advantage_mean=zero,
-            advantage_std=zero,
-            advantage_rms=zero,
-            positive_token_fraction=zero,
-            negative_token_fraction=zero,
-            zero_token_fraction=zero,
-            teacher_gap_mean=zero,
-            active_token_fraction=zero,
-            clipped_token_fraction=zero,
-        )
-        return advantages, metrics
+        return advantages, SignedOPSDMetrics()
 
-    valid_advantages = advantages[active].float()
-    valid_gap = gap[active].float()
+    valid_advantages = advantages[active]
+    p10, p50, p90 = torch.quantile(valid_gap, valid_gap.new_tensor([0.1, 0.5, 0.9])).tolist()
     clipped_fraction = 0.0
     if advantage_clip is not None:
         clipped_fraction = float((valid_gap.abs() > float(advantage_clip)).float().mean())
@@ -89,8 +95,12 @@ def groove_opsd_advantages(
         positive_token_fraction=float((valid_advantages > 0).float().mean()),
         negative_token_fraction=float((valid_advantages < 0).float().mean()),
         zero_token_fraction=float((valid_advantages == 0).float().mean()),
-        teacher_gap_mean=float(_masked_mean(gap, mask)),
-        active_token_fraction=float(active.sum().to(mask.dtype).div(total_tokens)),
+        teacher_gap_mean=float(valid_gap.mean()),
+        delta_std=float(valid_gap.std(unbiased=False)),
+        delta_p10=p10,
+        delta_p50=p50,
+        delta_p90=p90,
+        active_token_fraction=float(active.sum() / response_valid.sum().clamp_min(1)),
         clipped_token_fraction=clipped_fraction,
     )
     return advantages, metrics
@@ -106,6 +116,8 @@ def combine_grpo_opsd_advantages(
 
     if grpo_advantages.shape != opsd_advantages.shape:
         raise ValueError("GRPO and OPSD advantage shapes must match")
-    if opsd_coef < 0:
-        raise ValueError("opsd_coef must be non-negative")
+    if not math.isfinite(opsd_coef) or opsd_coef < 0:
+        raise ValueError("opsd_coef must be finite and non-negative")
+    if opsd_coef == 0:
+        return grpo_advantages.detach()
     return grpo_advantages.detach() + float(opsd_coef) * opsd_advantages.detach()

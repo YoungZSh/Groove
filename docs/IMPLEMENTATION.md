@@ -126,12 +126,11 @@ the SFT data for a later synchronized Qwen Analyzer.
 
 ## Self-evolution behavior
 
-`teacher_model_source=current` causes both passes to use the currently training
-model.  The difference is privileged visual context, not a larger frozen
-Teacher.  As the Student improves, the next on-policy group and the next
-privileged Teacher distribution both change.  The external Analyzer and DINO
-remain fixed in version one, which removes an additional drifting learned
-policy from the loop.
+Both scoring passes use the pre-update actor under `no_grad`. Their signed gap
+is cached in the combined advantage before any actor optimizer step and stays
+fixed across that batch's PPO mini-batches and epochs. The next rollout batch
+uses the latest actor for both contexts. There is no separate Teacher optimizer
+or EMA update. The external Analyzer and DINO remain fixed in version one.
 
 ## Bundled training runtime
 
@@ -140,10 +139,12 @@ training paths is vendored under `src/verl`.  The project-specific additions are
 therefore ordinary source files rather than a patch applied to a sibling
 repository:
 
-- `src/verl/trainer/ppo/core_algos.py` contains `compute_groove_opsd_advantages`;
-- `src/verl/workers/actor/dp_actor.py` contains the `groove` actor branch;
+- `src/groove/losses.py` contains the shared signed evidence calculation;
+- `src/verl/trainer/ppo/core_algos.py` retains a compatibility entrypoint;
+- `src/groove/verl_trainer.py` merges evidence credit in its post-advantage hook;
+- `src/verl/workers/utils/losses.py` runs the existing PPO and reference KL losses;
 - `src/verl/trainer/config/groove.yaml` contains the Hydra preset;
-- `src/groove/verl_trainer.py` constructs the online evidence columns.
+- `src/groove/advantage_metrics.py` reports batch and outcome-group diagnostics.
 
 The existing Conda environment supplies heavyweight runtime dependencies such as
 PyTorch, Ray, vLLM, and Transformers; the source tree supplies the matching

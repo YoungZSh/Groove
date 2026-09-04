@@ -316,8 +316,8 @@ def compute_grpo_outcome_advantage(
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.zeros((), dtype=torch.float64, device=scores.device)
-                id2std[idx] = torch.ones((), dtype=torch.float64, device=scores.device)
+                id2mean[idx] = id2score[idx][0].to(dtype=torch.float64)
+                id2std[idx] = torch.zeros((), dtype=torch.float64, device=scores.device)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx]).to(dtype=torch.float64)
                 id2mean[idx] = torch.mean(scores_tensor)
@@ -348,56 +348,31 @@ def compute_groove_opsd_advantages(
     self_distillation_mask: Optional[torch.Tensor] = None,
     advantage_clip: Optional[float] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Build detached, uncentered signed OPSD token advantages."""
-    if student_log_probs.shape != teacher_log_probs.shape:
-        raise ValueError("student and teacher sampled-token log-probs must have the same shape")
-    if student_log_probs.shape != response_mask.shape:
-        raise ValueError("sampled-token log-probs and response_mask must have the same shape")
-    if advantage_clip is not None and advantage_clip <= 0:
-        raise ValueError("advantage_clip must be positive when set")
+    """Compatibility entrypoint for the shared signed evidence calculation."""
+    from groove.losses import groove_opsd_advantages
 
-    loss_mask = response_mask.to(dtype=student_log_probs.dtype)
-    if self_distillation_mask is not None:
-        sample_mask = self_distillation_mask.to(device=loss_mask.device, dtype=loss_mask.dtype)
-        if sample_mask.ndim == 1:
-            if sample_mask.shape[0] != loss_mask.shape[0]:
-                raise ValueError("self_distillation_mask batch dimension does not match log-probs")
-            sample_mask = sample_mask.unsqueeze(1)
-        elif sample_mask.shape != loss_mask.shape:
+    evidence_mask = self_distillation_mask
+    token_evidence_fraction = None
+    if evidence_mask is not None and evidence_mask.ndim == 2:
+        if evidence_mask.shape != response_mask.shape:
             raise ValueError("self_distillation_mask must be sample-level [B] or token-level [B,T]")
-        loss_mask = loss_mask * sample_mask
-
-    teacher_gap = (teacher_log_probs.detach() - student_log_probs.detach()).detach()
-    signed_advantages = teacher_gap
-    if advantage_clip is not None:
-        signed_advantages = signed_advantages.clamp(-float(advantage_clip), float(advantage_clip))
-    signed_advantages = (signed_advantages * loss_mask).detach()
-
-    active = loss_mask > 0
-    if not active.any():
-        valid_gap = teacher_gap.new_zeros(1, dtype=torch.float32)
-        valid_advantage = valid_gap
-        active_ratio = 0.0
-    else:
-        valid_gap = teacher_gap[active].float()
-        valid_advantage = signed_advantages[active].float()
-        active_ratio = active.float().mean().item()
-    clipped_fraction = (
-        float((valid_gap.abs() > float(advantage_clip)).float().mean())
-        if advantage_clip is not None and active.any()
-        else 0.0
+        response_token_count = response_mask.count_nonzero().clamp_min(1)
+        response_mask = response_mask * evidence_mask.detach().to(response_mask.device)
+        token_evidence_fraction = float(response_mask.count_nonzero() / response_token_count)
+        evidence_mask = None
+    signed_advantages, diagnostics = groove_opsd_advantages(
+        student_log_probs,
+        teacher_log_probs,
+        response_mask,
+        evidence_mask=evidence_mask,
+        advantage_clip=advantage_clip,
     )
     metrics = {
-        "actor/groove_opsd_active_token_ratio": active_ratio,
-        "actor/groove_opsd_teacher_gap_mean": float(valid_gap.mean()),
-        "actor/groove_opsd_advantage_mean": float(valid_advantage.mean()),
-        "actor/groove_opsd_advantage_std": float(valid_advantage.std(unbiased=False)),
-        "actor/groove_opsd_advantage_rms": float(torch.sqrt(valid_advantage.square().mean())),
-        "actor/groove_opsd_positive_token_fraction": float((valid_advantage > 0).float().mean()),
-        "actor/groove_opsd_negative_token_fraction": float((valid_advantage < 0).float().mean()),
-        "actor/groove_opsd_zero_token_fraction": float((valid_advantage == 0).float().mean()),
-        "actor/groove_opsd_clipped_token_fraction": clipped_fraction,
+        f"actor/groove_opsd_{key}": value for key, value in diagnostics.__dict__.items()
     }
+    active_fraction = diagnostics.active_token_fraction if token_evidence_fraction is None else token_evidence_fraction
+    metrics["actor/groove_opsd_active_token_fraction"] = active_fraction
+    metrics["actor/groove_opsd_active_token_ratio"] = active_fraction
     return signed_advantages, metrics
 
 

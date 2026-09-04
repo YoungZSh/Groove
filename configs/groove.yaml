@@ -55,7 +55,9 @@ grounding:
   min_short_side: 768
 
 teacher:
-  model_source: current_student
+  model_source: pre_update_actor
+  refresh: every_rollout_batch
+  targets_fixed_during_update: true
   prefix: original_image_plus_focus_text_plus_independent_crops
   interleaved_reasoning: false
 

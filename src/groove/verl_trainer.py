@@ -21,10 +21,14 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.model import compute_position_id_with_mask
 
 from .analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
+from .advantage_metrics import compute_advantage_metrics
 from .evidence import SAFE_FOCUS_FALLBACK, EvidenceBuilderConfig, TeacherEvidenceBuilder, teacher_payload
 from .grounding import GroundingDinoConfig, GroundingDinoGrounder
+from .losses import combine_grpo_opsd_advantages, groove_opsd_advantages
+from .objective import validate_objective_config
 from .reward import extract_option
 from .schemas import GroupRollout, Rollout
+from .trajectory_audit import write_trajectory_audit
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -37,11 +41,9 @@ def _env_bool(name: str, default: bool) -> bool:
 class GrooveRayPPOTrainer(RayPPOTrainer):
     """Inject a shared hindsight Crop/Zoom prefix into every rollout of an analyzed group.
 
-    This class changes only Teacher input construction.  The actor patch owns the
-    objective: ordinary GRPO credit is built for all rollouts, while signed
-    visual OPSD credit is added wherever ``self_distillation_mask`` says
-    evidence is available.  The actor sends the combined advantage through one
-    PPO objective.
+    The trainer scores both contexts before the actor update and fixes the
+    resulting signed evidence advantages for every mini-batch in that update.
+    The actor consumes their sum with GRPO through its existing PPO objective.
     """
 
     _groove_builder: TeacherEvidenceBuilder | None = None
@@ -493,18 +495,25 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
     def _build_groove_teacher_batch(
         self,
         batch: DataProto,
-    ) -> tuple[DataProto, torch.Tensor, dict[str, float]]:
+    ) -> tuple[DataProto | None, torch.Tensor, dict[str, float]]:
         config = self.config.groove
         teacher_key = config.get("teacher_image_key", "groove_teacher_images")
         batch_size = len(batch)
+        evidence_mask = torch.tensor(
+            [self._teacher_images_available(images) for images in batch.non_tensor_batch[teacher_key]],
+            dtype=torch.float32,
+        )
+        if not evidence_mask.any():
+            return None, evidence_mask, {
+                "groove/teacher_prefix_cache_entries": 0.0,
+                "groove/teacher_evidence_fraction": 0.0,
+            }
         cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]] = {}
         prefixes = []
-        evidence_mask = []
         for index in range(batch_size):
             images = batch.non_tensor_batch[teacher_key][index]
             images = images.tolist() if isinstance(images, np.ndarray) else list(images or [])
-            has_evidence = self._teacher_images_available(images)
-            evidence_mask.append(float(has_evidence))
+            has_evidence = bool(evidence_mask[index])
             uid = str(batch.non_tensor_batch.get("uid", np.arange(batch_size))[index])
             if uid not in cache:
                 if has_evidence:
@@ -561,10 +570,11 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         teacher_batch.meta_info = dict(batch.meta_info)
         metrics = {
             "groove/teacher_prefix_cache_entries": float(len(cache)),
-            "groove/teacher_evidence_fraction": float(np.mean(evidence_mask)),
+            "groove/teacher_evidence_fraction": float(evidence_mask.mean()),
         }
-        return teacher_batch, torch.tensor(evidence_mask, dtype=torch.float32), metrics
+        return teacher_batch, evidence_mask, metrics
 
+    @torch.no_grad()
     def _postprocess_advantages(
         self,
         batch: DataProto,
@@ -575,29 +585,75 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         groove_config = self.config.get("groove", {}) or {}
         if not bool(groove_config.get("enabled", False)):
             return batch, metrics
+        validate_objective_config(self.config)
 
         metrics.update(self._build_online_teacher_columns(batch, reward_tensor))
         teacher_batch, evidence_mask, teacher_metrics = self._build_groove_teacher_batch(batch)
         metrics.update(teacher_metrics)
-        started = time.perf_counter()
-        teacher_output, _teacher_mfu = self._compute_old_log_prob(teacher_batch)
-        metrics["timing_s/groove/teacher_log_prob"] = time.perf_counter() - started
-
-        from groove.losses import combine_grpo_opsd_advantages, groove_opsd_advantages
-
-        student_log_probs = batch.batch["old_log_probs"]
-        teacher_log_probs = teacher_output.batch["old_log_probs"].to(student_log_probs.device)
+        # Both scores use the same pre-update actor weights. Cache their detached
+        # difference once; the optimizer subsequently sees only total advantages.
+        student_log_probs = batch.batch["old_log_probs"].detach()
+        teacher_log_probs = student_log_probs
+        metrics["timing_s/groove/teacher_log_prob"] = 0.0
+        if evidence_mask.any():
+            started = time.perf_counter()
+            teacher_output, _teacher_mfu = self._compute_old_log_prob(teacher_batch)
+            teacher_log_probs = teacher_output.batch["old_log_probs"].detach().to(student_log_probs.device)
+            metrics["timing_s/groove/teacher_log_prob"] = time.perf_counter() - started
+        metrics["groove/teacher_forward_skipped"] = float(not evidence_mask.any())
+        evidence_mask = evidence_mask.to(student_log_probs.device)
         opsd_advantages, opsd_metrics = groove_opsd_advantages(
             student_log_probs,
             teacher_log_probs,
             batch.batch["response_mask"],
-            evidence_mask=evidence_mask.to(student_log_probs.device),
+            evidence_mask=evidence_mask,
             advantage_clip=groove_config.get("opsd_advantage_clip"),
         )
-        batch.batch["advantages"] = combine_grpo_opsd_advantages(
-            batch.batch["advantages"],
+        grpo_advantages = batch.batch["advantages"].detach()
+        opsd_coef = float(groove_config.get("opsd_advantage_coef", 0.01))
+        total_advantages = combine_grpo_opsd_advantages(
+            grpo_advantages,
             opsd_advantages,
-            opsd_coef=float(groove_config.get("opsd_advantage_coef", 0.01)),
+            opsd_coef=opsd_coef,
         )
+        batch.batch["advantages"] = total_advantages
         metrics.update({f"actor/groove_opsd_{key}": value for key, value in opsd_metrics.__dict__.items()})
+        # Keep the existing training-progress reader compatible with the new
+        # valid-response-token denominator.
+        metrics["actor/groove_opsd_active_token_ratio"] = opsd_metrics.active_token_fraction
+        for key in (
+            "positive_token_fraction", "negative_token_fraction", "zero_token_fraction", "clipped_token_fraction"
+        ):
+            metrics[f"opsd/{key}"] = getattr(opsd_metrics, key)
+        metrics.update(
+            compute_advantage_metrics(
+                grpo_advantages=grpo_advantages,
+                opsd_advantages=opsd_advantages,
+                total_advantages=total_advantages,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                response_mask=batch.batch["response_mask"],
+                evidence_mask=evidence_mask,
+                opsd_coef=opsd_coef,
+                sequence_rewards=reward_tensor.sum(-1),
+                group_ids=batch.non_tensor_batch.get("uid", np.arange(len(batch))),
+            )
+        )
+        audit_dir = os.environ.get("OPSD_LOG_PROB_DUMP_DIR", "").strip()
+        if audit_dir:
+            metrics["groove/audit_token_count"] = write_trajectory_audit(
+                audit_dir,
+                step=self.global_steps,
+                batch=batch,
+                tokenizer=self.tokenizer,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                grpo_advantages=grpo_advantages,
+                opsd_advantages=opsd_advantages,
+                total_advantages=total_advantages,
+                evidence_mask=evidence_mask,
+                sequence_rewards=reward_tensor.sum(-1),
+                opsd_coef=opsd_coef,
+                advantage_clip=groove_config.get("opsd_advantage_clip"),
+            )
         return batch, metrics

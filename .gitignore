@@ -44,6 +44,8 @@ data/vstar/images/
 data/deepeyes_47k/
 data/deepeyes_vstar_grpo_*/
 data/vision_opd_*_seed*/
+data/baseline_*_seed*/
+data/visual_evidence_source/
 
 # Archived upstream references remain outside the project package.
 TMP/references/

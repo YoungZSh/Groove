@@ -45,6 +45,20 @@ class FakeMultimodalProcessor:
 
 
 class TeacherPromptTest(unittest.TestCase):
+    def test_missing_evidence_skips_teacher_prompt_construction(self):
+        trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
+        trainer.config = SimpleNamespace(groove={})
+        images = np.empty(2, dtype=object)
+        images[:] = [[], []]
+        batch = DataProto.from_dict(
+            tensors={"responses": torch.ones(2, 1, dtype=torch.long)},
+            non_tensors={"groove_teacher_images": images},
+        )
+        teacher, mask, metrics = trainer._build_groove_teacher_batch(batch)
+        self.assertIsNone(teacher)
+        self.assertEqual(mask.tolist(), [0.0, 0.0])
+        self.assertEqual(metrics["groove/teacher_prefix_cache_entries"], 0)
+
     def test_multimodal_prompt_is_resized_without_truncating_image_tokens(self):
         processor = FakeMultimodalProcessor()
         trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
