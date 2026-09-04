@@ -28,7 +28,9 @@ else
 fi
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$DEFAULT_TRAIN_BATCH_SIZE}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-$((TRAIN_BATCH_SIZE * ROLLOUT_N))}"
+# VERL 0.9 defines this in prompt groups and multiplies by rollout.n inside
+# the trainer before dispatching the completion batch.
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
 DATA_OUTPUT_DIR="${DATA_OUTPUT_DIR:-$PROJECT_ROOT/data/vision_opd_${DATA_MAX_SOURCE_ROWS}_seed${SEED}}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_OUTPUT_DIR/train.parquet}"
 TEST_FILE="${TEST_FILE:-$DATA_OUTPUT_DIR/test.parquet}"
@@ -141,7 +143,7 @@ FORMAT_REWARD_WEIGHT="${FORMAT_REWARD_WEIGHT:-0.1}"
 CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-$PROJECT_ROOT/src/groove/reward.py}"
 CUSTOM_REWARD_FUNCTION_NAME="${CUSTOM_REWARD_FUNCTION_NAME:-compute_score}"
 REWARD_MANAGER_NAME="${REWARD_MANAGER_NAME:-naive}"
-LAUNCH_REWARD_FN_ASYNC="${LAUNCH_REWARD_FN_ASYNC:-false}"
+REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-8}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$MAX_MODEL_LEN}"
 ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-$MAX_MODEL_LEN}"
 
@@ -168,25 +170,18 @@ fi
 
 if [[ "$OPSD_ENABLED" == "true" ]]; then
   OPSD_OVERRIDES=(
-    "actor_rollout_ref.actor.policy_loss.loss_mode=groove"
-    "actor_rollout_ref.actor.self_distillation.teacher_always_on=true"
-    "actor_rollout_ref.actor.self_distillation.teacher_model_source=current"
-    "actor_rollout_ref.actor.self_distillation.teacher_image_key=groove_teacher_images"
-    "actor_rollout_ref.actor.self_distillation.fallback_to_policy_loss_on_missing_teacher=true"
-    "actor_rollout_ref.actor.self_distillation.full_logit_distillation=false"
-    "actor_rollout_ref.actor.self_distillation.distillation_topk=null"
-    "actor_rollout_ref.actor.self_distillation.opsd_advantage_coef=$OPSD_ADVANTAGE_COEF"
-    "actor_rollout_ref.actor.self_distillation.opsd_advantage_clip=$OPSD_ADVANTAGE_CLIP"
-    "actor_rollout_ref.actor.self_distillation.log_prob_dump_dir=$OPSD_LOG_PROB_DUMP_DIR"
-    "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+    "actor_rollout_ref.actor.policy_loss.loss_mode=vanilla"
+    "groove.enabled=true"
+    "groove.opsd_advantage_coef=$OPSD_ADVANTAGE_COEF"
+    "groove.opsd_advantage_clip=$OPSD_ADVANTAGE_CLIP"
+    "groove.max_reprompt_len=$MAX_MODEL_LEN"
   )
 else
-  # Vanilla policy loss is the actual GRPO-only path.  Clearing the config
-  # prevents any future self-distillation helper from constructing a Teacher
-  # batch even if a stale setting is present in the base YAML.
+  # Vanilla policy loss is the actual GRPO-only path. The project-level flag
+  # is checked before constructing any privileged Teacher/evidence inputs.
   OPSD_OVERRIDES=(
     "actor_rollout_ref.actor.policy_loss.loss_mode=vanilla"
-    "actor_rollout_ref.actor.self_distillation=null"
+    "groove.enabled=false"
   )
 fi
 
@@ -264,14 +259,13 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   algorithm.adv_estimator=grpo \
   algorithm.norm_adv_by_std_in_grpo=true \
   algorithm.use_kl_in_reward=false \
-  reward_model.enable=false \
-  reward_model.use_reward_loop=false \
-  reward_model.launch_reward_fn_async="$LAUNCH_REWARD_FN_ASYNC" \
-  reward_manager.name="$REWARD_MANAGER_NAME" \
-  custom_reward_function.path="$CUSTOM_REWARD_FUNCTION_PATH" \
-  custom_reward_function.name="$CUSTOM_REWARD_FUNCTION_NAME" \
-  custom_reward_function.reward_kwargs.answer_reward_weight="$ANSWER_REWARD_WEIGHT" \
-  custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT" \
+  reward.reward_model.enable=false \
+  reward.num_workers="$REWARD_NUM_WORKERS" \
+  reward.reward_manager.name="$REWARD_MANAGER_NAME" \
+  reward.custom_reward_function.path="$CUSTOM_REWARD_FUNCTION_PATH" \
+  reward.custom_reward_function.name="$CUSTOM_REWARD_FUNCTION_NAME" \
+  reward.custom_reward_function.reward_kwargs.answer_reward_weight="$ANSWER_REWARD_WEIGHT" \
+  reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT" \
   trainer.project_name=groove-visual-evidence \
   trainer.experiment_name="$EXPERIMENT_NAME" \
   trainer.logger='["console"]' \
@@ -283,6 +277,7 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   trainer.max_actor_ckpt_to_keep="$MAX_ACTOR_CKPT_TO_KEEP" \
   trainer.test_freq="$TEST_FREQ" \
   trainer.val_before_train="$VAL_BEFORE_TRAIN" \
+  trainer.use_v1=false \
   trainer.default_local_dir="$CHECKPOINT_DIR" \
   trainer.rollout_data_dir="$ROLLOUT_DATA_DIR" \
   "$@"

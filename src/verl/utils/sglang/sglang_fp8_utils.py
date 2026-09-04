@@ -13,170 +13,115 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
+import re
+from collections.abc import Iterable
+from typing import Any
 
-import torch
-
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+from verl.utils.fp8_utils import FP8QuantizerHelper
 
 
-def should_quantize_param(param_name: str) -> bool:
-    """Determine whether to quantize to FP8 based on parameter name
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    get_value = getattr(config, "get", None)
+    if callable(get_value):
+        return get_value(key, default)
+    return getattr(config, key, default)
 
-    Quantization rules:
-    - Must end with .weight (exclude bias)
-    - Exclude embedding layers
-    - Exclude normalization layers
-    - Exclude output layer (lm_head)
-    """
-    # Must be a weight parameter
-    if not param_name.endswith(".weight"):
+
+def _normalize_ignored_layers(ignored_layers: Any) -> list[str]:
+    if ignored_layers is None:
+        return []
+    if isinstance(ignored_layers, str):
+        ignored_layers = ignored_layers.split(",")
+    elif not isinstance(ignored_layers, Iterable):
+        ignored_layers = [ignored_layers]
+
+    normalized = []
+    for layer in ignored_layers:
+        layer_name = str(layer).strip()
+        if layer_name:
+            normalized.append(layer_name)
+    return normalized
+
+
+def _dedupe_layers(ignored_layers: Iterable[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for layer in ignored_layers:
+        layer_lower = layer.lower()
+        if layer_lower in seen:
+            continue
+        seen.add(layer_lower)
+        deduped.append(layer)
+    return deduped
+
+
+def _get_ignored_layers_from_env() -> list[str]:
+    return _normalize_ignored_layers(os.getenv("SGLANG_FP8_IGNORED_LAYERS"))
+
+
+def get_sglang_fp8_ignored_layers(quant_config: Any = None) -> list[str]:
+    ignored_layers = []
+    ignored_layers.extend(_normalize_ignored_layers(_get_config_value(quant_config, "ignored_layers")))
+    ignored_layers.extend(_normalize_ignored_layers(_get_config_value(quant_config, "modules_to_not_convert")))
+    ignored_layers.extend(_get_ignored_layers_from_env())
+    return _dedupe_layers(ignored_layers)
+
+
+def _matches_ignored_layer(param_name: str, ignored_layer: str) -> bool:
+    ignored_layer = ignored_layer.strip()
+    if not ignored_layer:
         return False
 
-    # Layer types to exclude
-    exclude_patterns = [
-        "embed_tokens",  # Embedding layer
-        "lm_head",  # Output layer
-        "layernorm",  # LayerNorm
-        "norm",  # Various Norm layers
-        "ln_",  # LayerNorm variants
-        "embeddings",  # Embeddings
-    ]
+    name = param_name.strip(".")
+    module_name = name[: -len(".weight")] if name.lower().endswith(".weight") else name
+    if ignored_layer.startswith("re:"):
+        pattern = ignored_layer[3:]
+        return any(re.match(pattern, candidate) for candidate in (name, module_name))
 
-    # Check if matches exclude patterns
-    param_lower = param_name.lower()
-    for pattern in exclude_patterns:
-        if pattern in param_lower:
-            return False
-
-    # Layer types to include (Linear layers)
-    include_patterns = [
-        "q_proj",  # Query projection
-        "k_proj",  # Key projection
-        "v_proj",  # Value projection
-        "o_proj",  # Output projection
-        "gate_proj",  # Gate projection (for MLP)
-        "up_proj",  # Up projection (for MLP)
-        "down_proj",  # Down projection (for MLP)
-        "fc1",  # Fully connected 1
-        "fc2",  # Fully connected 2
-        "gate",  # Gate (for MoE)
-        "mlp",  # MLP layers
-    ]
-
-    # Check if matches include patterns
-    for pattern in include_patterns:
-        if pattern in param_lower:
-            logger.debug(f"Will quantize FP8: {param_name}")
+    ignored_layer = ignored_layer.lower().strip(".")
+    name = name.lower()
+    module_name = module_name.lower()
+    for candidate in (name, module_name):
+        if candidate == ignored_layer:
             return True
-
-    # Do not quantize by default
-    logger.debug(f"Skip quantization: {param_name}")
+        if candidate.startswith(f"{ignored_layer}."):
+            return True
+        if candidate.endswith(f".{ignored_layer}"):
+            return True
+        if f".{ignored_layer}." in f".{candidate}.":
+            return True
     return False
 
 
-def scaled_fp8_blockwise(
-    data_hp,
-    weight_block_size,
-):
-    # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
-    assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
+def build_sglang_fp8_quant_config(hf_config: Any = None, ignored_layers: Any = None) -> dict[str, Any]:
+    """Build SGLang block-wise FP8 config shared by server init and weight sync."""
+    fp8_quant_config = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
 
-    block_size1 = weight_block_size[1]
-    block_size0 = weight_block_size[0]
-    assert data_hp.shape[1] % block_size1 == 0, (
-        f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    )
-    assert data_hp.shape[0] % block_size0 == 0, (
-        f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
-    )
+    hf_quant_config = _get_config_value(hf_config, "quantization_config")
+    merged_ignored_layers = get_sglang_fp8_ignored_layers(hf_quant_config)
+    merged_ignored_layers.extend(_normalize_ignored_layers(ignored_layers))
+    merged_ignored_layers = _dedupe_layers(merged_ignored_layers)
+    if merged_ignored_layers:
+        fp8_quant_config["ignored_layers"] = merged_ignored_layers
 
-    # FP8
-    max_dtype = torch.finfo(torch.float8_e4m3fn).max
-
-    original_shape = data_hp.shape
-    blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
-
-    assert block_size1 == block_size0
-    data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
-
-    # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    data_hp = data_hp.permute(0, 2, 1, 3)
-    # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
-    data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
-
-    # Calculate max absolute value per block
-    max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
-
-    # Use FP32 scale
-    scale_fp = max_dtype / max_abs
-    scale_fp = torch.where(max_abs == 0, 1.0, scale_fp)
-    # preserve the behavior for 0 amax case
-    scale_fp = torch.where(max_abs == torch.inf, 1.0, scale_fp)
-
-    descale_fp = torch.reciprocal(scale_fp)
-
-    # Scale and saturate cast the data elements to max of target dtype
-    data_lp = torch.clamp(data_hp * scale_fp, min=-1 * max_dtype, max=max_dtype)
-
-    fp_data = data_lp.to(torch.float8_e4m3fn)
-
-    # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)
-    fp_data = fp_data.reshape(blk_m, blk_n, block_size0, block_size1).permute(0, 2, 1, 3).reshape(original_shape)
-
-    # Convert to target format, but still in original precision container
-    return fp_data, descale_fp
+    return fp8_quant_config
 
 
-def quant_weights_by_name(weights, quant_config, dtype=torch.bfloat16):
-    """FP8 quantization based on parameter name
+class SGLangFP8QuantizerHelper(FP8QuantizerHelper):
+    def __init__(self, quant_config):
+        super().__init__(quant_config)
+        self.ignored_layers = get_sglang_fp8_ignored_layers(quant_config)
 
-    Args:
-        weights: Generator of (name, tensor) pairs
-        quant_config: Quantization configuration
-        dtype: Data type for intermediate computation
-
-    Returns:
-        List of (name, tensor) pairs with quantized weights
-    """
-
-    weights_quantized = []
-
-    if isinstance(quant_config, dict):
-        weight_block_size = quant_config.get("weight_block_size")
-    else:
-        weight_block_size = getattr(quant_config, "weight_block_size", None)
-
-    if weight_block_size is None:
-        raise ValueError("weight_block_size not found in quant_config")
-
-    for k, v in weights:
-        # Check if quantization is needed
-        if not should_quantize_param(k):
-            weights_quantized.append((k, v))
-            continue
-
-        # Quantize to FP8
-        try:
-            if weight_block_size is not None:
-                if torch.distributed.get_rank() == 0:
-                    logger.debug(f"  Quantizing to FP8 blockwise: {k}")
-                param_lp, param_scale = scaled_fp8_blockwise(
-                    v.to(dtype),
-                    weight_block_size=weight_block_size,
-                )
-                param_scale = param_scale.squeeze(-1)
-                weights_quantized.append([k, param_lp])
-                weights_quantized.append([k + "_scale_inv", param_scale])
-            else:
-                raise ValueError(
-                    "Only blockwise quantization is supported. Please set weight_block_size in quant_config"
-                )
-        except Exception as e:
-            logger.error(f"Failed to quantize {k}: {e}")
-            # If quantization fails, use original weights
-            weights_quantized.append((k, v))
-
-    return weights_quantized
+    def should_quantize_param(self, param_name):
+        for ignored_layer in self.ignored_layers:
+            if _matches_ignored_layer(param_name, ignored_layer):
+                return False
+        return super().should_quantize_param(param_name)

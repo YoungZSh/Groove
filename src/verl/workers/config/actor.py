@@ -18,171 +18,32 @@ from typing import Any, Optional
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
-from verl.trainer.config import CheckpointConfig
+from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
 from verl.utils.profiler.config import ProfilerConfig
+from verl.utils.qat import QATConfig
 
-from .engine import FSDPEngineConfig, McoreEngineConfig
+from .checkpoint import McoreCheckpointConfig, MindSpeedCheckpointConfig
+from .engine import (
+    FSDPEngineConfig,
+    McoreEngineConfig,
+    MindSpeedEngineConfig,
+    TorchtitanEngineConfig,
+    VeOmniEngineConfig,
+)
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
-    "SelfDistillationConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
+    "VeOmniActorConfig",
+    "QATConfig",
+    "TorchTitanActorConfig",
+    "MindSpeedActorConfig",
 ]
-
-
-@dataclass
-class SelfDistillationConfig(BaseConfig):
-    """Configuration for self-distillation loss.
-
-    Args:
-        Distillation is enabled when policy_loss.loss_mode is "vopd" or "groove".
-        full_logit_distillation (bool): Whether to use full-logit KL distillation.
-        alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
-        gamma (float): Weight applied to the SDPO loss.
-        success_reward_threshold (float): Minimum sequence reward to be considered successful.
-        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region", "progressive".
-        teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
-        teacher_update_interval (Optional[int]): Hard-sync the teacher to the current student every N actor updates
-            when teacher_regularization="progressive".
-        distillation_topk (Optional[int]): If set, use top-k logits for distillation.
-        distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
-        max_reprompt_len (int): Maximum length of the reprompted prompt.
-        reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
-        dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
-        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
-        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
-        reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
-        solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
-        feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
-        include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
-        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
-        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
-        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
-        teacher_always_on (bool): Whether to distill every sample directly from a teacher input instead of selecting successful samples by reward.
-        teacher_model_source (str): Teacher source. Options: "legacy", "current" or "fixed".
-        teacher_model_path (Optional[str]): Fixed teacher model path when teacher_model_source="fixed".
-        teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
-        fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
-            policy loss for samples whose teacher_image_key column is empty.
-        log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
-        opsd_advantage_coef (float): Weight for the uncentered signed OPSD advantage.
-        opsd_advantage_clip (Optional[float]): Optional symmetric clip for the teacher-student log-prob gap.
-    """
-
-    full_logit_distillation: bool = True
-    alpha: float = 0.0
-    gamma: float = 1.0
-    success_reward_threshold: float = 1.0
-    teacher_regularization: str = "ema"
-    teacher_update_rate: float = 0.05
-    teacher_update_interval: Optional[int] = None
-    distillation_topk: Optional[int] = None
-    distillation_add_tail: bool = True
-    max_reprompt_len: int = 10240
-    reprompt_truncation: str = "right"
-    dont_reprompt_on_self_success: bool = False
-    remove_thinking_from_demonstration: bool = False
-    is_clip: Optional[float] = None
-    reprompt_template: str = (
-        "{prompt}{solution}{feedback}\n\n"
-        "Correctly solve the original question.\n"
-    )
-    solution_template: str = (
-        "\n"
-        "Correct solution:\n\n"
-        "{successful_previous_attempt}\n\n"
-    )
-    feedback_template: str = (
-        "\n"
-        "The following is feedback from your unsuccessful earlier attempt:\n\n"
-        "{feedback_raw}\n\n"
-    )
-    include_environment_feedback: bool = False
-    environment_feedback_only_without_solution: bool = False
-    teacher_always_on: bool = False
-    teacher_model_source: str = "legacy"
-    teacher_model_path: Optional[str] = None
-    teacher_image_key: Optional[str] = None
-    teacher_prompt_mode: Optional[str] = None
-    answer_hint_template: str = (
-        "\n\nHere is a reference solution to this problem:\n"
-        "{answer}\n\n"
-        "After understanding the reference solution, please try to solve this problem using your own approach below:\n"
-    )
-    fallback_to_policy_loss_on_missing_teacher: bool = False
-    log_prob_dump_dir: Optional[str] = None
-    opsd_advantage_coef: float = 0.01
-    opsd_advantage_clip: Optional[float] = None
-
-    def __post_init__(self):
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        if self.gamma < 0.0:
-            raise ValueError(f"self_distillation.gamma must be non-negative, got {self.gamma}")
-        if self.opsd_advantage_coef < 0.0:
-            raise ValueError(
-                "self_distillation.opsd_advantage_coef must be non-negative, "
-                f"got {self.opsd_advantage_coef}"
-            )
-        if self.opsd_advantage_clip is not None and self.opsd_advantage_clip <= 0.0:
-            raise ValueError(
-                "self_distillation.opsd_advantage_clip must be positive when set, "
-                f"got {self.opsd_advantage_clip}"
-            )
-        valid_teacher_regularization = ["ema", "trust-region", "progressive"]
-        if self.teacher_regularization not in valid_teacher_regularization:
-            raise ValueError(
-                "self_distillation.teacher_regularization must be one of "
-                f"{valid_teacher_regularization}, got {self.teacher_regularization}"
-            )
-        if not 0.0 <= self.teacher_update_rate <= 1.0:
-            raise ValueError(
-                f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}"
-            )
-        if self.teacher_update_interval is not None and self.teacher_update_interval <= 0:
-            raise ValueError(
-                "self_distillation.teacher_update_interval must be a positive integer "
-                f"when set, got {self.teacher_update_interval}"
-            )
-        if self.distillation_topk is not None and self.distillation_topk <= 0:
-            raise ValueError(
-                f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
-            )
-        if self.is_clip is not None and self.is_clip <= 0:
-            raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
-        if self.teacher_prompt_mode is not None and self.teacher_prompt_mode != "answer_hint":
-            raise ValueError(
-                f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"
-            )
-        if self.teacher_always_on and not self.teacher_image_key and self.teacher_prompt_mode != "answer_hint":
-            raise ValueError(
-                "self_distillation.teacher_image_key is required when teacher_always_on=True "
-                "(unless teacher_prompt_mode='answer_hint')"
-            )
-        valid_teacher_model_source = ["legacy", "current", "fixed"]
-        if self.teacher_model_source not in valid_teacher_model_source:
-            raise ValueError(
-                "self_distillation.teacher_model_source must be one of "
-                f"{valid_teacher_model_source}, got {self.teacher_model_source}"
-            )
-        if self.teacher_model_source == "fixed" and not self.teacher_model_path:
-            raise ValueError("self_distillation.teacher_model_path is required when teacher_model_source='fixed'")
-        if self.teacher_regularization == "progressive":
-            if self.teacher_model_source != "legacy":
-                raise ValueError(
-                    "self_distillation.teacher_regularization='progressive' requires "
-                    "teacher_model_source='legacy'"
-                )
-            if self.teacher_update_interval is None:
-                raise ValueError(
-                    "self_distillation.teacher_update_interval is required when "
-                    "teacher_regularization='progressive'"
-                )
 
 
 @dataclass
@@ -221,13 +82,15 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options include 'vanilla', 'clip-cov', 'kl-cov',
-            'gpg', 'vopd', and 'groove'.
+        loss_mode (str): Registered policy loss name. Options: 'vanilla', 'dppo_tv', 'dppo_kl', 'gspo', 'sapo',
+            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', and 'bypass_mode'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
+        rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
     loss_mode: str = "vanilla"
@@ -236,6 +99,8 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    dro_beta: Optional[float] = None
+    rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
 @dataclass
@@ -257,7 +122,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
         clip_ratio_c (float): Clipping ratio for critic loss.
-        loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
+        loss_agg_mode (str): Loss aggregation mode, including 'token-mean', 'token-sum', and sequence modes.
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
@@ -305,6 +170,7 @@ class ActorConfig(BaseConfig):
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
+    calculate_sum_pi_squared: bool = False
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward
     use_prefix_grouper: bool = False
@@ -313,7 +179,7 @@ class ActorConfig(BaseConfig):
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
     shuffle: bool = False
-    data_loader_seed: int = 1
+    data_loader_seed: int = 42
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
@@ -322,13 +188,13 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
-    self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
+    qat: QATConfig = field(default_factory=QATConfig)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -349,6 +215,7 @@ class ActorConfig(BaseConfig):
 
         valid_loss_agg_modes = [
             "token-mean",
+            "token-sum",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
             "seq-mean-token-sum-norm",
@@ -402,16 +269,19 @@ class McoreActorConfig(ActorConfig):
 
     Args:
         strategy (str): Training strategy set to 'megatron' for Megatron parallelism.
-        load_weight (bool): Whether to load model weights from checkpoint.
         megatron (dict[str, Any]): Configuration for Megatron parallelism settings.
         profile (dict[str, Any]): Configuration for profiling settings.
+        checkpoint (McoreCheckpointConfig): Megatron-specific checkpoint config
+            that adds ``mbridge_config`` on top of the base checkpoint fields.
     """
 
     strategy: str = "megatron"
-    load_weight: bool = True
+    entropy_from_logits_with_chunking: bool = False
+    entropy_from_logits_chunk_size: int = 2048
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
     use_rollout_log_probs: bool = False
+    checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
@@ -432,6 +302,8 @@ class FSDPActorConfig(ActorConfig):
         entropy_from_logits_with_chunking (bool): Whether to compute entropy from logits
             with chunking for memory efficiency.
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
+        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+            Forwarded to ``fsdp_config.pad_to_length``, which is what the engine reads.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
     """
@@ -440,17 +312,21 @@ class FSDPActorConfig(ActorConfig):
     grad_clip: float = 1.0
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
+    entropy_from_logits_chunk_size: int = 2048
     entropy_checkpointing: bool = False
+    pad_to_length: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     use_rollout_log_probs: bool = False
-    calculate_sum_pi_squared: bool = False
-    sum_pi_squared_checkpointing: bool = False
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
         super().__post_init__()
         self.engine = self.fsdp_config
+        # Sync strategy to engine config so engine_workers can pick the right FSDP version.
+        # EngineConfig.strategy defaults to None, so without this, engine_workers.py always
+        # falls back to FSDP1 even when actor.strategy="fsdp2".
+        object.__setattr__(self.engine, "strategy", self.strategy)
 
         # backward compatibility
         if self.ulysses_sequence_parallel_size > 1:
@@ -459,9 +335,96 @@ class FSDPActorConfig(ActorConfig):
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate FSDP actor configuration with runtime parameters."""
         super().validate(n_gpus, train_batch_size, model_config)
+        if (
+            self.ulysses_sequence_parallel_size > 1
+            and model_config
+            and not model_config.get("use_remove_padding", False)
+        ):
+            raise ValueError(
+                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+            )
 
-        if self.strategy in {"fsdp", "fsdp2"} and self.ulysses_sequence_parallel_size > 1:
-            if model_config and not model_config.get("use_remove_padding", False):
-                raise ValueError(
-                    "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
-                )
+
+@dataclass
+class VeOmniActorConfig(ActorConfig):
+    """Configuration for VeOmni actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'veomni' for VeOmni parallelism.
+        veomni (dict[str, Any]): Configuration for VeOmni settings.
+        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+            Forwarded to ``veomni.pad_to_length``, which is what the engine reads.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+    """
+
+    strategy: str = "veomni"
+    veomni: VeOmniEngineConfig = field(default_factory=VeOmniEngineConfig)
+    pad_to_length: bool = False
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate VeOmni actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.veomni
+        if self.veomni.router_replay.mode != "disabled" and not self.use_remove_padding:
+            raise RuntimeError(
+                "router_replay requires use_remove_padding=True. In VeOmni engine, "
+                "the non-remove-padding path also disables Ulysses SP slicing and "
+                "the fused-kernel log_probs path, and is not a tested production "
+                "configuration for MoE routing replay. Set "
+                "actor.use_remove_padding=True or router_replay.mode='disabled'."
+            )
+
+
+@dataclass
+class TorchTitanActorConfig(ActorConfig):
+    """Configuration for TorchTitan actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'torchtitan' for TorchTitan parallelism.
+        torchtitan (TorchtitanEngineConfig): Configuration for TorchTitan engine settings.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        use_rollout_log_probs (bool): Whether to use log probabilities from rollout engine
+    """
+
+    strategy: str = "torchtitan"
+    torchtitan: TorchtitanEngineConfig = field(default_factory=TorchtitanEngineConfig)
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate TorchTitan actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.torchtitan
+
+
+@dataclass
+class MindSpeedActorConfig(ActorConfig):
+    """Configuration for mindspeed actor models.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'mindspeed' for mindspeed parallelism.
+        mindspeed (dict[str, Any]): Configuration for mindspeed parallelism settings.
+        profile (dict[str, Any]): Configuration for profiling settings.
+        use_rollout_log_probs (bool): Whether to use log probabilities from rollout engine.
+        checkpoint (MindSpeedCheckpointConfig): MindSpeed-specific checkpoint config
+            (inherits ``mbridge_config`` from :class:`McoreCheckpointConfig`).
+    """
+
+    strategy: str = "mindspeed"
+    mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
+    profile: dict[str, Any] = field(default_factory=dict)
+    use_rollout_log_probs: bool = False
+    checkpoint: MindSpeedCheckpointConfig = field(default_factory=MindSpeedCheckpointConfig)
+
+    def __post_init__(self):
+        """Validate MindSpeed actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.mindspeed

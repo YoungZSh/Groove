@@ -14,7 +14,7 @@ done
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_grpo_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2200-seed20260904-b16-v1}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2200-seed20260904-b16-verl090-v2}"
 
 export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
 export PREPARE_DATA=false
@@ -30,7 +30,7 @@ export GROOVE_REQUIRE_SLEEP_LEVEL_2=false
 
 export TRAIN_BATCH_SIZE=16
 export ROLLOUT_N=8
-export PPO_MINI_BATCH_SIZE=128
+export PPO_MINI_BATCH_SIZE=16
 # Dynamic micro-batching for actor, reference, and log-prob passes. The first
 # end-to-end step used only ~19GB/GPU at 9K, so 32K materially improves GPU
 # occupancy while retaining ample room on the two 80GB cards.
@@ -45,11 +45,9 @@ export ENABLE_THINKING=false
 export STUDENT_IMAGE_MAX_PIXELS=null
 export STUDENT_IMAGE_PATCH_SIZE=16
 
-# Qwen3.5 interleaves full attention with Gated DeltaNet layers. VERL's generic
-# remove-padding path concatenates independent samples without passing sequence
-# boundaries to DeltaNet, which changes their log probabilities. Keep samples
-# separate until that backend gains sequence-boundary support.
-export MODEL_USE_REMOVE_PADDING=false
+# VERL 0.9 passes packed cu_seqlens/seq_idx through Qwen3.5's Gated DeltaNet
+# and causal-convolution layers, preventing cross-sample state leakage.
+export MODEL_USE_REMOVE_PADDING=true
 
 # Each DP rollout replica receives about 64 completions per training step.
 export ROLLOUT_TENSOR_PARALLEL_SIZE=1
@@ -73,9 +71,12 @@ export FUSED_ADAMW=true
 # Use the screened-data judge protocol as the sole outcome reward. Missing
 # answer tags are diagnostic only and do not reduce the binary accuracy score.
 export CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/deepeyes_reward.py"
-export CUSTOM_REWARD_FUNCTION_NAME=compute_score_batched
-export REWARD_MANAGER_NAME=batch
-export LAUNCH_REWARD_FN_ASYNC=true
+export CUSTOM_REWARD_FUNCTION_NAME=compute_score
+export REWARD_MANAGER_NAME=naive
+# VERL 0.9's reward worker is an async Ray actor: concurrent trajectory calls
+# share its executor, so one process can keep many remote Judge requests in
+# flight without the instability and startup cost of dozens of worker actors.
+export REWARD_NUM_WORKERS=1
 export ANSWER_REWARD_WEIGHT=1.0
 export FORMAT_REWARD_WEIGHT=0.0
 export DEEPEYES_JUDGE_BASE_URL=http://127.0.0.1:8002/v1

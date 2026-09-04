@@ -18,36 +18,27 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import inspect
 import json
-import logging
 import os
-import re
-import time
 import uuid
 from collections import defaultdict
-from copy import deepcopy
-from dataclasses import dataclass, field
-from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
-from string import Template
 from typing import Any, Optional
 
 import numpy as np
-import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from PIL import Image
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -57,83 +48,31 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    create_rl_dataset,
+    create_rl_sampler,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
-from verl.utils.chat_template import resolve_custom_chat_template
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
-from verl.utils.model import compute_position_id_with_mask
+from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.skip.skip_manager import SkipManager
 from verl.utils.torch_functional import masked_mean
-from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import FSDPEngineConfig
+from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ResourcePoolManager:
-    """
-    Define a resource pool specification. Resource pool will be initialized first.
-    """
-
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
-
-    def create_resource_pool(self):
-        """Create Ray resource pools for distributed training.
-
-        Initializes resource pools based on the resource pool specification,
-        with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
-        For Megatron backend, uses max_colocate_count>1 for different models.
-        """
-        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
-            resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
-            )
-            self.resource_pool_dict[resource_pool_name] = resource_pool
-
-        self._check_resource_available()
-
-    def get_resource_pool(self, role: Role) -> RayResourcePool:
-        """Get the resource pool of the worker_cls"""
-        return self.resource_pool_dict[self.mapping[role]]
-
-    def get_n_gpus(self) -> int:
-        """Get the number of gpus in this cluster."""
-        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
-
-    def _check_resource_available(self):
-        """Check if the resource pool can be satisfied in this ray cluster."""
-        node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
-
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
-        )
-        if total_available_gpus < total_required_gpus:
-            raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
-            )
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -196,22 +135,53 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def should_reuse_rollout_log_probs_as_old_log_probs(config, batch: DataProto) -> bool:
-    """Reuse rollout-time logprobs as the old-policy anchor for true on-policy updates.
+def compute_spec_decode_metrics(
+    spec_drafts,
+    spec_accepts,
+    spec_verifies,
+    non_padding_mask=None,
+) -> dict:
+    """Aggregate per-request speculative decoding stats.
 
-    This preserves the current SDPO loss mode while skipping the extra old_log_prob
-    recomputation when a step consists of exactly one PPO mini-batch and one PPO epoch.
+    Ratios are computed per request and then averaged, so long and short
+    responses have equal metric weight.
+
+    The three inputs come from the rollout engine (vLLM request spec-decode
+    stats or sglang ``meta_info["spec_*"]`` keys). Either all three are ``None``
+    (caller didn't fetch them, e.g. spec rollout disabled) and the function
+    is a no-op, or all three are populated; mixed state is a programmer error.
+
+    ``non_padding_mask`` is a numpy bool array used by sync PPO to drop padded
+    placeholder samples; pass ``None`` for async PPO.
     """
-    if "rollout_log_probs" not in batch.batch:
-        return False
+    if spec_drafts is None and spec_accepts is None and spec_verifies is None:
+        return {}
+    assert spec_drafts is not None and spec_accepts is not None and spec_verifies is not None, (
+        "spec_decode metrics require all three of spec_num_draft_tokens / "
+        "spec_num_accepted_tokens / spec_num_verify_steps; got partial inputs"
+    )
 
-    actor_cfg = config.actor_rollout_ref.actor
-    if actor_cfg.ppo_epochs != 1:
-        return False
+    drafts = spec_drafts.tolist() if hasattr(spec_drafts, "tolist") else list(spec_drafts)
+    accepts = spec_accepts.tolist() if hasattr(spec_accepts, "tolist") else list(spec_accepts)
+    verifies = spec_verifies.tolist() if hasattr(spec_verifies, "tolist") else list(spec_verifies)
 
-    effective_batch_size = batch.batch.batch_size[0]
-    expected_on_policy_batch_size = actor_cfg.ppo_mini_batch_size * config.actor_rollout_ref.rollout.n
-    return effective_batch_size == expected_on_policy_batch_size
+    if non_padding_mask is not None:
+        drafts = [d for d, keep in zip(drafts, non_padding_mask, strict=True) if keep]
+        accepts = [a for a, keep in zip(accepts, non_padding_mask, strict=True) if keep]
+        verifies = [v for v, keep in zip(verifies, non_padding_mask, strict=True) if keep]
+
+    if len(drafts) == 0:
+        return {}
+
+    # Treat zero-denominator samples as 0.0 and keep them in the mean.
+    per_sample_accept_rate = [(a / d) if d > 0 else 0.0 for a, d in zip(accepts, drafts, strict=True)]
+    per_sample_accept_length = [(1.0 + a / v) if v > 0 else 0.0 for a, v in zip(accepts, verifies, strict=True)]
+
+    n = len(drafts)
+    return {
+        "rollout/spec_accept_rate": float(sum(per_sample_accept_rate) / n),
+        "rollout/spec_accept_length": float(sum(per_sample_accept_length) / n),
+    }
 
 
 def compute_advantage(
@@ -287,6 +257,10 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # GDPO: pass raw data for per-dimension reward extraction
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["batch"] = data.batch
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -295,6 +269,8 @@ def compute_advantage(
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
@@ -306,6 +282,7 @@ def compute_advantage(
     return data
 
 
+@deprecated("Legacy trainer is deprecated, and wil be removed in v0.9.0. Please use `trainer.use_v1=True` instead.")
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -324,8 +301,6 @@ class RayPPOTrainer:
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
-        reward_fn=None,
-        val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
         collate_fn=None,
@@ -343,8 +318,6 @@ class RayPPOTrainer:
             resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
             ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
             processor: Optional data processor, used for multimodal data
-            reward_fn: Function for computing rewards during training.
-            val_reward_fn: Function for computing rewards during validation.
             train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
             val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
             collate_fn: Function to collate data samples into batches.
@@ -354,18 +327,8 @@ class RayPPOTrainer:
 
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
-        self.tokenizer.padding_side = "left"
-        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation") or {}
-        self.tokenizer.truncation_side = self_distillation_cfg.get("reprompt_truncation", "error")
         self.processor = processor
         self.config = config
-        custom_chat_template = resolve_custom_chat_template(self.config.actor_rollout_ref.model)
-        if custom_chat_template is not None:
-            if self.processor is not None:
-                self.processor.chat_template = custom_chat_template
-            self.tokenizer.chat_template = custom_chat_template
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -378,9 +341,9 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
-        # legacy reward model implementation
-        self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_reward_loop = self.config.reward_model.use_reward_loop
+        self.use_teacher_policy = need_teacher_policy(self.config)
+
+        self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
@@ -402,17 +365,16 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
-        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+        self.checkpoint_manager = None
+        self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
-
         if train_dataset is None:
             train_dataset = create_rl_dataset(
                 self.config.data.train_files,
@@ -421,7 +383,7 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("train_max_samples", -1),
             )
-        if val_dataset is None and self.config.data.val_files:
+        if val_dataset is None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files,
                 self.config.data,
@@ -442,34 +404,32 @@ class RayPPOTrainer:
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
         )
 
-        if self.val_dataset is not None:
-            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-            if val_batch_size is None:
-                val_batch_size = len(self.val_dataset)
+        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
 
-            self.val_dataloader = StatefulDataLoader(
-                dataset=self.val_dataset,
-                batch_size=val_batch_size,
-                num_workers=num_workers,
-                shuffle=self.config.data.get("validation_shuffle", True),
-                drop_last=False,
-                collate_fn=collate_fn,
-            )
-        else:
-            self.val_dataloader = None
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader) if self.val_dataloader else 0}"
+            f"{len(self.val_dataloader)}"
         )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -490,10 +450,11 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -501,22 +462,54 @@ class RayPPOTrainer:
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
+            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
-
         with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -531,19 +524,14 @@ class RayPPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            score_tensor = batch.batch.get("token_level_scores")
-            scores = score_tensor.sum(-1).cpu().tolist() if score_tensor is not None else [None] * len(batch)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
-            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "rollout_sample_id" in batch.batch:
-                reward_extra_infos_to_dump["rollout_sample_id"] = (
-                    batch.batch["rollout_sample_id"].detach().cpu().tolist()
-                )
-            if "uid" in batch.non_tensor_batch:
-                reward_extra_infos_to_dump["uid"] = [str(value) for value in batch.non_tensor_batch["uid"]]
+            reward_extra_infos_to_dump = {
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
+            }
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
@@ -581,1208 +569,29 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _compute_or_extract_reward(
-        self,
-        batch: DataProto,
-        reward_fn=None,
-        return_dict: bool = False,
-        sum_reward: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor | dict[str, Any]:
-        """
-        Compute or extract reward from batch.
-
-        When use_reward_loop=True, rewards are already computed during generate_sequences
-        and stored in rm_scores. This method directly extracts them instead of calling
-        reward functions which would only perform format conversion.
-
-        Args:
-            batch: DataProto containing the batch data
-            reward_fn: Reward function to use if rm_scores doesn't exist (for training/validation)
-            return_dict: Whether to return dict format with reward_extra_info (for validation)
-            sum_reward: Whether to sum reward tensor along last dimension (for REMAX baseline)
-
-        Returns:
-            If return_dict=True: dict with "reward_tensor" and "reward_extra_info"
-            If return_dict=False and sum_reward=True: summed reward_tensor (1D tensor)
-            If return_dict=False and sum_reward=False: reward_tensor (2D tensor)
-        """
-        # When rm_scores already exists, extract it directly (format conversion only)
-        if "rm_scores" in batch.batch.keys():
-            reward_tensor = batch.batch["rm_scores"]
-            if sum_reward:
-                reward_tensor = reward_tensor.sum(dim=-1)
-
-            if return_dict:
-                # Extract reward_extra_info if available
-                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
-                reward_extra_info = (
-                    {key: batch.non_tensor_batch[key] for key in reward_extra_keys} if reward_extra_keys else {}
-                )
-                return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
-            else:
-                # If sum_reward=True, only return tensor (for REMAX baseline)
-                if sum_reward:
-                    return reward_tensor
-                # Otherwise, return tuple with reward_extra_info (for training loop)
-                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
-                reward_extra_infos_dict = (
-                    {key: batch.non_tensor_batch[key] for key in reward_extra_keys} if reward_extra_keys else {}
-                )
-                return reward_tensor, reward_extra_infos_dict
-
-        if reward_fn is None and self._use_reward_free_teacher_vopd():
-            reward_tensor = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
-            if sum_reward:
-                reward_tensor = reward_tensor.sum(dim=-1)
-            if return_dict:
-                return {"reward_tensor": reward_tensor, "reward_extra_info": {}}
-            return reward_tensor, {}
-
-        # Otherwise, compute reward using reward_fn
-        if reward_fn is None:
-            raise ValueError("reward_fn must be provided when rm_scores is not available.")
-
-        if return_dict:
-            result = reward_fn(batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            if sum_reward:
-                reward_tensor = reward_tensor.sum(dim=-1)
-            reward_extra_info = result.get("reward_extra_info", {})
-            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
-        else:
-            reward_tensor, reward_extra_infos_dict = compute_reward(batch, reward_fn)
-            if sum_reward:
-                reward_tensor = reward_tensor.sum(dim=-1)
-            return reward_tensor, reward_extra_infos_dict
-
-    def _use_reward_free_teacher_vopd(self) -> bool:
-        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
-        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "vopd":
-            return False
-        if not self_distillation_cfg.get("teacher_always_on", False):
-            return False
-        if self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False):
-            return False
-        if self_distillation_cfg.get("teacher_image_key", None) is not None:
-            return True
-        if self_distillation_cfg.get("teacher_prompt_mode", None) == "answer_hint":
-            return True
-        return False
-
-    @staticmethod
-    def _collect_feedback(
-        include_environment_feedback: bool,
-        reward_extra_infos_dict: Optional[dict[str, Any]],
-        batch_size: int
-    ) -> list[Any]:
-        """
-        Collect environment feedback from reward_extra_infos_dict.
-
-        Args:
-            include_environment_feedback: Whether to include environment feedback
-            reward_extra_infos_dict: Dictionary containing reward extra information
-            batch_size: Size of the batch
-
-        Returns:
-            List of feedback strings (or None for entries without feedback)
-        """
-        feedback_list: list[Any] = [None] * batch_size
-        if include_environment_feedback and reward_extra_infos_dict is not None:
-            raw_feedback = reward_extra_infos_dict.get("feedback", [])
-            for i in range(min(len(raw_feedback), batch_size)):
-                # Only include non-empty feedback strings
-                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                    feedback_list[i] = raw_feedback[i]
-        return feedback_list
-
-    @staticmethod
-    def _message_content_to_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts = []
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type")
-                if item_type == "text":
-                    text_parts.append(item.get("text", ""))
-                elif item_type == "image":
-                    text_parts.append("<image>")
-                elif item_type == "video":
-                    text_parts.append("<video>")
-            return "".join(text_parts)
-        if isinstance(content, dict):
-            return str(content.get("text", ""))
-        return str(content)
-
-    @staticmethod
-    def _normalize_teacher_image(image: Any) -> Image.Image:
-        max_pixels = None
-        if isinstance(image, Image.Image):
-            normalized = image.convert("RGB")
-        elif isinstance(image, str):
-            with Image.open(image) as pil_image:
-                normalized = pil_image.convert("RGB")
-        elif isinstance(image, dict):
-            max_pixels = image.get("max_pixels")
-            if "image" in image:
-                normalized = RayPPOTrainer._normalize_teacher_image(image["image"])
-            elif image.get("bytes") is not None:
-                normalized = Image.open(BytesIO(image["bytes"])).convert("RGB")
-            elif "path" in image:
-                with Image.open(image["path"]) as pil_image:
-                    normalized = pil_image.convert("RGB")
-            else:
-                raise TypeError(f"Unsupported teacher image dictionary: {image.keys()}")
-        else:
-            raise TypeError(f"Unsupported teacher image type: {type(image)}")
-
-        if max_pixels is None:
-            return normalized
-        try:
-            max_pixels = int(max_pixels)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"teacher image max_pixels must be an integer, got {max_pixels!r}") from exc
-        if max_pixels <= 0 or normalized.width * normalized.height <= max_pixels:
-            return normalized
-        scale = (max_pixels / (normalized.width * normalized.height)) ** 0.5
-        size = (
-            max(1, round(normalized.width * scale)),
-            max(1, round(normalized.height * scale)),
-        )
-        return normalized.resize(size, Image.Resampling.LANCZOS)
-
-    def _swap_images_in_messages(self, messages: list[dict], teacher_images: list[Any]) -> list[dict]:
-        teacher_messages = deepcopy(messages)
-        image_offset = 0
-        for message in teacher_messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            new_content = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "image":
-                    if image_offset >= len(teacher_images):
-                        raise ValueError(
-                            f"Teacher image count is smaller than prompt image count: {len(teacher_images)=}, {image_offset=}"
-                        )
-                    new_content.append(
-                        {
-                            "type": "image",
-                            "image": self._normalize_teacher_image(teacher_images[image_offset]),
-                        }
-                    )
-                    image_offset += 1
-                else:
-                    new_content.append(item)
-            message["content"] = new_content
-        if image_offset != len(teacher_images):
-            raise ValueError(
-                f"Teacher image count does not match prompt image placeholders: {len(teacher_images)=}, {image_offset=}"
-            )
-        return teacher_messages
-
-    def _build_teacher_messages_from_template(self, messages: list[dict], teacher_images: list[Any]) -> list[dict]:
-        teacher_messages = deepcopy(messages)
-        normalized_images = [self._normalize_teacher_image(image) for image in teacher_images]
-        image_offset = 0
-
-        for message in teacher_messages:
-            content = message.get("content")
-            if isinstance(content, list):
-                continue
-            if not isinstance(content, str):
-                continue
-
-            content_list = []
-            segments = [segment for segment in re.split(r"(<image>)", content) if segment != ""]
-            for segment in segments:
-                if segment == "<image>":
-                    if image_offset >= len(normalized_images):
-                        raise ValueError(
-                            "Teacher image count is smaller than teacher_prompt placeholders: "
-                            f"{len(normalized_images)=}, {image_offset=}"
-                        )
-                    content_list.append({"type": "image", "image": normalized_images[image_offset]})
-                    image_offset += 1
-                else:
-                    content_list.append({"type": "text", "text": segment})
-            message["content"] = content_list
-
-        if image_offset != len(normalized_images):
-            raise ValueError(
-                "Teacher image count does not match teacher_prompt placeholders: "
-                f"{len(normalized_images)=}, {image_offset=}"
-            )
-        return teacher_messages
-
-    def _prepare_teacher_messages(
-        self,
-        prompt_messages: list[dict],
-        teacher_images: list[Any],
-        teacher_prompt_messages: Optional[list[dict]] = None,
-    ) -> list[dict]:
-        if teacher_prompt_messages is not None:
-            return self._build_teacher_messages_from_template(teacher_prompt_messages, teacher_images)
-        return self._swap_images_in_messages(prompt_messages, teacher_images)
-
-    def _prepare_opsd_teacher_messages(
-        self,
-        raw_prompt_messages: list[dict],
-        answer: str,
-        hint_template: str,
-    ) -> list[dict]:
-        teacher_messages = deepcopy(raw_prompt_messages)
-        last_msg = teacher_messages[-1]
-        content = last_msg["content"]
-        hint_suffix = hint_template.format(answer=answer)
-
-        if isinstance(content, list):
-            teacher_messages[-1]["content"] = list(content) + [{"type": "text", "text": hint_suffix}]
-        elif isinstance(content, str):
-            teacher_messages[-1]["content"] = content + hint_suffix
-        else:
-            raise TypeError(f"Unsupported message content type: {type(content)}")
-        return teacher_messages
-
-    @staticmethod
-    def _extract_images_from_messages(messages: list[dict]) -> list[Image.Image]:
-        images = []
-        for message in messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict) or item.get("type") != "image":
-                    continue
-                if "image" in item:
-                    images.append(RayPPOTrainer._normalize_teacher_image(item["image"]))
-                elif "path" in item:
-                    images.append(RayPPOTrainer._normalize_teacher_image(item["path"]))
-                elif "bytes" in item:
-                    images.append(RayPPOTrainer._normalize_teacher_image({"bytes": item["bytes"]}))
-        return images
-
-    @staticmethod
-    def _teacher_images_available(teacher_images: Any) -> bool:
-        if teacher_images is None:
-            return False
-        if isinstance(teacher_images, np.ndarray):
-            teacher_images = teacher_images.tolist()
-        elif not isinstance(teacher_images, (list, tuple)):
-            teacher_images = [teacher_images]
-        for image in teacher_images:
-            if image is None:
-                continue
-            if isinstance(image, str):
-                if image:
-                    return True
-                continue
-            if isinstance(image, dict):
-                if image.get("path") or image.get("bytes") is not None or image.get("image") is not None:
-                    return True
-                continue
-            return True
-        return False
-
-    def _get_visual_special_token_mappings(self) -> dict[int, str]:
-        processing_class = self.processor or self.tokenizer
-        if processing_class is None:
-            return {}
-
-        token_mappings: dict[int, str] = {}
-        attr_names = {
-            "image_token_id": "<|image_pad|>",
-            "video_token_id": "<|video_pad|>",
-            "vision_start_token_id": "<|vision_start|>",
-            "vision_end_token_id": "<|vision_end|>",
-        }
-        for attr_name, fallback_token in attr_names.items():
-            token_id = getattr(processing_class, attr_name, None)
-            if token_id is None:
-                token_id = getattr(getattr(processing_class, "tokenizer", None), attr_name, None)
-            if token_id is None:
-                tokenizer = getattr(processing_class, "tokenizer", processing_class)
-                if tokenizer is not None and hasattr(tokenizer, "convert_tokens_to_ids"):
-                    converted = tokenizer.convert_tokens_to_ids(fallback_token)
-                    if converted is not None and converted != getattr(tokenizer, "unk_token_id", None):
-                        token_id = converted
-            if token_id is not None:
-                token_mappings[int(token_id)] = fallback_token
-        return token_mappings
-
-    def _raise_if_response_contains_visual_special_tokens(
-        self,
-        response: torch.Tensor,
-        response_mask: torch.Tensor,
-        batch: DataProto,
-        sample_idx: int,
-    ) -> None:
-        visual_special_tokens = self._get_visual_special_token_mappings()
-        if not visual_special_tokens:
-            return
-
-        active_response = response[response_mask.bool()].detach().cpu()
-        bad_positions = [
-            (position, int(token_id))
-            for position, token_id in enumerate(active_response.tolist())
-            if int(token_id) in visual_special_tokens
-        ]
-        if not bad_positions:
-            return
-
-        bad_tokens = [
-            {
-                "position": position,
-                "token_id": token_id,
-                "token": visual_special_tokens[token_id],
-            }
-            for position, token_id in bad_positions
-        ]
-        uid = batch.non_tensor_batch["uid"][sample_idx] if "uid" in batch.non_tensor_batch else None
-        index = batch.non_tensor_batch["index"][sample_idx] if "index" in batch.non_tensor_batch else None
-        decoded_response = None
-        tokenizer = getattr(self.processor, "tokenizer", None) if self.processor is not None else self.tokenizer
-        if tokenizer is not None:
-            try:
-                decoded_response = tokenizer.decode(active_response.tolist(), skip_special_tokens=False)
-            except Exception:
-                decoded_response = None
-
-        message = (
-            "Response contains vision special tokens before teacher SDPO forward, which would corrupt "
-            f"image token accounting. sample_idx={sample_idx}, uid={uid}, index={index}, bad_tokens={bad_tokens}"
-        )
-        if decoded_response is not None:
-            message += f", response={decoded_response!r}"
-        logger.error(message)
-        raise ValueError(message)
-
-    def _needs_qwen2_5_vl_teacher_position_ids_compat(self) -> bool:
-        if self.processor is None:
-            return False
-
-        processor_name = type(self.processor).__name__.lower()
-        if "qwen2_5" in processor_name and "vl" in processor_name:
-            return True
-
-        model_path = str(getattr(self.config.actor_rollout_ref.model, "path", "")).lower()
-        return "qwen2.5-vl" in model_path or "qwen2_5_vl" in model_path or "qwen25_vl" in model_path
-
-    def _maybe_expand_qwen2_5_vl_prompt_position_ids(
-        self,
-        prompt_position_ids: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self._needs_qwen2_5_vl_teacher_position_ids_compat():
-            return prompt_position_ids
-
-        if prompt_position_ids.dim() != 2 or prompt_position_ids.shape[0] != 3:
-            return prompt_position_ids
-
-        valid_mask = prompt_attention_mask.bool()
-        text_position_ids = torch.ones(
-            (1, prompt_attention_mask.shape[-1]),
-            dtype=prompt_position_ids.dtype,
-            device=prompt_position_ids.device,
-        )
-        text_position_ids[0, valid_mask] = torch.arange(
-            valid_mask.sum().item(),
-            dtype=prompt_position_ids.dtype,
-            device=prompt_position_ids.device,
-        )
-        return torch.cat((text_position_ids, prompt_position_ids), dim=0)
-
-    @staticmethod
-    def _resize_teacher_images(images: list[Image.Image], scale: float) -> list[Image.Image]:
-        """Resize multimodal teacher images by a common area scale.
-
-        Qwen-VL expands every image placeholder into a number of image tokens
-        proportional to the processed image area.  Keeping a common scale for
-        the original image and its evidence crops preserves their relative
-        resolution while allowing the complete multimodal prompt to fit the
-        reprompt budget.
-        """
-        if scale >= 0.999:
-            return images
-
-        resized: list[Image.Image] = []
-        for image in images:
-            width = max(1, round(image.width * scale))
-            height = max(1, round(image.height * scale))
-            if (width, height) == image.size:
-                resized.append(image)
-            else:
-                resized.append(image.resize((width, height), Image.Resampling.LANCZOS))
-        return resized
-
-    @staticmethod
-    def _replace_teacher_message_images(
-        messages: list[dict], images: list[Image.Image]
-    ) -> list[dict]:
-        """Return messages whose image parts refer to ``images`` in order."""
-        updated_messages = deepcopy(messages)
-        image_offset = 0
-        for message in updated_messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict) or item.get("type") != "image":
-                    continue
-                if image_offset >= len(images):
-                    raise ValueError(
-                        "Teacher image count is smaller than message image placeholders: "
-                        f"{len(images)=}, {image_offset=}"
-                    )
-                # Remove path/bytes/max_pixels metadata so the processor sees
-                # exactly the resized PIL image selected by the token budget.
-                item.pop("path", None)
-                item.pop("bytes", None)
-                item.pop("max_pixels", None)
-                item["image"] = images[image_offset]
-                image_offset += 1
-
-        if image_offset != len(images):
-            raise ValueError(
-                "Teacher image count does not match message image placeholders: "
-                f"{len(images)=}, {image_offset=}"
-            )
-        return updated_messages
-
-    def _process_teacher_multimodal_prompt(
-        self,
-        messages: list[dict],
-        prompt_images: list[Image.Image],
-        apply_kwargs: dict[str, Any],
-        max_prompt_len: int,
-    ) -> tuple[str, dict[str, torch.Tensor]]:
-        """Process a multimodal Teacher prompt without truncating image tokens.
-
-        ``ProcessorMixin`` validates that the number of image tokens in the
-        rendered text equals the number in ``input_ids``.  Tokenizer-side
-        truncation can cut an expanded image block and make that invariant
-        false.  We therefore render/process without truncation and, if the
-        complete prompt is too long, downscale all images and try again.
-        """
-        if max_prompt_len <= 0:
-            raise ValueError(f"max_prompt_len must be positive, got {max_prompt_len}")
-
-        candidate_images = list(prompt_images)
-        candidate_messages = (
-            self._replace_teacher_message_images(messages, candidate_images)
-            if candidate_images
-            else messages
-        )
-        last_prompt_len = None
-        max_attempts = 8
-
-        # There is no image-token invariant to preserve for a text-only
-        # processor call, so retain the normal tokenizer truncation behavior.
-        if not candidate_images:
-            raw_prompt = self.processor.apply_chat_template(
-                candidate_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                **apply_kwargs,
-            )
-            model_inputs = dict(
-                self.processor(
-                    text=[raw_prompt],
-                    images=None,
-                    videos=None,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_prompt_len,
-                )
-            )
-            return raw_prompt, model_inputs
-
-        for attempt in range(max_attempts):
-            raw_prompt = self.processor.apply_chat_template(
-                candidate_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                **apply_kwargs,
-            )
-            model_inputs = dict(
-                self.processor(
-                    text=[raw_prompt],
-                    images=candidate_images or None,
-                    videos=None,
-                    return_tensors="pt",
-                    # Never truncate a multimodal prompt: Qwen-VL's processor
-                    # expands image placeholders before tokenizer validation.
-                    truncation=False,
-                )
-            )
-            prompt_len = int(model_inputs["input_ids"].shape[-1])
-            last_prompt_len = prompt_len
-            if prompt_len <= max_prompt_len:
-                return raw_prompt, model_inputs
-
-            if not candidate_images:
-                raise ValueError(
-                    "Teacher prompt exceeds max_prompt_len without images: "
-                    f"{prompt_len} > {max_prompt_len}"
-                )
-
-            # Image-token count is approximately proportional to image area.
-            # Leave a small margin for processor rounding to patch grids and
-            # rerender the chat template after each resize so its image-token
-            # placeholders and image_grid_thw stay synchronized.
-            scale = (max_prompt_len / prompt_len) ** 0.5 * 0.97
-            scale = min(scale, 0.90)
-            next_images = self._resize_teacher_images(candidate_images, scale)
-            if all(next_image.size == image.size for next_image, image in zip(next_images, candidate_images)):
-                break
-            candidate_images = next_images
-            candidate_messages = self._replace_teacher_message_images(
-                messages,
-                candidate_images,
-            )
-
-        raise ValueError(
-            "Teacher multimodal prompt still exceeds max_prompt_len after safe image resizing: "
-            f"{last_prompt_len} > {max_prompt_len}"
-        )
-
-    def _build_teacher_prompt_inputs(
-        self,
-        messages: list[dict],
-        responses: torch.Tensor,
-        response_mask: torch.Tensor,
-        max_prompt_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict[str, torch.Tensor]]]:
-        apply_kwargs = dict(self.config.data.apply_chat_template_kwargs or {})
-        processing_class = self.processor or self.tokenizer
-
-        teacher_multi_modal_inputs = None
-        if self.processor is not None:
-            prompt_images = self._extract_images_from_messages(messages)
-            raw_prompt, model_inputs = self._process_teacher_multimodal_prompt(
-                messages,
-                prompt_images,
-                apply_kwargs,
-                max_prompt_len,
-            )
-            teacher_multi_modal_inputs = model_inputs.copy()
-            prompt_input_ids = teacher_multi_modal_inputs.pop("input_ids").squeeze(0)
-            prompt_attention_mask = teacher_multi_modal_inputs.pop("attention_mask").squeeze(0)
-
-            if hasattr(self.processor, "get_rope_index"):
-                processor_model_type = getattr(getattr(self.processor, "config", None), "model_type", None)
-                if processor_model_type in {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}:
-                    mm_token_type_ids = teacher_multi_modal_inputs.pop("mm_token_type_ids", None)
-                    if mm_token_type_ids is None:
-                        mm_token_type_ids = torch.zeros_like(prompt_input_ids).unsqueeze(0)
-                        mm_token_type_ids[0][prompt_input_ids == self.processor.image_token_id] = 1
-                        video_token_id = getattr(self.processor, "video_token_id", None)
-                        if video_token_id is not None:
-                            mm_token_type_ids[0][prompt_input_ids == video_token_id] = 2
-
-                    prompt_position_ids = self.processor.get_rope_index(
-                        input_ids=prompt_input_ids.unsqueeze(0),
-                        mm_token_type_ids=mm_token_type_ids,
-                        image_grid_thw=teacher_multi_modal_inputs.get("image_grid_thw"),
-                        video_grid_thw=teacher_multi_modal_inputs.get("video_grid_thw"),
-                        attention_mask=prompt_attention_mask.unsqueeze(0),
-                    )
-                else:
-                    rope_index_kwargs = dict(
-                        input_ids=prompt_input_ids,
-                        attention_mask=prompt_attention_mask,
-                        image_grid_thw=teacher_multi_modal_inputs.get("image_grid_thw"),
-                        video_grid_thw=teacher_multi_modal_inputs.get("video_grid_thw"),
-                    )
-                    try:
-                        rope_index_signature = inspect.signature(self.processor.get_rope_index)
-                    except (TypeError, ValueError):
-                        rope_index_signature = None
-                    if rope_index_signature is None or "second_per_grid_ts" in rope_index_signature.parameters:
-                        rope_index_kwargs["second_per_grid_ts"] = teacher_multi_modal_inputs.get("second_per_grid_ts")
-
-                    try:
-                        prompt_position_ids = self.processor.get_rope_index(**rope_index_kwargs)
-                    except IndexError as exc:
-                        # Some Qwen-VL implementations expect a batch dimension here.
-                        if prompt_input_ids.dim() != 1 or "tuple index out of range" not in str(exc):
-                            raise
-                        rope_index_kwargs["input_ids"] = prompt_input_ids.unsqueeze(0)
-                        rope_index_kwargs["attention_mask"] = prompt_attention_mask.unsqueeze(0)
-                        prompt_position_ids = self.processor.get_rope_index(**rope_index_kwargs)
-                if isinstance(prompt_position_ids, tuple):
-                    prompt_position_ids = prompt_position_ids[0]
-                if prompt_position_ids.dim() == 3 and prompt_position_ids.shape[1] == 1:
-                    prompt_position_ids = prompt_position_ids.squeeze(1)
-                if (
-                    processor_model_type in {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}
-                    and prompt_position_ids.dim() == 2
-                    and prompt_position_ids.shape[0] == 3
-                ):
-                    text_position_ids = torch.arange(
-                        prompt_input_ids.shape[-1],
-                        dtype=prompt_position_ids.dtype,
-                        device=prompt_position_ids.device,
-                    ).unsqueeze(0)
-                    prompt_position_ids = torch.cat((text_position_ids, prompt_position_ids), dim=0)
-                prompt_position_ids = self._maybe_expand_qwen2_5_vl_prompt_position_ids(
-                    prompt_position_ids,
-                    prompt_attention_mask,
-                )
-            else:
-                prompt_position_ids = compute_position_id_with_mask(prompt_attention_mask.unsqueeze(0)).squeeze(0)
-        else:
-            raw_prompt = processing_class.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                **apply_kwargs,
-            )
-            teacher_prompt = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                return_tensors="pt",
-                return_dict=True,
-                continue_final_message=False,
-                add_generation_prompt=True,
-                max_length=max_prompt_len,
-                padding=False,
-                truncation=True,
-            )
-            prompt_input_ids = teacher_prompt["input_ids"].squeeze(0)
-            prompt_attention_mask = teacher_prompt["attention_mask"].squeeze(0)
-            prompt_position_ids = compute_position_id_with_mask(prompt_attention_mask.unsqueeze(0)).squeeze(0)
-
-        (
-            full_input_ids,
-            full_attention_mask,
-            full_position_ids,
-            response_start_idx,
-        ) = self._append_teacher_response(
-            prompt_input_ids,
-            prompt_attention_mask,
-            prompt_position_ids,
-            responses,
-            response_mask,
-        )
-
-        return full_input_ids, full_attention_mask, full_position_ids, response_start_idx, teacher_multi_modal_inputs
-
-    @staticmethod
-    def _append_teacher_response(
-        prompt_input_ids: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        prompt_position_ids: torch.Tensor,
-        response: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Append one sampled response to an already processed Teacher prefix.
-
-        All rollouts in one UID group share the same Teacher prompt and images;
-        only the sampled response differs.  Keeping this operation separate lets
-        the caller process the expensive multimodal prefix once per group while
-        preserving the exact position-id construction used by the uncached path.
-        """
-        response_cpu = response.cpu()
-        response_mask_cpu = response_mask.cpu()
-        full_input_ids = torch.cat([prompt_input_ids, response_cpu], dim=0)
-        full_attention_mask = torch.cat([prompt_attention_mask, response_mask_cpu], dim=0)
-        response_start_idx = torch.tensor(prompt_input_ids.shape[0], dtype=torch.long)
-        if prompt_position_ids.dim() == 1:
-            response_positions = torch.arange(
-                response_cpu.shape[0], dtype=prompt_position_ids.dtype
-            ) + prompt_position_ids[-1] + 1
-            full_position_ids = torch.cat([prompt_position_ids, response_positions], dim=0)
-        else:
-            response_positions = (
-                torch.arange(response_cpu.shape[0], dtype=prompt_position_ids.dtype).unsqueeze(0)
-                + prompt_position_ids[:, -1:].cpu()
-                + 1
-            )
-            full_position_ids = torch.cat([prompt_position_ids.cpu(), response_positions], dim=-1)
-        return full_input_ids, full_attention_mask, full_position_ids, response_start_idx
-
-    def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
-        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
-        uids = batch.non_tensor_batch["uid"]
-        success_by_uid: dict[Any, list[int]] = defaultdict(list)
-        for idx, uid in enumerate(uids):
-            if seq_scores[idx] >= success_reward_threshold:
-                success_by_uid[uid].append(idx)
-        return success_by_uid
-
-    @staticmethod
-    def _remove_thinking_trace(text: str) -> str:
-        """Remove <think>...</think> tags and their content from text."""
-        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-
-    def _get_solution(
-        self,
-        idx: int,
-        success_by_uid: dict[Any, list[int]],
-        uids: list[Any],
-        response_texts: list[str],
-        dont_reprompt_on_self_success: bool = False,
-        remove_thinking_from_demonstration: bool = False,
-    ) -> Optional[str]:
-        uid = uids[idx]
-        solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
-        if len(solution_idxs) == 0:
-            return None
-        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
-        solution_str = response_texts[solution_idx]
-        if remove_thinking_from_demonstration:
-            solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
-
-
-    def _maybe_build_self_distillation_batch(
-        self,
-        batch: DataProto,
-        reward_tensor: torch.Tensor,
-        reward_extra_infos_dict: Optional[dict[str, list]] = None,
-    ) -> Optional[tuple[DataProto, dict[str, float]]]:
-        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
-        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode not in {"vopd", "groove"}:
-            return None
-
-        device = batch.batch["input_ids"].device
-        response_mask = batch.batch["response_mask"]
-        responses = batch.batch["responses"]
-        batch_size = batch.batch.batch_size[0]
-
-        # Determine teacher input construction mode
-        teacher_prompt_mode = self_distillation_cfg.get("teacher_prompt_mode", None)
-        use_opsd_answer_hint = (
-            self_distillation_cfg.get("teacher_always_on", False)
-            and teacher_prompt_mode == "answer_hint"
-        )
-        # Build teacher inputs directly from teacher_image_key whenever teacher_always_on is enabled
-        # for both SDPO and OPD modes. Note: OPD is NOT reward-free globally; this branch only
-        # controls teacher-side input construction.
-        use_teacher_always_on_inputs = (
-            self_distillation_cfg.get("teacher_always_on", False)
-            and self_distillation_cfg.get("teacher_image_key", None) is not None
-            and not use_opsd_answer_hint
-        )
-
-        if use_opsd_answer_hint:
-            answer_hint_template = self_distillation_cfg.get(
-                "answer_hint_template",
-                "\n\nHere is a reference solution to this problem:\n{answer}\n\n"
-                "After understanding the reference solution, please try to solve this problem using your own approach below:\n",
-            )
-
-            teacher_input_ids_list = []
-            teacher_attention_mask_list = []
-            teacher_position_ids_list = []
-            teacher_response_start_idx_list = []
-            teacher_multi_modal_inputs_list = []
-            teacher_present_mask_list = []
-
-            for i in range(batch_size):
-                self._raise_if_response_contains_visual_special_tokens(
-                    responses[i],
-                    response_mask[i],
-                    batch,
-                    i,
-                )
-
-                reward_model_info = batch.non_tensor_batch.get("reward_model", [None] * batch_size)
-                answer = None
-                if reward_model_info[i] is not None and isinstance(reward_model_info[i], dict):
-                    answer = reward_model_info[i].get("ground_truth", None)
-                if answer is None:
-                    extra_info = batch.non_tensor_batch.get("extra_info", [None] * batch_size)
-                    if extra_info[i] is not None and isinstance(extra_info[i], dict):
-                        answer = extra_info[i].get("answer", None)
-
-                has_answer = answer is not None and str(answer).strip() != ""
-                teacher_present_mask_list.append(1.0 if has_answer else 0.0)
-
-                if not has_answer:
-                    answer = ""
-
-                raw_prompt_messages = list(batch.non_tensor_batch["raw_prompt"][i])
-                teacher_messages = self._prepare_opsd_teacher_messages(
-                    raw_prompt_messages,
-                    str(answer),
-                    answer_hint_template,
-                )
-
-                (
-                    teacher_input_ids,
-                    teacher_attention_mask,
-                    teacher_position_ids,
-                    teacher_response_start_idx,
-                    teacher_multi_modal_inputs,
-                ) = self._build_teacher_prompt_inputs(
-                    teacher_messages,
-                    responses[i],
-                    response_mask[i],
-                    max_prompt_len=self_distillation_cfg.max_reprompt_len,
-                )
-                teacher_input_ids_list.append(teacher_input_ids)
-                teacher_attention_mask_list.append(teacher_attention_mask)
-                teacher_position_ids_list.append(teacher_position_ids)
-                teacher_response_start_idx_list.append(teacher_response_start_idx)
-                teacher_multi_modal_inputs_list.append(teacher_multi_modal_inputs)
-
-            teacher_input_ids = torch.nn.utils.rnn.pad_sequence(
-                teacher_input_ids_list,
-                batch_first=True,
-                padding_value=self.tokenizer.pad_token_id or 0,
-            ).to(device)
-            teacher_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                teacher_attention_mask_list,
-                batch_first=True,
-                padding_value=0,
-            ).to(device)
-
-            max_teacher_len = teacher_input_ids.shape[1]
-            if teacher_position_ids_list[0].dim() == 1:
-                teacher_position_ids = torch.zeros(
-                    (batch_size, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, : position_ids.shape[-1]] = position_ids.to(device)
-            else:
-                rope_dims = teacher_position_ids_list[0].shape[0]
-                teacher_position_ids = torch.zeros(
-                    (batch_size, rope_dims, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, :, : position_ids.shape[-1]] = position_ids.to(device)
-
-            teacher_present_mask = torch.tensor(teacher_present_mask_list, dtype=torch.float32, device=device)
-            grpo_fallback_count = float(batch_size - teacher_present_mask.sum().item())
-            metrics = {
-                "self_distillation/teacher_always_on_fraction": teacher_present_mask.mean().item(),
-                "self_distillation/opsd_answer_hint_fraction": teacher_present_mask.mean().item(),
-                "self_distillation/policy_fallback_fraction": (1.0 - teacher_present_mask.mean()).item(),
-                "self_distillation/grpo_fallback_count": grpo_fallback_count,
-            }
-            return DataProto.from_dict(
-                tensors={
-                    "teacher_input_ids": teacher_input_ids,
-                    "teacher_attention_mask": teacher_attention_mask,
-                    "teacher_position_ids": teacher_position_ids,
-                    "teacher_response_start_idx": torch.stack(teacher_response_start_idx_list).to(device),
-                    "self_distillation_mask": teacher_present_mask,
-                },
-                non_tensors={"teacher_multi_modal_inputs": teacher_multi_modal_inputs_list},
-            ), metrics
-
-        if use_teacher_always_on_inputs:
-            teacher_image_key = self_distillation_cfg.teacher_image_key
-            if teacher_image_key not in batch.non_tensor_batch:
-                raise KeyError(f"Teacher image key `{teacher_image_key}` not found in batch.non_tensor_batch")
-            fallback_to_policy_loss = self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False)
-
-            teacher_input_ids_list = []
-            teacher_attention_mask_list = []
-            teacher_position_ids_list = []
-            teacher_response_start_idx_list = []
-            teacher_multi_modal_inputs_list = []
-            teacher_present_mask_list = []
-            # Rollouts with the same UID share one Teacher prompt and one set
-            # of evidence images.  Cache that expensive multimodal prefix once
-            # per group; only the sampled response is appended per rollout.
-            teacher_prefix_cache: dict[
-                str,
-                tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict[str, torch.Tensor]]],
-            ] = {}
-
-            for i in range(batch_size):
-                self._raise_if_response_contains_visual_special_tokens(
-                    responses[i],
-                    response_mask[i],
-                    batch,
-                    i,
-                )
-                teacher_prompt_messages = None
-                if "teacher_prompt" in batch.non_tensor_batch:
-                    teacher_prompt_messages = list(batch.non_tensor_batch["teacher_prompt"][i])
-
-                teacher_images = batch.non_tensor_batch[teacher_image_key][i]
-                if isinstance(teacher_images, np.ndarray):
-                    teacher_images = teacher_images.tolist()
-                elif teacher_images is None:
-                    teacher_images = []
-                else:
-                    teacher_images = list(teacher_images)
-                has_teacher_images = self._teacher_images_available(teacher_images)
-                teacher_present_mask_list.append(1.0 if has_teacher_images else 0.0)
-                if not has_teacher_images:
-                    if not fallback_to_policy_loss:
-                        raise ValueError(
-                            f"Teacher image key `{teacher_image_key}` is empty for sample {i}, "
-                            "but fallback_to_policy_loss_on_missing_teacher=False."
-                        )
-                    teacher_images = self._extract_images_from_messages(list(batch.non_tensor_batch["raw_prompt"][i]))
-
-                uid_value = batch.non_tensor_batch.get("uid", [i])[i]
-                cache_key = str(uid_value)
-                cached_prefix = teacher_prefix_cache.get(cache_key)
-                if cached_prefix is None:
-                    teacher_messages = self._prepare_teacher_messages(
-                        list(batch.non_tensor_batch["raw_prompt"][i]),
-                        teacher_images,
-                        teacher_prompt_messages=teacher_prompt_messages,
-                    )
-                    (
-                        first_input_ids,
-                        first_attention_mask,
-                        first_position_ids,
-                        first_response_start_idx,
-                        teacher_multi_modal_inputs,
-                    ) = self._build_teacher_prompt_inputs(
-                        teacher_messages,
-                        responses[i],
-                        response_mask[i],
-                        max_prompt_len=self_distillation_cfg.max_reprompt_len,
-                    )
-                    prefix_len = int(first_response_start_idx.item())
-                    if first_position_ids.dim() == 1:
-                        prefix_position_ids = first_position_ids[:prefix_len]
-                    else:
-                        prefix_position_ids = first_position_ids[..., :prefix_len]
-                    cached_prefix = (
-                        first_input_ids[:prefix_len].contiguous(),
-                        first_attention_mask[:prefix_len].contiguous(),
-                        prefix_position_ids.contiguous(),
-                        teacher_multi_modal_inputs,
-                    )
-                    teacher_prefix_cache[cache_key] = cached_prefix
-                    teacher_input_ids = first_input_ids
-                    teacher_attention_mask = first_attention_mask
-                    teacher_position_ids = first_position_ids
-                    teacher_response_start_idx = first_response_start_idx
-                else:
-                    (
-                        prefix_input_ids,
-                        prefix_attention_mask,
-                        prefix_position_ids,
-                        teacher_multi_modal_inputs,
-                    ) = cached_prefix
-                    (
-                        teacher_input_ids,
-                        teacher_attention_mask,
-                        teacher_position_ids,
-                        teacher_response_start_idx,
-                    ) = self._append_teacher_response(
-                        prefix_input_ids,
-                        prefix_attention_mask,
-                        prefix_position_ids,
-                        responses[i],
-                        response_mask[i],
-                    )
-                teacher_input_ids_list.append(teacher_input_ids)
-                teacher_attention_mask_list.append(teacher_attention_mask)
-                teacher_position_ids_list.append(teacher_position_ids)
-                teacher_response_start_idx_list.append(teacher_response_start_idx)
-                teacher_multi_modal_inputs_list.append(teacher_multi_modal_inputs)
-
-            teacher_input_ids = torch.nn.utils.rnn.pad_sequence(
-                teacher_input_ids_list,
-                batch_first=True,
-                padding_value=self.tokenizer.pad_token_id or 0,
-            ).to(device)
-            teacher_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                teacher_attention_mask_list,
-                batch_first=True,
-                padding_value=0,
-            ).to(device)
-
-            max_teacher_len = teacher_input_ids.shape[1]
-            if teacher_position_ids_list[0].dim() == 1:
-                teacher_position_ids = torch.zeros(
-                    (batch_size, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, : position_ids.shape[-1]] = position_ids.to(device)
-            else:
-                rope_dims = teacher_position_ids_list[0].shape[0]
-                teacher_position_ids = torch.zeros(
-                    (batch_size, rope_dims, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, :, : position_ids.shape[-1]] = position_ids.to(device)
-
-            teacher_present_mask = torch.tensor(teacher_present_mask_list, dtype=torch.float32, device=device)
-            grpo_fallback_count = float(batch_size - teacher_present_mask.sum().item())
-            metrics = {
-                "self_distillation/teacher_always_on_fraction": teacher_present_mask.mean().item(),
-                "self_distillation/teacher_image_swap_fraction": teacher_present_mask.mean().item(),
-                "self_distillation/policy_fallback_fraction": (1.0 - teacher_present_mask.mean()).item(),
-                "self_distillation/grpo_fallback_count": grpo_fallback_count,
-            }
-            return DataProto.from_dict(
-                tensors={
-                    "teacher_input_ids": teacher_input_ids,
-                    "teacher_attention_mask": teacher_attention_mask,
-                    "teacher_position_ids": teacher_position_ids,
-                    "teacher_response_start_idx": torch.stack(teacher_response_start_idx_list).to(device),
-                    "self_distillation_mask": teacher_present_mask,
-                },
-                non_tensors={"teacher_multi_modal_inputs": teacher_multi_modal_inputs_list},
-            ), metrics
-
-        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
-        prompt_texts = [self._message_content_to_text(msgs[-1]["content"]) for msgs in batch.non_tensor_batch["raw_prompt"]]
-
-        # Extract feedback if available and include_environment_feedback is enabled
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
-
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
-            )
-            for i in range(batch_size)
-        ]
-
-        def _build_teacher_message(i: int) -> list[dict]:
-            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-
-            # If feedback_only_without_solution is True, only use feedback when no solution exists
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
-
-            # build solution section
-            solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
-                )
-
-            # build feedback section
-            feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(
-                    feedback_raw=feedback_list[i]
-                )
-
-            # combine solution and feedback sections
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
-                    prompt=prompt_texts[i],
-                    solution=solution_section,
-                    feedback=feedback_section,
-                )
-            else:
-                reprompt_text = prompt_texts[i]
-
-            return system_messages + [
-                {"role": "user", "content": reprompt_text},
-            ]
-
-
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
-        enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
-        teacher_prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
-            continue_final_message=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-            max_length=self_distillation_cfg.max_reprompt_len,
-            padding=True,
-            truncation=True,
-        )
-        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
-        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
-        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
-        teacher_response_start_idx = torch.full(
-            (batch_size,),
-            teacher_prompt["input_ids"].shape[1],
-            dtype=torch.long,
-            device=device,
-        )
-
-        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-        feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
-            for i in range(batch_size)
-        ]
-
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
-
-        uids = set(batch.non_tensor_batch["uid"])
-        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
-        num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
-        metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
-            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
-        }
-        return DataProto.from_dict(tensors={
-            "teacher_input_ids": teacher_input_ids,
-            "teacher_attention_mask": teacher_attention_mask,
-            "teacher_position_ids": teacher_position_ids,
-            "teacher_response_start_idx": teacher_response_start_idx,
-            "self_distillation_mask": self_distillation_mask,
-        }), metrics
-
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = (
-            set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt", "teacher_prompt"})
-            & batch.non_tensor_batch.keys()
-        )
-        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation") or {}
-        teacher_image_key = self_distillation_cfg.get("teacher_image_key", None)
-        if teacher_image_key and teacher_image_key in batch.non_tensor_batch:
-            reward_model_keys.add(teacher_image_key)
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
         # For agent loop, we need reward model keys to compute score.
-        if self.async_rollout_mode:
-            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+        gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
+        """
+        compute reward use colocate reward model
+        """
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+        batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+        return batch_reward
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -1809,10 +618,6 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
-
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
@@ -1830,16 +635,19 @@ class RayPPOTrainer:
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+
+            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                # for colocate reward models, we need to sleep rollout model
+                # to spare GPU memory for reward model
+                self.checkpoint_manager.sleep_replicas()
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                # wake up rollout model
+                # replace with wake_up method once supported
+                self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -1862,13 +670,12 @@ class RayPPOTrainer:
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             # evaluate using reward_function
-            result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
-            reward_tensor = result["reward_tensor"]
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
+
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            reward_extra_info = result.get("reward_extra_info", {})
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
@@ -1976,13 +783,14 @@ class RayPPOTrainer:
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
                 role=str(actor_role),
             )
-            self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
+            self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
         else:
             raise NotImplementedError
 
@@ -1994,25 +802,34 @@ class RayPPOTrainer:
 
             critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
 
-            if self.use_legacy_worker_impl == "disable":
-                # convert critic_cfg into TrainingWorkerConfig
-                from verl.workers.engine_workers import TrainingWorkerConfig
+            # convert critic_cfg into TrainingWorkerConfig for the unified model engine worker
+            from verl.workers.engine_workers import TrainingWorkerConfig
 
-                orig_critic_cfg = critic_cfg
-                if orig_critic_cfg.strategy == "fsdp":
-                    engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
-                    engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-                    engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-                else:
-                    raise NotImplementedError(f"Unknown strategy {orig_critic_cfg.strategy=}")
+            orig_critic_cfg = critic_cfg
+            engine_config: EngineConfig = orig_critic_cfg.engine
+            engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+            engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
-                critic_cfg = TrainingWorkerConfig(
-                    model_type="value_model",
-                    model_config=orig_critic_cfg.model_config,
-                    engine_config=engine_config,
-                    optimizer_config=orig_critic_cfg.optim,
-                    checkpoint_config=orig_critic_cfg.checkpoint,
-                )
+            # Build the critic profiler config via the hydra path (same as the actor / ref / SFT),
+            # so its tool_config entries are real dataclass instances the torch/nsys/npu backends can
+            # read. The critic is a standalone TrainingWorker (no outer ActorRolloutRefWorker wrapper),
+            # and the trainer drives start_profile()/stop_profile() and train_batch annotation directly
+            # on it; without a profiler_config its DistProfiler silently degrades to a no-op, so the
+            # critic (update_critic / compute_values) was never profiled by any backend.
+            critic_omega_profiler_config = self.config.critic.get("profiler", {})
+            critic_profiler_config = (
+                omega_conf_to_dataclass(critic_omega_profiler_config) if critic_omega_profiler_config else None
+            )
+
+            critic_cfg = TrainingWorkerConfig(
+                model_type="value_model",
+                model_config=orig_critic_cfg.model,
+                engine_config=engine_config,
+                optimizer_config=orig_critic_cfg.optim,
+                checkpoint_config=orig_critic_cfg.checkpoint,
+                profiler_config=critic_profiler_config,
+                extra_context=getattr(self, "_critic_extra_context", {}),
+            )
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
@@ -2027,43 +844,12 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
-        # create a reward model if reward_fn is None
-        # for legacy discriminative reward model, we create a reward model worker here
-        # for reward loop discriminative reward model, we create a reward loop manager here
-        if not self.use_reward_loop:
-            # legacy reward model only handle reward-model based scenario
-            if self.use_rm:
-                # we create a RM here
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                rm_cls = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model
-                )
-                self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
-        else:
-            # reward loop handle hybrid reward scenario (rule, disrm, genrm, ...)
-            # Note: mode is always "async" since sync mode is deprecated
-            can_reward_loop_parallelize = not self.use_rm or self.config.reward_model.enable_resource_pool
-            # judge if we can asynchronously parallelize reward model with actor rollout
-            # two condition that we can parallelize reward model with actor rollout:
-            # 1. reward model is not enabled (rule-based reward can parallelize)
-            # 2. reward model is enabled but extra resource pool is enabled
-            # If we cannot parallelize, we should enable synchronous mode here, and launch a reward loop manager here
-            # else for parallelize mode, we launch a reward worker for each rollout worker (in agent loop, not here)
-            if not can_reward_loop_parallelize:
-                from verl.experimental.reward_loop import RewardLoopManager
-
-                self.config.reward_model.n_gpus_per_node = self.config.trainer.n_gpus_per_node
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                self.reward_loop_manager = RewardLoopManager(
-                    config=self.config,
-                    rm_resource_pool=resource_pool,
-                )
-
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
         # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        # See https://github.com/verl-project/verl/blob/master/examples/tutorial/ray/tutorial.ipynb
+        # for more information.
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
@@ -2082,6 +868,8 @@ class RayPPOTrainer:
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            if not class_dict:
+                continue
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
@@ -2093,17 +881,14 @@ class RayPPOTrainer:
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
-            if self.use_legacy_worker_impl == "disable":
-                self.critic_wg.reset()
-                # assign critic loss
-                from functools import partial
+            self.critic_wg.reset()
+            # assign critic loss
+            from functools import partial
 
-                from verl.workers.utils.losses import value_loss
+            from verl.workers.utils.losses import value_loss
 
-                value_loss_ = partial(value_loss, config=orig_critic_cfg)
-                self.critic_wg.set_loss_fn(value_loss_)
-            else:
-                self.critic_wg.init_model()
+            value_loss_ = partial(value_loss, config=orig_critic_cfg)
+            self.critic_wg.set_loss_fn(value_loss_)
 
         if self.use_reference_policy and not self.ref_in_actor:
             if str(Role.RefPolicy) in all_wg:
@@ -2114,12 +899,6 @@ class RayPPOTrainer:
                 assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
                 self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
 
-        self.rm_wg = None
-        # initalization of rm_wg will be deprecated in the future
-        if self.use_rm and not self.use_reward_loop:
-            self.rm_wg = all_wg[str(Role.RewardModel)]
-            self.rm_wg.init_model()
-
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
@@ -2127,9 +906,35 @@ class RayPPOTrainer:
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
+        # create reward loop manager
+        from verl.experimental.reward_loop import RewardLoopManager
+
+        # initalize reward loop manager
+        # reward model (colocate or standalone): get resource_pool
+        # no reward model: resource_pool = None
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
+        self.reward_loop_manager = RewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+        )
+
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
+
+        # initialize teacher loop manager
+        if self.use_teacher_policy:
+            from verl.experimental.teacher_loop import MultiTeacherModelManager
+
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            self.teacher_model_manager = MultiTeacherModelManager(
+                config=self.config,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
 
         # Support custom AgentLoopManager via config
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
@@ -2138,16 +943,42 @@ class RayPPOTrainer:
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-        else:
-            rm_resource_pool = None
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
-        self.async_rollout_manager = AgentLoopManager(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-            rm_resource_pool=rm_resource_pool,
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+        # teacher loop workers can sleep/wake together with rollout workers
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        self.async_rollout_manager = AgentLoopManager.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(),
+            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        # Support custom CheckpointEngineManager via config
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            from verl.checkpoint_engine import CheckpointEngineManager
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+
+        # sleep all replicas to load checkpoint
+        self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -2270,8 +1101,18 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            steps_per_epoch = len(self.train_dataloader)
+            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+            if at_epoch_boundary:
+                print(
+                    f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                    f"The saved state marks the dataloader as exhausted. "
+                    f"Next epoch will iterate from scratch."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -2283,8 +1124,6 @@ class RayPPOTrainer:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
-            if self.use_rm and not self.use_reward_loop:
-                self.rm_wg.start_profile(profile_step=self.global_steps)
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -2294,8 +1133,6 @@ class RayPPOTrainer:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
                 self.critic_wg.stop_profile()
-            if self.use_rm and not self.use_reward_loop:
-                self.rm_wg.stop_profile()
 
     def _get_dp_size(self, worker_group, role: str) -> int:
         """Get data parallel size from worker group dispatch info.
@@ -2388,72 +1225,87 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _compute_values(self, batch: DataProto) -> DataProto:
-        if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            tu.assign_non_tensor(batch_td, compute_loss=False)
-            output = self.critic_wg.infer_batch(batch_td)
-            output = output.get()
-            values = tu.get(output, "values")
-            values = no_padding_2_padding(values, batch_td)
-            values = tu.get_tensordict({"values": values.float()})
-            values = DataProto.from_tensordict(values)
-        else:
-            values = self.critic_wg.compute_values(batch)
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        tu.assign_non_tensor(batch_td, compute_loss=False)
+        output = self.critic_wg.infer_batch(batch_td)
+        output = output.get()
+        values = tu.get(output, "values")
+        values = no_padding_2_padding(values, batch_td)
+        values = tu.get_tensordict({"values": values.float()})
+        values = DataProto.from_tensordict(values)
         return values
 
+    def _postprocess_advantages(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: dict[str, list] | None,
+    ) -> tuple[DataProto, dict[str, float]]:
+        """Project extension point after advantage estimation and before updates."""
+        return batch, {}
+
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-        if self.use_legacy_worker_impl == "disable":
-            # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            metadata = {"calculate_entropy": False, "compute_loss": False}
-            if self.ref_in_actor:
-                metadata["no_lora_adapter"] = True
-            tu.assign_non_tensor(batch_td, **metadata)
-            if self.ref_in_actor:
-                output = self.actor_rollout_wg.compute_log_prob(batch_td)
-            else:
-                output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
-            # gather output
-            log_probs = tu.get(output, "log_probs")
-            # step 4. No padding to padding
-            log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
-            ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
-            ref_log_prob = DataProto.from_tensordict(ref_log_prob)
+        # step 1: convert dataproto to tensordict.
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        metadata = {"calculate_entropy": False, "compute_loss": False}
+        if self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        tu.assign_non_tensor(batch_td, **metadata)
+        if self.ref_in_actor:
+            output = self.actor_rollout_wg.compute_log_prob(batch_td)
         else:
-            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+        # gather output
+        log_probs = tu.get(output, "log_probs")
+        # step 4. No padding to padding
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        # step 5: rebuild a tensordict and convert to dataproto
+        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
+        ref_log_prob = DataProto.from_tensordict(ref_log_prob)
 
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
-        if self.use_legacy_worker_impl == "disable":
-            # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-            # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
-            output = self.actor_rollout_wg.compute_log_prob(batch_td)
-            # gather output
-            entropy = tu.get(output, "entropy")
-            log_probs = tu.get(output, "log_probs")
-            old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-            # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
-            log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
-            old_log_prob = DataProto.from_tensordict(old_log_prob)
-        else:
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-            old_log_prob_mfu = 0
+        # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
+        # step 1: convert dataproto to tensordict.
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=True,
+            calculate_sum_pi_squared=calculate_sum_pi_squared,
+            compute_loss=False,
+        )
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        # gather output
+        entropy = tu.get(output, "entropy")
+        log_probs = tu.get(output, "log_probs")
+        routed_experts = tu.get(output, "routed_experts")
+        sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
+
+        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        # step 4. No padding to padding
+        entropy = no_padding_2_padding(entropy, batch_td)
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        if sum_pi_squared is not None:
+            sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+        # step 5: rebuild a tensordict and convert to dataproto
+        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+        if routed_experts is not None:
+            result["routed_experts"] = routed_experts
+        if sum_pi_squared is not None:
+            result["sum_pi_squared"] = sum_pi_squared.float()
+        old_log_prob = tu.get_tensordict(result)
+        old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -2461,66 +1313,77 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
-        batch.meta_info["global_steps"] = self.global_steps
         # update actor
-        if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
-            batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
-            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-            ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
-            seed = self.config.actor_rollout_ref.actor.data_loader_seed
-            shuffle = self.config.actor_rollout_ref.actor.shuffle
-            tu.assign_non_tensor(
-                batch_td,
-                calculate_entropy=calculate_entropy,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
-                epochs=ppo_epochs,
-                seed=seed,
-                dataloader_kwargs={"shuffle": shuffle},
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to no-padding
+        batch_td = left_right_2_no_padding(batch_td)
+        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
+        distillation_use_topk = (
+            self.distillation_config.distillation_loss.loss_settings.use_topk
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
+        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
+        if is_distillation_enabled(self.config.get("distillation")):
+            distillation_loss_cfg = self.distillation_config.distillation_loss
+            distillation_only = (
+                distillation_use_topk
+                and not distillation_loss_cfg.use_task_rewards
+                and not distillation_loss_cfg.use_policy_gradient
             )
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+        shuffle = self.config.actor_rollout_ref.actor.shuffle
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=calculate_entropy,
+            distillation_use_topk=distillation_use_topk,
+            distillation_only=distillation_only,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+            compute_loss=True,
+        )
+        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        actor_output = tu.get(actor_output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        # modify key name
+        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
-            actor_output = self.actor_rollout_wg.update_actor(batch_td)
-            actor_output = tu.get(actor_output, "metrics")
-            actor_output = rename_dict(actor_output, "actor/")
-            # modify key name
-            actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
-            actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
-        else:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
-        if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
-            batch_td = left_right_2_no_padding(batch_td)
-            ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-            ppo_epochs = self.config.critic.ppo_epochs
-            seed = self.config.critic.data_loader_seed
-            shuffle = self.config.critic.shuffle
-            tu.assign_non_tensor(
-                batch_td,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
-                epochs=ppo_epochs,
-                seed=seed,
-                dataloader_kwargs={"shuffle": shuffle},
-            )
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to no-padding
+        batch_td = left_right_2_no_padding(batch_td)
+        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_epochs = self.config.critic.ppo_epochs
+        seed = self.config.critic.data_loader_seed
+        shuffle = self.config.critic.shuffle
+        tu.assign_non_tensor(
+            batch_td,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+        )
 
-            output = self.critic_wg.train_mini_batch(batch_td)
-            output = output.get()
-            output = tu.get(output, "metrics")
-            output = rename_dict(output, "critic/")
-            # modify key name
-            output["perf/mfu/critic"] = output.pop("critic/mfu")
-            critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
-        else:
-            critic_output = self.critic_wg.update_critic(batch)
+        output = self.critic_wg.train_mini_batch(batch_td)
+        output = output.get()
+        output = tu.get(output, "metrics")
+        output = rename_dict(output, "critic/")
+        # modify key name
+        output["perf/mfu/critic"] = output.pop("critic/mfu")
+        critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
     def fit(self):
@@ -2530,6 +1393,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -2539,29 +1405,28 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
-            group_name=self.config.trainer.get("group_name", None),
         )
 
         self.global_steps = 0
 
-        # load checkpoint before doing anything
+        # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
+        SkipManager.init(self.config)
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
-
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-            rollout_skip.wrap_generate_sequences()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -2570,6 +1435,8 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
+
+        SkipManager.set_step(self.global_steps)
 
         prev_step_profile = False
         curr_step_profile = (
@@ -2604,65 +1471,58 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                rollout_n = self.config.actor_rollout_ref.rollout.n
+                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                    # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                    # rollout after replicas have been put to sleep, which can leave async vLLM
+                    # engines in an invalid state for multi-turn agent workloads.
+                    gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
+                    gen_baseline_batch = gen_batch.slice(0, None)
+                    gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(len(gen_baseline_batch), dtype=bool)
+                    combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
+                    num_sampled_prompts = len(gen_batch_output)
+                else:
+                    combined_gen_batch = gen_batch_output
+                    num_sampled_prompts = len(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        if curr_step_profile:
+                            self.llm_server_manager.start_profile()
+                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        self.checkpoint_manager.sleep_replicas()
+                        if curr_step_profile:
+                            self.llm_server_manager.stop_profile()
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        timing_raw.update(combined_gen_output.meta_info["timing"])
+                        combined_gen_output.meta_info.pop("timing", None)
+
+                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                    if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                        gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                        gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                        if "__do_sample__" in gen_baseline_output.non_tensor_batch:
+                            gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                if not self.use_reward_loop:
-                                    rm_scores = self.rm_wg.compute_rm_score(batch)
-                                else:
-                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                    rm_scores = self.reward_loop_manager.compute_rm_score(batch)
-                                batch = batch.union(rm_scores)
+                        if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
+                            baseline_reward = self._compute_reward_colocate(gen_baseline_output)
+                            gen_baseline_output = gen_baseline_output.union(baseline_reward)
 
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, sum_reward=True
-                            )
+                        reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+                        batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
+                        del gen_baseline_output
+                    del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    # Stable step-local identifier used to join rollout JSONL
-                    # records with per-rank OPD token dumps after DP balancing.
-                    batch.batch["rollout_sample_id"] = torch.arange(
-                        len(batch), device=batch.batch["responses"].device, dtype=torch.long
-                    )
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -2682,30 +1542,14 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    reward_free_teacher_vopd = self._use_reward_free_teacher_vopd()
-                    reward_extra_infos_dict = {}
-                    if reward_free_teacher_vopd:
-                        reward_tensor = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
-                    else:
-                        with marked_timer("reward", timing_raw, color="yellow"):
-                            # compute reward model score
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                if not self.use_reward_loop:
-                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
-                                else:
-                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                                batch = batch.union(reward_tensor)
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self._compute_reward_colocate(batch)
+                            batch = batch.union(batch_reward)
 
-                            # Compute or extract reward for training
-                            if self.config.reward_model.launch_reward_fn_async:
-                                future_reward = compute_reward_async.remote(
-                                    data=batch, config=self.config, tokenizer=self.tokenizer
-                                )
-                            else:
-                                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                    batch, reward_fn=self.reward_fn, return_dict=False
-                                )
+                        # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2713,10 +1557,6 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    reuse_rollout_log_probs = (
-                        not bypass_recomputing_logprobs
-                        and should_reuse_rollout_log_probs_as_old_log_probs(self.config, batch)
-                    )
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -2725,8 +1565,6 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                    elif reuse_rollout_log_probs:  # Reuse rollout-time log_probs for true on-policy updates
-                        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -2745,26 +1583,22 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
+                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                raise ValueError(
+                                    "Detected conflicting router replay configuration: "
+                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                    "cannot be enabled simultaneously. "
+                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                    "it should not be set when using R2 mode."
+                                )
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                rollout_debug_metrics = calculate_debug_metrics(batch)
-                                metrics.update(rollout_debug_metrics)
-                                if os.environ.get("VERL_PRINT_ROLLOUT_LOGPROB_DIFF", "").lower() in {
-                                    "1",
-                                    "true",
-                                    "yes",
-                                }:
-                                    print(
-                                        "ROLLOUT_LOGPROB_DEBUG "
-                                        + json.dumps(rollout_debug_metrics, default=float),
-                                        flush=True,
-                                    )
+                                metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -2779,31 +1613,20 @@ class RayPPOTrainer:
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
-                        if not reward_free_teacher_vopd and self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-
-                        self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
-                        if self_distillation_data is not None:
-                            self_distillation_batch, self_distillation_metrics = self_distillation_data
-                            batch = batch.union(self_distillation_batch)
-                            metrics.update(self_distillation_metrics)
+                        reward_extra_infos_dict: dict[str, list]
+                        batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # Reward-free teacher SDPO never consumes real rewards or KL-in-reward.
-                        if reward_free_teacher_vopd:
-                            pass
                         # compute rewards. apply_kl_penalty if available
-                        elif self.config.algorithm.use_kl_in_reward:
-                            batch.batch["token_level_scores"] = reward_tensor
+                        if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_scores"] = reward_tensor
-                            batch.batch["token_level_rewards"] = reward_tensor
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -2820,28 +1643,26 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
-                        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-                        skip_advantage_for_vopd = self_distillation_cfg is not None and loss_mode == "vopd"
-                        if skip_advantage_for_vopd and "self_distillation_mask" in batch.batch.keys():
-                            skip_advantage_for_vopd = bool(torch.all(batch.batch["self_distillation_mask"] > 0.5).item())
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                            "norm_adv_by_std_in_grpo", True
+                        )  # GRPO adv normalization factor
 
-                        if not skip_advantage_for_vopd:
-                            # compute advantages, executed on the driver process
-                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                                "norm_adv_by_std_in_grpo", True
-                            )  # GRPO adv normalization factor
-
-                            batch = compute_advantage(
-                                batch,
-                                adv_estimator=self.config.algorithm.adv_estimator,
-                                gamma=self.config.algorithm.gamma,
-                                lam=self.config.algorithm.lam,
-                                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                                config=self.config.algorithm,
-                            )
-
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+                        batch, advantage_metrics = self._postprocess_advantages(
+                            batch,
+                            reward_tensor,
+                            reward_extra_infos_dict,
+                        )
+                        metrics.update(advantage_metrics)
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -2850,10 +1671,40 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.config.trainer.critic_warmup > self.global_steps:
+                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+
+                        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        # Check if the conditions for saving a checkpoint are met.
+                        # The conditions include a mandatory condition (1) and
+                        # one of the following optional conditions (2/3/4):
+                        # 1. The save frequency is set to a positive value.
+                        # 2. It's the last training step.
+                        # 3. The current step number is a multiple of the save frequency.
+                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step
+                            or self.global_steps % self.config.trainer.save_freq == 0
+                            or esi_close_to_expiration
+                        ):
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -2863,36 +1714,14 @@ class RayPPOTrainer:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
-                # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                esi_close_to_expiration = should_save_ckpt_esi(
-                    max_steps_duration=self.max_steps_duration,
-                    redundant_time=self.config.trainer.esi_redundant_time,
-                )
-                # Check if the conditions for saving a checkpoint are met.
-                # The conditions include a mandatory condition (1) and
-                # one of the following optional conditions (2/3/4):
-                # 1. The save frequency is set to a positive value.
-                # 2. It's the last training step.
-                # 3. The current step number is a multiple of the save frequency.
-                # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if is_last_step or (self.config.trainer.save_freq > 0 and (
-                    self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                )):
-                    if esi_close_to_expiration:
-                        print("Force saving checkpoint: ESI instance expiration approaching.")
-                    with marked_timer("save_checkpoint", timing_raw, color="green"):
-                        self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
@@ -2920,6 +1749,16 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # GDPO per-component reward metrics
+                gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+                if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+                    for key in gdpo_reward_keys:
+                        if key in batch.non_tensor_batch:
+                            vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                            metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                            metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                            metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                            metrics[f"gdpo/{key}/min"] = float(np.min(vals))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -2929,27 +1768,26 @@ class RayPPOTrainer:
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                    self.train_dataloader.sampler.update(batch=batch)
+                # Per-request spec decode metrics.
+                metrics.update(
+                    compute_spec_decode_metrics(
+                        batch.non_tensor_batch.get("spec_num_draft_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_accepted_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_verify_steps", None),
+                    )
+                )
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
-
-                if (
-                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
-                ):
-                    self.actor_rollout_wg.dump_memory_snapshot(
-                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
-                    )
+                SkipManager.set_step(self.global_steps)
 
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -2959,3 +1797,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dump_executor()

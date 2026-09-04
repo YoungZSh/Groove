@@ -17,18 +17,16 @@ from groove.verl_trainer import GrooveRayPPOTrainer
 class GrooveTrainerTest(unittest.TestCase):
     def test_vanilla_grpo_skips_online_teacher_construction(self):
         trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
-        trainer.config = SimpleNamespace(
-            actor_rollout_ref=SimpleNamespace(
-                actor=SimpleNamespace(policy_loss={"loss_mode": "vanilla"})
-            )
-        )
+        trainer.config = {"groove": {"enabled": False}}
         trainer._build_online_teacher_columns = lambda *_args: (_ for _ in ()).throw(
             AssertionError("GRPO-only mode must not build online OPSD evidence")
         )
 
-        result = trainer._maybe_build_self_distillation_batch(None, None, None)
+        batch = object()
+        result, metrics = trainer._postprocess_advantages(batch, None, None)
 
-        self.assertIsNone(result)
+        self.assertIs(result, batch)
+        self.assertEqual(metrics, {})
 
     def test_remote_evidence_builds_groups_concurrently(self):
         class FakeBatch:

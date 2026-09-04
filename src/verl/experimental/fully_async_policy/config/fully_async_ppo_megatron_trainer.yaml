@@ -18,29 +18,35 @@ async_training:
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
-  # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, LLMServerClient auto resume generation, making rollout interruption invisible to the AgentLoop.
   partial_rollout: True
-
-  # Whether to use rollout log probs for training
-  use_rollout_log_probs: True
-
-  # compute_prox_log_prob
-  compute_prox_log_prob: False
 
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Whether to enable dynamic resource scheduling.
+  # When True, hybrid rollout replicas are initialised on Trainer-node GPUs at
+  # startup (sleeping, memory returned to the training engine), and are kept
+  # active so that Trainer GPUs participate in rollout alongside standalone GPUs.
+  use_dynamic_resource_scheduling: False
 
-  # checkpoint_engine config for accelerating parameter synchronization between rollouter and trainer
-  checkpoint_engine:
-    # Whether to use checkpoint_engine
-    enable: True
+  # Name of the dynamic scheduling policy ("default" or custom registered name).
+  dynamic_schedule_policy: "default"
 
-    # Device buffer size for checkpoint_engine, default is 4096 MB
-    device_buffer_size_M: 4096
+  # Sample-collection ratio threshold for deactivating hybrid replicas.
+  # At each fit_step, the controller waits until
+  #   deactivate_ratio * required_samples * trigger_parameter_sync_step
+  # samples are buffered before deactivating hybrid replicas.
+  # Set lower (e.g. 0.3) to deactivate earlier; set to 1.0 for a full batch.
+  dynamic_schedule_deactivate_ratio: 0.3
 
-    # Enable the pipeline for broadcasting and updating parameters, but it requires more device memory
-    overlap_broadcast_and_consume: False
+  # Whether to rebalance (abort + clear sticky cache + resume) in-flight requests
+  # across newly activated hybrid replicas via least-loaded routing.
+  dynamic_schedule_enable_rebalance: True
+
+  # Maximum number of concurrent generation requests per replica.
+  concurrent_samples_per_replica: 16
 
 # Rollout config
 rollout:
@@ -57,20 +63,35 @@ rollout:
   # total rollout samples # TODO rename to total_rollout_samples
   total_rollout_steps: 100
 
-  # Number of epochs in training 
-  total_epochs: 10
-
-  # Test frequency, how many times a parameter update triggers a validation
-  test_freq: 1
-
 data:
   # Number of samples generated, currently only support 1
   gen_batch_size: 1
 
 actor_rollout_ref:
-  # checkpoint_engine config for accelerating parameter synchronization between rollouter and trainer
-  checkpoint_engine: ${oc.select:async_training.checkpoint_engine, null}
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    # When use_dynamic_resource_scheduling is enabled, hybrid replicas share the GPU with
+    # the training engine, so gpu_memory_utilization should be kept low (e.g. 0.3-0.5).
+    # standalone_gpu_memory_utilization applies only to standalone replicas (dedicated
+    # rollout GPUs); null means fall back to gpu_memory_utilization.
+    standalone_gpu_memory_utilization: null
+
+    checkpoint_engine:
+      backend: "nccl"
 
   actor:
-    # Whether to use rollout log probs for training
-    use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

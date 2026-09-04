@@ -1,12 +1,11 @@
 defaults:
   - ppo_trainer
-  - user
   - _self_
 
 actor_rollout_ref:
   hybrid_engine: true
   model:
-    enable_activation_offload: true
+    enable_activation_offload: false
     use_fused_kernels: true
     fused_kernel_options:
       impl_backend: torch
@@ -30,16 +29,7 @@ actor_rollout_ref:
       optimizer_offload: true
       reshard_after_forward: true
     policy_loss:
-      loss_mode: groove
-    self_distillation:
-      teacher_always_on: true
-      teacher_model_source: current
-      teacher_image_key: groove_teacher_images
-      fallback_to_policy_loss_on_missing_teacher: true
-      opsd_advantage_coef: 0.01
-      opsd_advantage_clip: null
-      full_logit_distillation: false
-      distillation_topk: null
+      loss_mode: vanilla
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:
@@ -66,13 +56,25 @@ algorithm:
 data:
   apply_chat_template_kwargs:
     enable_thinking: false
+  image_max_pixels: null
 
-custom_reward_function:
-  reward_kwargs:
-    answer_reward_weight: 0.9
-    format_reward_weight: 0.1
+reward:
+  custom_reward_function:
+    reward_kwargs:
+      answer_reward_weight: 0.9
+      format_reward_weight: 0.1
+
+# Project-specific OPSD settings are inert during pure GRPO. They stay outside
+# VERL's typed ActorConfig and are consumed only by the GROOVE adapter.
+groove:
+  enabled: false
+  opsd_advantage_coef: 0.01
+  opsd_advantage_clip: null
+  teacher_image_key: groove_teacher_images
+  max_reprompt_len: 9216
 
 trainer:
+  use_v1: false
   val_before_train: false
 
 ray_kwargs:

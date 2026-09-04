@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 from pathlib import Path
+from pprint import pprint
 
 import ray
 import verl
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from verl.trainer.main_ppo import TaskRunner, run_ppo
+from verl.trainer.main_ppo import run_ppo
+from verl.trainer.main_ppo_v0 import BaseTaskRunner
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
@@ -142,13 +145,63 @@ def validate_full_time_sharing(config) -> int:
     return int(VLLM_SLEEP_LEVEL)
 
 
-class GrooveTaskRunner(TaskRunner):
+class GrooveTaskRunner(BaseTaskRunner):
     def run(self, config):
-        # TaskRunner resolves this module global only inside the Ray driver process.
-        import verl.trainer.main_ppo as main_ppo
+        """Run VERL 0.9's synchronous dataflow with the GROOVE trainer."""
+        print(f"GrooveTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        pprint(OmegaConf.to_container(config, resolve=True))
+        OmegaConf.resolve(config)
 
-        main_ppo.RayPPOTrainer = GrooveRayPPOTrainer
-        return super().run(config)
+        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        self.add_critic_worker(config)
+        self.add_reward_model_resource_pool(config)
+        self.add_teacher_model_resource_pool(config)
+        self.add_ref_policy_worker(config, actor_rollout_cls)
+        validate_config(
+            config=config,
+            use_reference_policy=need_reference_policy(config),
+            use_critic=need_critic(config),
+        )
+
+        from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from verl.workers.config import HFModelConfig
+
+        model_config: HFModelConfig = omega_conf_to_dataclass(config.actor_rollout_ref.model)
+        tokenizer = model_config.tokenizer
+        processor = model_config.processor
+        resource_pool_manager = self.init_resource_pool_mgr(config)
+        train_dataset = create_rl_dataset(
+            config.data.train_files,
+            config.data,
+            tokenizer,
+            processor,
+            is_train=True,
+            max_samples=config.data.get("train_max_samples", -1),
+        )
+        val_dataset = create_rl_dataset(
+            config.data.val_files,
+            config.data,
+            tokenizer,
+            processor,
+            is_train=False,
+            max_samples=config.data.get("val_max_samples", -1),
+        )
+        trainer = GrooveRayPPOTrainer(
+            config=config,
+            tokenizer=tokenizer,
+            processor=processor,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=create_rl_sampler(config.data, train_dataset),
+        )
+        trainer.init_workers()
+        trainer.fit()
 
 
 def main() -> None:
@@ -173,21 +226,21 @@ def main() -> None:
             use_reference_policy=need_reference_policy(config),
             use_critic=need_critic(config),
         )
-        reward_kwargs = config.custom_reward_function.get("reward_kwargs", {})
+        reward_kwargs = config.reward.custom_reward_function.get("reward_kwargs", {})
         optimizer_overrides = config.actor_rollout_ref.actor.optim.get(
             "override_optimizer_config", {}
         ) or {}
         policy_loss_mode = str(config.actor_rollout_ref.actor.policy_loss.loss_mode)
-        opsd_enabled = policy_loss_mode in {"vopd", "groove"}
-        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation") or {}
+        groove_cfg = config.get("groove", {}) or {}
+        opsd_enabled = bool(groove_cfg.get("enabled", False))
         print(
             "groove config valid:",
             policy_loss_mode,
             config.actor_rollout_ref.rollout.n,
             config.trainer.n_gpus_per_node,
             f"opsd_enabled={opsd_enabled}",
-            f"opsd_advantage_coef={self_distillation_cfg.get('opsd_advantage_coef')}",
-            f"opsd_advantage_clip={self_distillation_cfg.get('opsd_advantage_clip')}",
+            f"opsd_advantage_coef={groove_cfg.get('opsd_advantage_coef')}",
+            f"opsd_advantage_clip={groove_cfg.get('opsd_advantage_clip')}",
             f"vllm_sleep_level={sleep_level}",
             "full_time_sharing=enabled",
             f"optimizer={config.actor_rollout_ref.actor.optim.optimizer_impl}."
@@ -203,10 +256,10 @@ def main() -> None:
             f"total_training_steps={config.trainer.total_training_steps}",
             f"train_files={list(config.data.train_files)}",
             f"val_files={list(config.data.val_files)}",
-            f"reward_manager={config.reward_manager.name}",
-            f"reward_async={config.reward_model.launch_reward_fn_async}",
-            f"reward_fn={config.custom_reward_function.path}:"
-            f"{config.custom_reward_function.name}",
+            f"reward_manager={config.reward.reward_manager.name}",
+            "reward_async=True",
+            f"reward_fn={config.reward.custom_reward_function.path}:"
+            f"{config.reward.custom_reward_function.name}",
             f"answer_reward_weight={reward_kwargs.get('answer_reward_weight')}",
             f"format_reward_weight={reward_kwargs.get('format_reward_weight')}",
         )

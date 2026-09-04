@@ -17,8 +17,8 @@ Router Replay Utilities
 Utilities for handling router replay functionality in Megatron models.
 """
 
+import inspect
 import warnings
-from typing import Optional
 
 import torch
 
@@ -31,20 +31,30 @@ except ImportError:
 from megatron.core import parallel_state as mpu
 from megatron.core.pipeline_parallel.schedules import get_schedule_table
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
-from verl.models.mcore.util import postprocess_packed_seqs, preprocess_packed_seqs
+from verl.models.mcore.util import (
+    postprocess_packed_seqs,
+    postprocess_thd_engine,
+    preprocess_packed_seqs,
+    preprocess_thd_engine,
+)
 from verl.utils.device import get_device_name
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 
 device_name = get_device_name()
 
 
+def _context_parallel_layout(tf_config) -> str:
+    if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid":
+        return "contiguous"
+    return "zigzag"
+
+
 # from megatron.core.transformer.transformer_block import get_num_layers_to_build
-def get_num_layers_to_build(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
-) -> int:
+def get_num_layers_to_build(config: TransformerConfig, vp_stage: int | None = None, pp_rank: int | None = None) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
@@ -167,7 +177,65 @@ def get_num_layers_to_build(
     return num_layers_to_build
 
 
-def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None):
+def is_moe_layer(tf_config, layer_idx):
+    moe_layer_freq = getattr(tf_config, "moe_layer_freq", None)
+
+    if isinstance(moe_layer_freq, int):
+        return layer_idx % moe_layer_freq == 0
+    elif isinstance(moe_layer_freq, list):
+        return moe_layer_freq[layer_idx] == 1
+    else:
+        raise ValueError(f"Unsupported moe_layer_freq type: {type(moe_layer_freq)}")
+
+
+def get_moe_num_layers_to_build(
+    config: TransformerConfig, vp_stage: int | None = None, pp_rank: int | None = None
+) -> int:
+    """Count the number of MoE layers assigned to the current rank.
+    When ``moe_layer_freq`` is 1 or unset, every transformer layer is an MoE
+    layer, so the count equals the total layer count. Otherwise only layers
+    whose global index satisfies the frequency predicate are counted.
+    Args:
+        config: Megatron TransformerConfig providing layer layout information.
+        vp_stage: Virtual-pipeline stage index (None defaults to current).
+        pp_rank: Pipeline-parallel rank (None defaults to current).
+    Returns:
+        Number of MoE layers on the specified rank/stage.
+    """
+    total_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+
+    sig = inspect.signature(get_transformer_layer_offset)
+    # core 0.12.1 is not support vp_stage and pp_rank as parameters
+    if "vp_stage" in sig.parameters and "pp_rank" in sig.parameters:
+        layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    elif "pp_rank" in sig.parameters:
+        layer_offset = get_transformer_layer_offset(config, pp_rank=pp_rank)
+    else:
+        layer_offset = get_transformer_layer_offset(config)
+
+    local_global_indices = range(layer_offset, layer_offset + total_layers)
+
+    num_moe_layers = sum(1 for idx in local_global_indices if is_moe_layer(config, idx))
+
+    return num_moe_layers
+
+
+def _context_parallel_layout(tf_config) -> str:
+    """Return the CP row layout used for THD packing, matching MegatronEngine.
+
+    Router-replay tensors must be sharded exactly like the model's own token rows; otherwise the
+    replayed routes are attached to the wrong tokens (or the shapes disagree outright, since the
+    zigzag layout doubles the alignment). Keep this in sync with
+    ``MegatronEngine._get_context_parallel_layout``.
+    """
+    if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid":
+        return "contiguous"
+    return "zigzag"
+
+
+def merge_router_topk_indices(
+    attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None, local_cp_size=None
+):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
     then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
@@ -202,15 +270,110 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
             .contiguous()
         )
 
-        batch_size, seq_len = attention_mask.shape[:2]
-        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
-        layers_topk_idx = postprocess_packed_seqs(
-            layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+        fp8 = tf_config.fp8
+        use_fp8_padding = fp8 in ["e4m3", "hybrid"]
+        cp_layout = _context_parallel_layout(tf_config)
+        min_local_rows = (
+            tf_config.csa_window_size
+            if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid"
+            else None
         )
+
+        cp_layout = _context_parallel_layout(tf_config)
+
+        if input_ids.is_nested:
+            batch_size = input_ids.shape[0]
+            _, packed_seq_params, _ = preprocess_thd_engine(
+                input_ids,
+                pre_process=True,
+                use_fp8_padding=use_fp8_padding,
+                min_local_rows=min_local_rows,
+                local_cp_size=local_cp_size,
+                cp_layout=cp_layout,
+            )
+            layers_topk_idx = postprocess_thd_engine(
+                layers_topk_idx,
+                packed_seq_params,
+                input_ids,
+                batch_size,
+                post_process=True,
+                local_cp_size=local_cp_size,
+                cp_layout=cp_layout,
+            )
+        else:
+            batch_size, seq_len = attention_mask.shape[:2]
+            _, packed_seq_params = preprocess_packed_seqs(
+                input_ids, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding
+            )
+            layers_topk_idx = postprocess_packed_seqs(
+                layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+            )
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
+def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Build a full-sequence replay mask for rollout-captured routes.
+
+    Response logprobs are read from shifted model rows, but those rows attend to
+    earlier hidden states whose MoE routing also affects the result. Replay every
+    causal row that can influence response logprobs and skip only the final
+    response row, whose logits are not used by ``no_padding_2_padding``.
+    """
+    total_lens = input_ids.offsets().diff()
+    response_lens = response_mask.sum(dim=-1).to(device=total_lens.device, dtype=total_lens.dtype)
+    bs = total_lens.size(0)
+    values = torch.tensor([True, False], dtype=torch.bool, device=total_lens.device).repeat(bs)
+    replay_lens = torch.where(response_lens > 0, total_lens - 1, torch.zeros_like(total_lens))
+    suffix_lens = total_lens - replay_lens
+    counts = torch.stack([replay_lens, suffix_lens], dim=1).flatten()
+    mask_values = torch.repeat_interleave(values, counts)
+    return torch.nested.nested_tensor_from_jagged(mask_values, offsets=input_ids.offsets())
+
+
+def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """Align rollout routes with full training inputs one sequence at a time.
+
+    Autoregressive rollout records the routes used to predict each generated
+    token, so it has no route for the final generated token. The R3 replay mask
+    leaves that final model row native; append one ignored placeholder per
+    affected sequence so route and model tensors still have identical shapes.
+    """
+    if not layers_topk_idx.is_nested or not input_ids.is_nested:
+        raise TypeError("R3 router replay requires jagged route targets and input_ids")
+
+    route_parts = list(layers_topk_idx.unbind())
+    input_lens = [int(length) for length in input_ids.offsets().diff().tolist()]
+    if len(route_parts) != len(input_lens):
+        raise RuntimeError(
+            f"R3 router replay has {len(route_parts)} route sequences for {len(input_lens)} input sequences"
+        )
+
+    aligned_parts = []
+    for sample_id, (routes, input_len) in enumerate(zip(route_parts, input_lens, strict=True)):
+        route_len = routes.shape[0]
+        if route_len == input_len:
+            aligned_parts.append(routes)
+        elif route_len == input_len - 1:
+            placeholder = torch.zeros((1, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
+            aligned_parts.append(torch.cat((routes, placeholder), dim=0))
+        else:
+            raise RuntimeError(
+                f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
+                "expected equal lengths or exactly one missing final route"
+            )
+
+    return torch.nested.as_nested_tensor(aligned_parts, layout=torch.jagged)
+
+
+def set_router_replay_data(
+    layers_topk_idx,
+    attention_mask,
+    tf_config,
+    vp_rank=None,
+    replay_mask=None,
+    local_cp_size=None,
+    model=None,
+):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -225,28 +388,130 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         tf_config: Megatron/Transformer engine configuration object.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
             Megatron parallel state will be used.
+        replay_mask (Optional[torch.Tensor]): Optional per-token mask. Masked tokens use replayed routes;
+            unmasked tokens keep native Megatron routes.
+        model: The forwarded model (or list of VPP chunks). When given, targets are written to its own
+            routers instead of a positional slice of the global RouterReplay.router_instances list.
 
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
     with torch.no_grad():
-        layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+        fp8 = tf_config.fp8
+        use_fp8_padding = fp8 in ["e4m3", "hybrid"]
+        cp_layout = _context_parallel_layout(tf_config)
+        min_local_rows = (
+            tf_config.csa_window_size
+            if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid"
+            else None
+        )
+
+        cp_layout = _context_parallel_layout(tf_config)
+
+        replay_mask_rmpad = None
+        if layers_topk_idx.is_nested:
+            layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(
+                layers_topk_idx,
+                pre_process=True,
+                use_fp8_padding=use_fp8_padding,
+                min_local_rows=min_local_rows,
+                local_cp_size=local_cp_size,
+                cp_layout=cp_layout,
+            )
+            if replay_mask is not None:
+                replay_mask_rmpad, _, _ = preprocess_thd_engine(
+                    replay_mask,
+                    pre_process=True,
+                    use_fp8_padding=use_fp8_padding,
+                    min_local_rows=min_local_rows,
+                    local_cp_size=local_cp_size,
+                    cp_layout=cp_layout,
+                )
+        else:
+            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(
+                layers_topk_idx, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding
+            )
         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
         # 1, dynamic_bs_split, layer_num, topk
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
         ).unsqueeze(dim=0)
+        replay_mask_rmpad_split = None
+        if replay_mask_rmpad is not None:
+            replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
+                replay_mask_rmpad.to(device_name).squeeze(dim=0)
+            )
 
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
             dim=0
         )  # layer_num, dynamic_bs_all, topk
+        # When dim-0 covers all layers (e.g. R3, or R2 with all-MoE models),
+        # index by absolute layer_idx; otherwise (R2 with mixed dense/MoE),
+        # dim-0 only contains MoE layers, index by MoE-layer ordinal.
+        index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
+
+        if model is not None:
+            for layer_number, router in iter_model_routers(model):
+                layer_idx = layer_number - 1
+                idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
+                if 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                    router.set_target_indices(
+                        layers_topk_idx_reshape[idx].to(torch.int64),
+                        replay_mask=replay_mask_rmpad_split,
+                    )
+            return
+
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset, _ = local_rank_info["start"], local_rank_info["end"]
+        offset, end = local_rank_info["start"], local_rank_info["end"]
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        for i, router in enumerate(router_instances_list):
-            router.set_target_indices(layers_topk_idx_reshape[i + offset].to(torch.int64))
+
+        # For R2: count MoE layers before `offset` as the starting position.
+        moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
+
+        router_offset = 0
+        for layer_idx in range(offset, end):
+            if not is_moe_layer(tf_config, layer_idx):
+                continue
+            router = router_instances_list[router_offset]
+            idx = layer_idx if index_by_layer else moe_idx
+            router.set_target_indices(
+                layers_topk_idx_reshape[idx].to(torch.int64),
+                replay_mask=replay_mask_rmpad_split,
+            )
+            router_offset += 1
+            moe_idx += 1
+
+
+def iter_model_routers(model):
+    """Yield ``(layer_number, RouterReplay)`` for every replay-enabled router owned by ``model``.
+
+    ``model`` is a single module or the list of virtual-pipeline chunks. The process-global
+    ``RouterReplay.router_instances`` list can hold more routers than this model has local layers —
+    a model that rebuilds its decoder registers a set it then discards — so a positional slice of it
+    can address the wrong objects. Walking the forwarded model reaches each layer's own router.
+    """
+    for chunk in model if isinstance(model, list | tuple) else [model]:
+        # Scope to the decoder: MTP layers restart layer numbering at 1, so they alias decoder
+        # layers, and the replay tensor carries no MTP rows. ``mtp`` is a sibling of ``decoder``
+        # on both GPTModel and HybridModel, the only two classes that build one.
+        for module in getattr(chunk, "decoder", chunk).modules():
+            router = getattr(module, "router_replay", None)
+            if isinstance(module, TopKRouter) and router is not None and module.layer_number is not None:
+                yield module.layer_number, router
+
+
+def set_model_router_replay_action(model, router_replay_action):
+    """Set the router replay action on the forwarded model's own routers.
+
+    Mirrors the module walk in ``set_router_replay_data``. Toggling through the positional slice can
+    miss the real routers, leaving them stuck in REPLAY_FORWARD so the backward recompute reads a
+    stale cross-micro-batch ``target_topk_idx`` instead of popping its own entry from
+    ``replay_backward_list``.
+    """
+    for _, router in iter_model_routers(model):
+        router.set_router_replay_action(router_replay_action)
 
 
 def reorder_and_merge_vpp_layers(
@@ -287,11 +552,22 @@ def reorder_and_merge_vpp_layers(
     for vidx, (_mb, chunk_id) in enumerate(schedule_table):
         tensor_by_chunk[chunk_id].append(micro_batch_tensor_list[vidx])
 
-    for chunk_id in range(vpp_size):
-        mini_tensor_list.append(torch.cat(tensor_by_chunk[chunk_id], dim=0))
+    if micro_batch_tensor_list[0].is_nested:
+        for chunk_id in range(vpp_size):
+            mini_tensor_list.append(merge_nested_router_maps(tensor_by_chunk[chunk_id]))
+    else:
+        for chunk_id in range(vpp_size):
+            mini_tensor_list.append(torch.cat(tensor_by_chunk[chunk_id], dim=0))
 
     out = torch.cat(mini_tensor_list, dim=2)
+
     return out
+
+
+def merge_nested_router_maps(router_maps) -> torch.Tensor:
+    """Flatten recorded micro-batch routes into one uint8 jagged tensor."""
+    tensors = [tensor.to(torch.uint8) for router_map in router_maps for tensor in router_map.unbind()]
+    return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 
 
 def get_current_rank_layer_info(tf_config, vp_rank=None):
@@ -310,7 +586,13 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
     if vp_rank is None:
         vp_rank = 0
     num_layers_to_build = get_num_layers_to_build(tf_config, vp_stage=vp_rank)
-    offset = get_transformer_layer_offset(tf_config, vp_stage=vp_rank)
+
+    sig = inspect.signature(get_transformer_layer_offset)
+
+    if "vp_stage" in sig.parameters:
+        offset = get_transformer_layer_offset(tf_config, vp_stage=vp_rank)
+    else:
+        offset = get_transformer_layer_offset(tf_config)
     local = {}
     local["start"] = offset
     local["end"] = offset + num_layers_to_build
@@ -337,34 +619,47 @@ def pp_gather(local_layers_router_map, tf_config):
 
     pp_group = mpu.get_pipeline_model_parallel_group()
     world_size = torch.distributed.get_world_size(pp_group)
-    local_layers_router_map = local_layers_router_map.to(device_name)
-    layers_topk_idx_global_list = [
-        torch.empty(
-            size=local_layers_router_map.shape,
-            dtype=local_layers_router_map.dtype,
-            device=local_layers_router_map.device,
+    if local_layers_router_map.is_nested:
+        # all_gather_object preserves each sender's CUDA device, so normalize
+        # jagged route maps before concatenating routes from local PP ranks.
+        local_layers_router_map = local_layers_router_map.to("cpu")
+        layers_topk_idx_global_list = [None] * world_size
+        torch.distributed.all_gather_object(layers_topk_idx_global_list, local_layers_router_map, pp_group)
+    else:
+        local_layers_router_map = local_layers_router_map.to(device_name)
+        layers_topk_idx_global_list = [
+            torch.empty(
+                size=local_layers_router_map.shape,
+                dtype=local_layers_router_map.dtype,
+                device=local_layers_router_map.device,
+            )
+            for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(
+            tensor=local_layers_router_map,
+            tensor_list=layers_topk_idx_global_list,
+            group=pp_group,
+            async_op=False,
         )
-        for _ in range(world_size)
-    ]
-    torch.distributed.all_gather(
-        tensor=local_layers_router_map,
-        tensor_list=layers_topk_idx_global_list,
-        group=pp_group,
-        async_op=False,
-    )
     vp_size = tf_config.virtual_pipeline_model_parallel_size
     if vp_size is not None:
         vpp_router_map_offset = [[] for _ in range(pp_size)]
         for pp_stage in range(pp_size):
             vpp_router_map_offset[pp_stage].append(0)
             for vp_stage in range(vp_size):
-                num_layers_to_build = get_num_layers_to_build(tf_config, vp_stage, pp_stage)
+                num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_stage, pp_stage)
                 vpp_router_map_offset[pp_stage].append(num_layers_to_build + vpp_router_map_offset[pp_stage][-1])
         layers_topk_idx_global = []
         for vp_stage in range(vp_size):
             for pp_stage in range(pp_size):
                 piece = slice(vpp_router_map_offset[pp_stage][vp_stage], vpp_router_map_offset[pp_stage][vp_stage + 1])
-                layers_topk_idx_global.append(layers_topk_idx_global_list[pp_stage][:, :, piece, :])
+                if layers_topk_idx_global_list[pp_stage].is_nested:
+                    nested_item = layers_topk_idx_global_list[pp_stage]
+                    sliced_tensors = [t[:, piece, :] for t in nested_item.unbind()]
+                    sliced_nested = torch.nested.as_nested_tensor(sliced_tensors, layout=torch.jagged)
+                    layers_topk_idx_global.append(sliced_nested)
+                else:
+                    layers_topk_idx_global.append(layers_topk_idx_global_list[pp_stage][:, :, piece, :])
         global_router_map = torch.cat(layers_topk_idx_global, dim=2).to("cpu")
     else:
         global_router_map = torch.cat(layers_topk_idx_global_list, dim=2).to("cpu")
@@ -399,12 +694,11 @@ class RouterReplayHelper:
             for pre_vp_stage in range(vp_size):
                 if pre_vp_stage == vp_rank:
                     break
-                num_layers_to_build = get_num_layers_to_build(tf_config, pre_vp_stage)
-                offset += num_layers_to_build
+                offset += get_moe_num_layers_to_build(tf_config, pre_vp_stage)
         else:
             offset = 0
 
-        num_layers_to_build = get_num_layers_to_build(tf_config, vp_rank)
+        num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_rank)
         router_instances_list = RouterReplay.router_instances[offset : offset + num_layers_to_build]
         return router_instances_list
 

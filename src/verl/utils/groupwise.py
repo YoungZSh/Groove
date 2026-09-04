@@ -46,7 +46,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_device_name
 
 __all__ = ["as_torch_index", "group_mean_std"]
 
@@ -71,7 +71,7 @@ def _resolve_device(explicit: Optional[torch.device | str]) -> torch.device:
     if "PYTEST_CURRENT_TEST" in os.environ:
         return torch.device("cpu")
 
-    return get_torch_device()
+    return torch.device(get_device_name())
 
 
 def _to_1d_numpy_object_array(x: Any) -> np.ndarray:
@@ -188,11 +188,7 @@ def group_mean_std(
     """
     target = _resolve_device(device)
 
-    # Accumulate in float64 so identical decimal rewards (for example eight
-    # copies of 0.1) have exactly zero within-group variance.  Float32's
-    # sum/sum-of-squares formula can otherwise leave a tiny mean error that is
-    # amplified by GRPO's 1e-6 normalization epsilon.
-    scores = scores.reshape(-1).to(device=target, dtype=torch.float64)
+    scores = scores.reshape(-1).to(device=target, dtype=torch.float32)
     gidx = gidx.reshape(-1).to(device=target, dtype=torch.long)
 
     if scores.numel() != gidx.numel():
@@ -204,14 +200,13 @@ def group_mean_std(
         empty = torch.empty(0, device=target, dtype=torch.float32)
         return empty, empty, empty
 
-    ones = torch.ones_like(scores, dtype=torch.float64)
+    ones = torch.ones_like(scores, dtype=torch.float32)
 
-    count = torch.zeros(G, device=target, dtype=torch.float64).index_add_(0, gidx, ones)
-    s1 = torch.zeros(G, device=target, dtype=torch.float64).index_add_(0, gidx, scores)
-    s2 = torch.zeros(G, device=target, dtype=torch.float64).index_add_(0, gidx, scores * scores)
-
+    count = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, ones)
+    s1 = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, scores)
     mean = s1 / count.clamp_min(1.0)
-    var_num = s2 - (s1 * s1) / count.clamp_min(1.0)
+    centered = scores - mean[gidx]
+    var_num = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, centered * centered)
     denom = (count - 1.0).clamp_min(1.0)
     var = var_num / denom
     std = torch.sqrt(torch.clamp(var, min=eps))
@@ -224,4 +219,4 @@ def group_mean_std(
         mean[single] = 0.0
         std[single] = 1.0
 
-    return mean.float(), std.float(), count.float()
+    return mean, std, count
