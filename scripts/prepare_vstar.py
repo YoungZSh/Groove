@@ -68,7 +68,7 @@ def main() -> None:
         answer = str(item["label"]).strip().upper()
         records.append(
             {
-                "data_source": "vstar_visual_seed",
+                "data_source": "vstar_groove",
                 "prompt": [{"role": "user", "content": prompt}],
                 "images": [{"path": str(image_path)}],
                 "ability": "visual_question_answering",

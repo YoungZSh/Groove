@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for pure GC-Visual-SEED probe helpers."""
+"""Unit tests for pure GC-Visual-Evidence probe helpers."""
 
 from __future__ import annotations
 

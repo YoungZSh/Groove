@@ -6,15 +6,15 @@ from pathlib import Path
 
 from PIL import Image
 
-from mmcot_opsd.analyzer import StaticAnalyzer
-from mmcot_opsd.evidence import (
+from groove.analyzer import StaticAnalyzer
+from groove.evidence import (
     EvidenceBuilderConfig,
     TeacherEvidenceBuilder,
     teacher_payload,
     validate_visible_focus,
 )
-from mmcot_opsd.grounding import StaticGrounder
-from mmcot_opsd.schemas import FocusProgram, GroupRollout, Rollout
+from groove.grounding import StaticGrounder, enlarge_crop
+from groove.schemas import FocusProgram, GroupRollout, Rollout
 
 
 def rollout_group(image_path: Path, rewards: list[float]) -> GroupRollout:
@@ -72,6 +72,14 @@ class EvidenceTest(unittest.TestCase):
         )
         self.assertEqual(capped_prompt, prompt)
         self.assertEqual([image["max_pixels"] for image in capped_images], [1024, 1024, 1024])
+
+    def test_tiny_crop_upscale_is_capped(self):
+        tiny = Image.new("RGB", (30, 40), color=(80, 100, 120))
+        capped = enlarge_crop(tiny, min_short_side=768, max_scale=10.0)
+        self.assertEqual(capped.size, (300, 400))
+
+        ordinary = Image.new("RGB", (100, 120), color=(80, 100, 120))
+        self.assertEqual(enlarge_crop(ordinary, min_short_side=768).size, (768, 922))
 
     def test_uniform_group_receives_evidence_by_default(self):
         builder = TeacherEvidenceBuilder(

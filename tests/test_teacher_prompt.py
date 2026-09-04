@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
+import numpy as np
 import torch
 from PIL import Image
 
+from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
@@ -94,6 +97,70 @@ class TeacherPromptTest(unittest.TestCase):
         self.assertNotIn("path", item)
         self.assertNotIn("max_pixels", item)
         self.assertEqual(messages[0]["content"][0]["image"].size, (20, 20))
+
+    def test_teacher_multimodal_prefix_is_processed_once_per_uid_group(self):
+        class AttrDict(dict):
+            __getattr__ = dict.__getitem__
+
+        processor = FakeMultimodalProcessor()
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.processor = processor
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        self_distillation = AttrDict(
+            teacher_always_on=True,
+            teacher_image_key="teacher_images",
+            fallback_to_policy_loss_on_missing_teacher=True,
+            max_reprompt_len=64,
+        )
+        trainer.config = SimpleNamespace(
+            data=SimpleNamespace(apply_chat_template_kwargs={}),
+            actor_rollout_ref=SimpleNamespace(
+                actor=AttrDict(
+                    policy_loss={"loss_mode": "groove"},
+                    self_distillation=self_distillation,
+                )
+            ),
+        )
+
+        image = Image.new("RGB", (10, 10))
+        raw_prompt = [{"role": "user", "content": [{"type": "image", "image": image}]}]
+        teacher_prompt = [{"role": "user", "content": "<image>\nInspect the image."}]
+        raw_prompts = np.empty(2, dtype=object)
+        raw_prompts[:] = [raw_prompt, raw_prompt]
+        teacher_prompts = np.empty(2, dtype=object)
+        teacher_prompts[:] = [teacher_prompt, teacher_prompt]
+        teacher_images = np.empty(2, dtype=object)
+        teacher_images[:] = [[{"image": image}], [{"image": image}]]
+
+        batch = DataProto.from_dict(
+            tensors={
+                "input_ids": torch.zeros((2, 2), dtype=torch.long),
+                "responses": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+                "response_mask": torch.ones((2, 2), dtype=torch.long),
+            },
+            non_tensors={
+                "uid": np.array(["same-group", "same-group"], dtype=object),
+                "raw_prompt": raw_prompts,
+                "teacher_prompt": teacher_prompts,
+                "teacher_images": teacher_images,
+            },
+        )
+
+        result = trainer._maybe_build_self_distillation_batch(
+            batch,
+            reward_tensor=torch.zeros((2, 2), dtype=torch.float32),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(processor.calls), 1)
+        teacher_batch, _metrics = result
+        starts = teacher_batch.batch["teacher_response_start_idx"].tolist()
+        self.assertEqual(starts[0], starts[1])
+        self.assertGreater(starts[0], 0)
+        self.assertEqual(
+            teacher_batch.batch["teacher_input_ids"][:, -2:].tolist(),
+            [[1, 2], [3, 4]],
+        )
 
 
 if __name__ == "__main__":

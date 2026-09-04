@@ -1,7 +1,7 @@
 {
   "source": "/root/siton-tmp/yzs/Vision-OPD/data/train.jsonl",
   "source_sha256": "8ad2fb81da0f6fba1766545dc5f84cc2250e48704738757461b2d75aa31821df",
-  "seed": 42,
+  "random_state": 42,
   "test_ratio": 0.05,
   "student_image_policy": "unboxed_original_images_only",
   "oracle_metadata_visible_to_model": false,

@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mmcot-opsd"
+name = "groove"
 version = "0.1.0"
-description = "Group-contrastive visual evidence distillation for multimodal GRPO"
+description = "GROOVE: Group-Relative On-Policy Optimization via Visual Evidence"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
@@ -22,7 +22,16 @@ dev = ["pytest>=8"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The vendored verl runtime loads Hydra YAMLs and its version marker from the
+# package at runtime.  Include them in wheels as well as source checkouts.
+[tool.setuptools.package-data]
+verl = [
+  "py.typed",
+  "version/*",
+  "trainer/config/*.yaml",
+  "trainer/config/*/*.yaml",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

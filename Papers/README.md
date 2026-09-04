@@ -2,7 +2,7 @@
 
 Downloaded from the corresponding arXiv records:
 
-- `SEED__Self-Evolving-On-Policy-Distillation-for-Agentic-Reinforcement-Learning.pdf`
+- `Self-Evolving-On-Policy-Distillation-for-Agentic-Reinforcement-Learning.pdf`
   - https://arxiv.org/abs/2607.14777
 - `OPID__On-Policy-Skill-Distillation-for-Agentic-Reinforcement-Learning.pdf`
   - https://arxiv.org/abs/2606.26790

@@ -2,16 +2,15 @@
 
 ## What comes from each reference
 
-From SEED, this project adopts the sampled-token teacher/student log-probability
-gap, the detached sigmoid token gate, and the additive GRPO + OPD objective.
-SEED's skill generation machinery is not copied: here the retained skill is a
-multimodal Crop/Zoom prefix generated from group-level rollout contrasts.
+This project uses a sampled-token teacher/student log-probability gap as an
+uncentered signed reverse-KL advantage.  It adds that token credit to the GRPO
+advantage before one shared PPO/dual-clip objective is evaluated.  The retained
+skill is a multimodal Crop/Zoom prefix generated from group-level rollout contrasts.
 
-From Vision-OPD, this project reuses the Qwen3.5/verl integration and its tested
-ability to score one fixed response under two prompts with different multimodal
-inputs.  Its original full-logit VOPD KL/JSD path remains intact.  The new
-`visual_seed` mode avoids full-vocabulary logits and uses only sampled-token
-log probabilities.
+The project vendors the required Qwen3.5/verl integration under `src/verl` so
+the training runtime is part of this repository.  The original full-logit VOPD
+KL/JSD path remains available for compatibility, while the `groove` mode
+avoids full-vocabulary logits and uses only sampled-token log probabilities.
 
 ## Information boundaries
 
@@ -54,65 +53,69 @@ phrases stay in the private execution record and are not Student targets.
 
 ## Mask semantics
 
+The following mask semantics apply when the joint objective is enabled with
+`OPSD_ENABLED=true`. The default GRPO-only ablation selects vanilla policy loss,
+does not construct a self-distillation batch, and therefore has no evidence mask
+or Teacher forward pass.
+
 `self_distillation_mask[i] = 1` means that the group containing rollout `i`
 has a valid visual Teacher prefix.  Every rollout in that group receives the
 same value. It never means that rollout `i` was wrong.  This makes the initial
 objective:
 
 ```text
-all rollout tokens       -> GRPO
-tokens in evidence group -> GRPO + lambda * SEED-OPD
+all rollout tokens       -> GRPO advantage
+tokens in evidence group -> GRPO advantage + lambda * signed OPSD advantage
 tokens in fallback group -> GRPO only
 ```
 
 The default eligibility rule is now simply a successful Analyzer/DINO execution.
-Mixed, all-correct, and all-wrong groups can all receive OPD. This matches SEED's
-default `failed_only=False` behavior and, importantly, keeps auxiliary learning
+Mixed, all-correct, and all-wrong groups can all receive OPD. This keeps auxiliary learning
 alive on tied-reward groups where the GRPO advantage is zero. The compatibility
-switch `VISUAL_SEED_MIXED_GROUPS_ONLY=true` restores the earlier mixed-only probe.
+switch `GROOVE_MIXED_GROUPS_ONLY=true` restores the earlier mixed-only probe.
 
-## SEED code alignment
+## Reference recipe alignment
 
-The official SEED repository is open source. The following settings are matched
-to its public paper and visual-task launcher:
+The following settings define the reference sampled-token visual-evidence recipe:
 
-| Detail | SEED | This project |
+| Detail | Reference recipe | This project |
 | --- | --- | --- |
 | rollout group | 8 | 8 |
-| sampled-token gate | `sigmoid(5 * delta)` | same |
-| OPD coefficient | 0.01 | 0.01 |
+| sampled-token credit | positive sigmoid gate | **signed `log p_teacher - log p_student`** |
+| OPSD advantage coefficient | 0.01 | 0.01 |
 | actor learning rate | 1e-6 | 1e-6 |
 | PPO clip | 0.2 | 0.2, explicitly overriding Vision-OPD's user preset |
 | PPO epochs | 1 | 1 |
-| entropy coefficient | 0.001 in the SEED code defaults | **0.0 (disabled)** |
+| entropy coefficient | 0.001 in the reference defaults | **0.0 (disabled)** |
 | reference KL | low-var KL, coefficient 0.01 | **0.001 (verl default)** |
 | GRPO advantage | group standard-deviation normalization | same |
 | Analyzer temperature | 0.0 | 0.0 |
 | Analyzer completion cap | 2048 for the public visual launcher | 2048 |
-| total steps | 150 in the paper | one 5,928-example epoch (2,964 updates); 150 is the pilot override |
+| total steps | 150 in the paper | GRPO-only: one 5,928-example epoch (370 updates); 150 is the pilot override |
 
-The host-dependent values intentionally remain smaller: prompt batch 2 and PPO
-mini-batch 16 (one complete 2x8 rollout batch), micro-batch 1, and parameter/
-optimizer/reference offload. SEED reports prompt batch 16, PPO mini-batch 128,
-micro-batch 8, and no actor offload on eight A800 80GB GPUs. The fine-grained VQA
-data also keeps a 4096-token prompt budget rather than SEED EZPoints' 1024 because
-its image/question format and multiple visual prefixes differ.
+The default GRPO-only ablation uses prompt batch 16 and PPO mini-batch 128 (one
+complete 16x8 rollout batch), micro-batch 1, and parameter/optimizer/reference
+offload. The joint launcher keeps its historical prompt batch 32 and PPO
+mini-batch 256; the formal supervisor overrides these to 8 and 64. A larger
+reference run uses micro-batch 8 and no actor offload on eight A800 80GB GPUs.
+The fine-grained VQA data keeps a 4096-token prompt budget rather than a fixed
+1024-token budget because its image/question format and multiple visual prefixes
+differ.
 
-One algorithmic difference is deliberate. Public SEED analyzes each trajectory
-separately and creates a per-trajectory text skill. Here the external Analyzer sees
+One algorithmic difference is deliberate. A per-trajectory baseline analyzes each
+trajectory separately and creates a text skill. Here the external Analyzer sees
 all eight trajectories jointly, performs the requested success/failure contrast,
-and produces one shared multimodal Crop/Zoom skill for the group. The loss and
-detached teacher/gate semantics stay SEED-compatible; only skill construction is
-group-contrastive.
+and produces one shared multimodal Crop/Zoom skill for the group. Teacher and
+evidence-advantage targets are detached; the skill construction is group-contrastive.
 
-The regularization choice is also task-specific: the training loss contains GRPO,
-sampled-token OPD, and verl's reference-policy KL only. Entropy regularization is
-disabled, and the KL coefficient uses verl's `0.001` default instead of SEED's
-`0.01`, because this is a short single-turn VQA task rather than a
-long-horizon exploration environment.
+The regularization choice is also task-specific: the training loss uses a shared
+PPO objective over the combined GRPO and signed OPSD advantages, followed by
+verl's reference-policy KL. Entropy regularization is disabled, and the KL
+coefficient uses verl's `0.001` default instead of the reference `0.01`, because
+this is a short single-turn VQA task rather than a long-horizon exploration environment.
 
-A second deliberate difference is Analyzer evolution. Paper-style SEED first uses
-an external model to annotate 1,440 trajectories (180 tasks x 8 rollouts), trains
+A second deliberate difference is Analyzer evolution. A paper-style pipeline first
+uses an external model to annotate trajectories, trains
 the policy for three SFT epochs to acquire trajectory-analysis ability, and then
 uses the latest policy snapshot as both actor and `policy_vllm` Analyzer during RL.
 Version one here skips that Stage-1 SFT and keeps the requested external GPT-5.6
@@ -130,30 +133,31 @@ privileged Teacher distribution both change.  The external Analyzer and DINO
 remain fixed in version one, which removes an additional drifting learned
 policy from the loop.
 
-## Runtime patch
+## Bundled training runtime
 
-`patches/vision_opd_visual_seed.patch` applies cleanly to Vision-OPD commit
-`c8a8fdd1f88eef1b5ef4fe6a8d64eb0272917471`. It adds:
+The complete runtime needed by the actor, rollout, reference-policy, and Hydra
+training paths is vendored under `src/verl`.  The project-specific additions are
+therefore ordinary source files rather than a patch applied to a sibling
+repository:
 
-- `compute_seed_opd_loss` in verl core algorithms;
-- the `visual_seed` actor branch;
-- `opd_loss_coef` and `opd_gate_beta` configuration;
-- multimodal self-distillation activation for the new mode;
-- a `visual_seed.yaml` Hydra preset.
+- `src/verl/trainer/ppo/core_algos.py` contains `compute_groove_opsd_advantages`;
+- `src/verl/workers/actor/dp_actor.py` contains the `groove` actor branch;
+- `src/verl/trainer/config/groove.yaml` contains the Hydra preset;
+- `src/groove/verl_trainer.py` constructs the online evidence columns.
 
-Project-side `VisualSeedRayPPOTrainer` constructs the online evidence columns
-and then delegates multimodal tokenization/alignment to Vision-OPD.
+The existing Conda environment supplies heavyweight runtime dependencies such as
+PyTorch, Ray, vLLM, and Transformers; the source tree supplies the matching
+Python runtime implementation.
 
 ## Initial diagnostics to monitor
 
 - group reward variance and mixed-group fraction;
 - evidence ready/skipped/error fraction;
 - DINO score and crop area fraction from cached `evidence.json` records;
-- `actor/seed_opd_teacher_gap_mean`;
-- `actor/seed_opd_gate_mean` and gate-active ratio;
+- signed OPSD teacher-gap mean, spread, and positive/negative token fractions;
 - correct/incorrect rollout splits of teacher gap, sampled-token probability
-  ratio, and gate mean (diagnostic only; outcome never weights the loss);
-- raw and weighted OPD loss;
+  ratio, and signed advantage mean (diagnostic only; outcome never weights OPSD);
+- raw and coefficient-weighted OPSD advantage RMS;
 - `reward/answer_reward_mean`, `reward/format_reward_mean`, and their weighted
   means;
 - GRPO loss, policy KL, accuracy, response length, and entropy as a diagnostic
@@ -169,19 +173,19 @@ Our implementation applies that pattern to a generic terminal `FINAL: X` anchor,
 returns all components through verl's custom reward interface, and writes them to
 the standard rollout JSONL as well as the trainer metrics.
 
-The formal data run is one epoch: 5,928 prompts at a prompt batch of two, or
-2,964 updates and 47,424 sampled rollouts. `TOTAL_STEPS=150` remains the
-SEED-aligned pilot, while `TOTAL_STEPS=10` is the initial systems and signal
-validation. Inspect cached Analyzer outputs and crops for answer leakage and
-localization failures before the full run.
+The default GRPO-only data run is one epoch: 5,928 prompts at a prompt batch of
+16, or 370 complete updates and 47,360 sampled rollouts (`drop_last=True`).
+`TOTAL_STEPS=150` remains the reference-aligned pilot, while `TOTAL_STEPS=10` is
+the initial systems and signal validation. The GRPO-only path makes no Analyzer
+calls; inspect cached Analyzer outputs and crops only for joint OPSD runs.
 
 ## Vision-OPD-6K split and information hygiene
 
 The released Vision-OPD-6K file has 6,241 training records and no official test
 split. This project creates a deterministic answer-stratified 95/5 holdout using
-seed 42. The test count is rounded upward, yielding 5,928 train and 313 test
-records; this also makes the training split exactly divisible by the two-prompt
-batch used by verl's `drop_last=True` loader.
+random state 42. The test count is rounded upward, yielding 5,928 train and 313 test
+records; the GRPO-only batch of 16 drops the final eight records because verl's
+training loader uses `drop_last=True`.
 
 The released `images` field is a full image with a red Oracle bounding box, its
 question contains a red-box focus hint, and `teacher_images` is an Oracle crop.
@@ -194,10 +198,10 @@ offline localization auditing; the online trainer reads only `question` and
 
 ## Two-GPU full time sharing
 
-The local Vision-OPD repository already uses verl's hybrid actor/rollout engine
-with actor parameter offload, optimizer offload, and reference offload. This
-project makes the full release path explicit and adds the settings needed for the
-more demanding GRPO + visual-Teacher + reference-KL workload:
+The bundled verl runtime provides the hybrid actor/rollout engine with actor
+parameter offload, optimizer offload, and reference offload. This project makes
+the full release path explicit and adds the settings needed for the more
+demanding GRPO + visual-Teacher + reference-KL workload:
 
 | Phase | GPU-resident state | State kept on CPU |
 | --- | --- | --- |
@@ -266,7 +270,7 @@ RAY_MEMORY_GUARD_HEADROOM_GIB=4 \
 RAY_MEMORY_USAGE_THRESHOLD_CEILING=0.95 \
 RAY_OBJECT_STORE_GIB=8 \
 RAY_MEMORY_MONITOR_REFRESH_MS=100 \
-./scripts/run_visual_seed.sh
+./scripts/run_groove.sh
 ```
 
 Ray's threshold is a node-wide, soft OOM-prevention trigger, not an allocation

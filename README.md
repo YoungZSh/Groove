@@ -1,24 +1,31 @@
-# Multimodal CoT Visual-SEED
+# GROOVE
+
+**Group-Relative On-Policy Optimization via Visual Evidence**
 
 This repository is the first trainable version of the group-contrastive visual
-self-evolution idea discussed in this task.  It combines a normal verl GRPO
-update with SEED-style sampled-token OPD.  The privileged Teacher sees an
+self-evolution idea discussed in this task.  It augments verl's GRPO advantage
+with a signed visual-evidence sampled-token OPSD advantage.  The privileged Teacher sees an
 Analyzer-selected visual prefix; the deployed Student sees only the original
 image.
 
 ## Implemented objective
 
-For a response token already sampled by the Student,
+For a response token already sampled by the Student, the joint mode builds one
+token advantage and sends it through the shared PPO/dual-clip objective:
 
 ```text
 delta_t = stopgrad(log p_teacher(y_t) - log p_student(y_t))
-gate_t  = sigmoid(beta * delta_t)
-L_OPD   = mean(gate_t * (stopgrad(log p_teacher(y_t)) - log p_student(y_t)))
-L_total = L_GRPO/PPO-clip + 0.01 * L_OPD + 0.001 * L_ref_KL
+A_OPSD,t = evidence_mask * delta_t
+A_total,t = A_GRPO + 0.01 * A_OPSD,t
+L_total = L_PPO/dual-clip(A_total) + 0.001 * L_ref_KL
 ```
 
-The OPD values follow the SEED recipe: `lambda=0.01`, `beta=5.0`. Reference
-KL uses verl's default coefficient `0.001`; entropy regularization is disabled.
+This is the uncentered signed sampled-token reverse-KL estimator: positive gaps
+reinforce a sampled token and negative gaps suppress it. There is no sigmoid
+gate, trajectory centering, or continuous OCR/DINO reliability coefficient.
+The initial evidence-advantage coefficient is `0.01`; optional symmetric gap
+clipping is disabled by default. Reference KL uses verl's coefficient `0.001`,
+and entropy regularization is disabled.
 
 The terminal GRPO reward is deliberately shaped as
 
@@ -35,12 +42,14 @@ protocol can be reused by later non-MCQ data.
 
 - There is no `(1-r_i)` factor.
 - GRPO is computed on every rollout.
-- If a group has usable visual evidence, OPD is computed on every one of its
+- If a group has usable visual evidence, signed OPSD credit is computed on every one of its
   eight rollouts, correct and incorrect alike.
-- The evidence mask is group-level availability, not a per-rollout reward gate.
-- Uniform-reward groups are analyzed too; this preserves SEED's useful OPD signal
+- The evidence mask is binary group-level availability, not a confidence or per-rollout reward gate.
+- Uniform-reward groups are analyzed too; this preserves the signed OPSD signal
   when a tied group gives GRPO zero advantage. Grounding or Analyzer failures fall
   back to ordinary GRPO.
+- The uncentered OPSD term does not change terminal rewards, but it can change a
+  trajectory's total token-advantage mass.
 
 ## Online training flow
 
@@ -76,13 +85,12 @@ configs/                 experiment-level design defaults
 data/vision_opd/         5,928/313 Vision-OPD-6K train/test manifests
 data/vstar/              prepared 191-example V*Bench probe/evaluation data
 docs/                    architecture and implementation notes
-patches/                 reproducible patch against Vision-OPD's verl fork
-scripts/                 data, runtime bootstrap, and training entrypoints
-src/mmcot_opsd/          Analyzer, grounding, evidence, reward, loss, trainer
+scripts/                 data and training entrypoints
+src/groove/              Analyzer, grounding, evidence, reward, loss, trainer
+src/verl/                vendored training runtime used by this project
 tests/                   CPU unit tests
 TMP/probe_experiments/   archived no-training probes and their reports
-TMP/references/          pinned clean SEED and Vision-OPD references
-TMP/runtime/Vision-OPD/  patched clean training runtime
+TMP/references/          pinned distillation reference material
 ```
 
 The source JSONL and released bbox/crop files in `../Vision-OPD` are not
@@ -91,53 +99,75 @@ in place, then writes the new parquet splits under this repository.
 
 ## Reproduce and test
 
-The prepared runtime is already present. To reconstruct it at the pinned
-Vision-OPD commit in a new workspace:
-
-```bash
-./scripts/bootstrap_runtime.sh
-```
-
-Prepare the leakage-free Vision-OPD-6K split and run the CPU tests:
+The required verl runtime is vendored under `src/verl`; no sibling repository
+or runtime bootstrap step is needed. Prepare the leakage-free Vision-OPD-6K
+split and run the CPU tests with the existing Conda environment:
 
 ```bash
 /home/yzs/miniconda3/envs/vision-opd/bin/python scripts/prepare_vision_opd.py
-PYTHONPATH="$PWD/src:$PWD/TMP/runtime/Vision-OPD" \
+PYTHONPATH="$PWD/src" \
   /home/yzs/miniconda3/envs/vision-opd/bin/python -m unittest discover -s tests -v
 ```
 
-The split uses seed 42 and answer-stratified sampling. It contains 5,928
+The split uses random state 42 and answer-stratified sampling. It contains 5,928
 training examples and 313 held-out examples. Student input uses the unboxed
 `original_images` field; the released red-box overlay and Oracle crop are kept
 only as audit metadata and are never sent to the Student, Analyzer, or DINO.
 
 ## Start training
 
-Set the external Analyzer endpoint when its credentials are available:
+The default launcher now runs the GRPO-only ablation: OPSD/Teacher/evidence
+construction is disabled and the prompt batch is 16. It does not need an
+Analyzer endpoint. Start it with:
 
 ```bash
+./scripts/run_grpo_ablation.sh
+```
+
+`ROLLOUT_N=8` keeps the corresponding PPO mini-batch at 128 sampled rollouts
+(`16` prompt groups × `8` rollouts). Use `GROOVE_DRY_RUN=true` to validate the
+resolved configuration without starting Ray workers or loading the model. The
+existing reference-policy KL regularizer remains enabled; it is separate from
+OPSD and is not part of this ablation.
+
+To run the historical joint GRPO+OPSD objective instead, set the switch and
+provide the external Analyzer endpoint:
+
+```bash
+export OPSD_ENABLED=true
 export ANALYZER_BASE_URL='https://your-endpoint.example/v1'
 export ANALYZER_API_KEY='...'
 export ANALYZER_MODEL='gpt-5.6'
-./scripts/run_visual_seed.sh
+# For the remote visual-tool host used by the training run:
+export ANALYZER_USE_VISION_TOOLS=true
+export ANALYZER_GROUNDING_URL='http://127.0.0.1:8011'
+export ANALYZER_OCR_URL='http://127.0.0.1:8012'
+export GROOVE_MAX_CONCURRENCY=8
+./scripts/run_groove.sh
 ```
 
-The launcher uses the local Qwen3.5-4B weights, the 5,928-example Vision-OPD
-training split, its 313-example held-out split, two GPUs, eight rollouts per
-question, and the local Hugging Face GroundingDINO-B cache. DINO defaults to CPU
-to avoid competing with the two training GPUs. The held-out split is evaluated
-before training and at the final step. Override any launcher setting with an
-environment variable or append a Hydra override.
+The equivalent explicit GRPO-only entrypoint is `scripts/run_grpo_ablation.sh`;
+it forces `OPSD_ENABLED=false` and `TRAIN_BATCH_SIZE=16` even if a shell has
+other defaults exported.
 
-The two A100-80GB cards use full phase-based GPU time sharing, following the
-local Vision-OPD hybrid-engine setup. During rollout, FSDP actor parameters,
+The launcher uses the local Qwen3.5-4B weights, the 5,928-example Vision-OPD
+training split, its 313-example held-out split, two GPUs, and eight rollouts per
+question. In joint mode, Analyzer evidence is built with up to eight concurrent
+groups when the three remote endpoints above are set; the remote DINO/OCR
+workers remain single-process GPU services. Without those endpoints, probe
+configurations fall back to the local GroundingDINO/OCR implementations. The
+held-out split is evaluated before training and at the final step. Override any
+launcher setting with an environment variable or append a Hydra override.
+
+The two A100-80GB cards use full phase-based GPU time sharing through the
+bundled verl hybrid-engine runtime. During rollout, FSDP actor parameters,
 optimizer state, and the reference model live on CPU while vLLM owns the GPUs.
 Before reference scoring or actor training, vLLM 0.18 enters sleep level 2 and
 releases both weights and KV cache. CUDA Graph is disabled so it cannot leave an
 unoffloadable GPU allocation; gradient checkpointing and the
 Qwen3.5 fused LM head further reduce the training peak. Actor updates use PyTorch
 Fused AdamW (`fused=true`, `foreach=false`); its state is still moved to CPU between
-updates. The launcher fails early if the runtime cannot provide sleep level 2.
+updates. The launcher fails early if the installed vLLM cannot provide sleep level 2.
 
 Host RAM is protected separately. This task's cgroup has a hard 220 GiB memory
 limit, and Ray's node-wide OOM monitor is pinned to a more conservative effective
@@ -148,30 +178,32 @@ controlled by `RAY_NODE_MEMORY_CAP_GIB`, `RAY_MEMORY_GUARD_HEADROOM_GIB`,
 `RAY_MEMORY_MONITOR_REFRESH_MS`. See `docs/IMPLEMENTATION.md` for the exact
 formula and the distinction between Ray's soft guard and the cgroup hard limit.
 
-The optimization defaults follow the public SEED recipe where it transfers
-cleanly: learning rate `1e-6`, one PPO epoch, clip ratio `0.2`, group size 8,
-response length 512, OPD coefficient `0.01`, gate beta `5`, and reference KL
-coefficient `0.001`. Entropy regularization is explicitly disabled. The prompt
-batch remains 2 and FSDP offload stays enabled because this host has two GPUs
-rather than SEED's eight A800-80GB setup. One full split pass is 2,964 updates;
-`TOTAL_STEPS=null` lets verl derive that value from one epoch. Checkpoints are
-written every 500 steps and only the latest two are retained. For the first
-end-to-end connectivity check, run only ten updates:
+Both modes use learning rate `1e-6`, one PPO epoch, clip ratio `0.2`, group
+size 8, response length 512, and reference KL coefficient `0.001`. Entropy
+regularization is explicitly disabled. The default GRPO-only ablation uses a
+16-prompt batch (PPO mini-batch 128 sampled rollouts) and therefore has 370
+complete updates over the 5,928-example split (`drop_last=true`); `TOTAL_STEPS=null`
+lets verl derive the value from one epoch. Joint mode (`OPSD_ENABLED=true`) additionally uses
+signed OPSD advantage coefficient `0.01`, no gap clipping by default, and its
+historical 32-prompt batch.
+FSDP offload stays enabled because this host has two GPUs rather than an
+eight-card reference setup. Checkpoints are written every 500 steps and only
+the latest two are retained. For the first end-to-end connectivity check, run
+only ten updates:
 
 ```bash
-TOTAL_STEPS=10 ./scripts/run_visual_seed.sh
+TOTAL_STEPS=10 ./scripts/run_grpo_ablation.sh
 ```
 
-The full one-epoch run makes 2,964 external Analyzer calls and 47,424 Student
-rollouts, so the ten-step connectivity run should be completed before committing
-to its API cost and wall-clock time.
+The GRPO-only run makes no external Analyzer calls. The joint one-epoch run
+still makes one Analyzer call per prompt group and should be smoke-tested with
+`TOTAL_STEPS=10` before committing to its API cost and wall-clock time.
 
 To validate the complete launcher configuration without creating Ray workers
-or loading the model, add `VISUAL_SEED_DRY_RUN=true`.
+or loading the model, add `GROOVE_DRY_RUN=true`.
 
 ## References
 
-- SEED paper and official implementation: <https://arxiv.org/abs/2607.14777>,
-  <https://github.com/jinyangwu/SEED>
+- Self-evolving on-policy distillation reference: <https://arxiv.org/abs/2607.14777>
 - Vision-OPD paper and official implementation: <https://arxiv.org/abs/2605.18740>,
   <https://github.com/VisionOPD/Vision-OPD>

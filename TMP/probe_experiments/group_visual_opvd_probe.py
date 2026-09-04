@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 
 
-ROOT = Path("/root/siton-tmp/yzs/mmcot_opsd")
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = Path("/root/siton-tmp/yzs/ckpts/Qwen3.5-4B")
 DEFAULT_DATA = Path(
     "/root/siton-tmp/yzs/datasets/vstar-bench/data/test-00000-of-00001.parquet"

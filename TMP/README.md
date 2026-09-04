@@ -3,11 +3,9 @@
 - `probe_experiments/` is the complete archive of the earlier no-training
   attention, interleaving, relative-attention, dense-OPD, and group visual-OPD
   probes, including their reports and outputs.
-- `references/SEED/` is pinned at
+- `references/distillation_reference/` is pinned at
   `2cf2fadca3c5aba28da68e8e1405182ba8d90e6c`.
-- `references/Vision-OPD-clean/` and `runtime/Vision-OPD/` start from
-  `c8a8fdd1f88eef1b5ef4fe6a8d64eb0272917471`.
-- `runtime/Vision-OPD/` has the reproducible patch from
-  `patches/vision_opd_visual_seed.patch` applied.
+- The runnable verl code now lives in the project's `src/verl/` package; no
+  upstream VOPD checkout is required here.
 
 Nothing in the dirty sibling repository `../Vision-OPD` was modified.

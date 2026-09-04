@@ -43,6 +43,7 @@ export ANALYZER_TOOL_FEEDBACK_MAX_SIDE="${ANALYZER_TOOL_FEEDBACK_MAX_SIDE:-1024}
 # still uses sleep level 2 plus CPU offload for rollout/training phase changes.
 export CUDA_VISIBLE_DEVICES="${TRAIN_GPU_ID:-1}"
 export N_GPUS=1
+export OPSD_ENABLED=true
 export GROUNDING_DINO_DEVICE=cpu
 export ANALYZER_USE_VISION_TOOLS="${ANALYZER_USE_VISION_TOOLS:-true}"
 # OCR uses the Analyzer's GPU during evidence construction.  GPU 1 remains
@@ -86,4 +87,4 @@ fi
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 export TEST_FREQ="${TEST_FREQ:-500}"
 export TOTAL_STEPS="${TOTAL_STEPS:-150}"
-exec "$PROJECT_ROOT/scripts/run_visual_seed.sh" "$@"
+exec "$PROJECT_ROOT/scripts/run_groove.sh" "$@"

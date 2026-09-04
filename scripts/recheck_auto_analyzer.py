@@ -9,8 +9,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from mmcot_opsd.analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
-from mmcot_opsd.schemas import GroupRollout, Rollout
+from groove.analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
+from groove.schemas import GroupRollout, Rollout
 from recheck_english_grounding import (
     SAMPLES,
     annotate,

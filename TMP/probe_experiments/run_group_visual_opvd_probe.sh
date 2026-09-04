@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROBE_ROOT="/root/siton-tmp/yzs/mmcot_opsd"
+PROBE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 PROBE_ENV="${PROBE_ENV:-/home/yzs/miniconda3/envs/vision-opd}"
 PROBE_PYTHON="${PROBE_PYTHON:-${PROBE_ENV}/bin/python}"
 

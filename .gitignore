@@ -2,14 +2,49 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local credentials and machine-specific environment files.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Editors and operating-system metadata.
+.DS_Store
+.idea/
+.vscode/
 
 checkpoints/
 outputs/
-data/vstar/images/
-data/vstar/*.parquet
-data/vision_opd/*.parquet
+wandb/
+ray_results/
+*.log
+*.pid
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 
-# The nested Vision-OPD (VOPD) runtime has its own Git history.
-TMP/runtime/
+# Downloaded or generated datasets stay local.  Keep small checked-in manifests
+# under data/vision_opd, but ignore prepared splits and Hugging Face caches.
+data/**/*.parquet
+data/**/.cache/
+data/vstar/images/
+data/deepeyes_47k/
+data/deepeyes_vstar_grpo_*/
+data/vision_opd_*_seed*/
+
+# Archived upstream references remain outside the project package.
 TMP/references/
 TMP/probe_experiments/outputs/

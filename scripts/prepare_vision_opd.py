@@ -29,7 +29,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output-dir", type=Path, default=Path("data/vision_opd"))
     parser.add_argument("--test-ratio", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument(
+        "--max-source-rows",
+        type=int,
+        default=None,
+        help="Use only the first N source rows before making the stratified split.",
+    )
     parser.add_argument(
         "--extract-original-images",
         action=argparse.BooleanOptionalAction,
@@ -86,7 +92,7 @@ def ensure_original_images(rows: list[dict[str, Any]], source_root: Path) -> Non
 
 
 def stratified_split_indices(
-    rows: list[dict[str, Any]], test_ratio: float, seed: int
+    rows: list[dict[str, Any]], test_ratio: float, random_state: int
 ) -> tuple[list[int], list[int]]:
     if not 0 < test_ratio < 1:
         raise ValueError("test_ratio must be between 0 and 1")
@@ -98,7 +104,8 @@ def stratified_split_indices(
         groups[answer].append(index)
 
     # Match common holdout-split behavior and keep the 5,928-row train split
-    # divisible by the two-prompt training batch (verl drops incomplete batches).
+    # divisible by the historical eight-rollout group (verl may drop an
+    # incomplete prompt batch for a particular launcher batch size).
     target_test_size = math.ceil(len(rows) * test_ratio)
     allocation = {label: math.floor(len(indices) * test_ratio) for label, indices in groups.items()}
     remaining = target_test_size - sum(allocation.values())
@@ -110,7 +117,7 @@ def stratified_split_indices(
     for label in fractional_order[:remaining]:
         allocation[label] += 1
 
-    rng = random.Random(seed)
+    rng = random.Random(random_state)
     test_indices: list[int] = []
     train_indices: list[int] = []
     for label in sorted(groups):
@@ -145,7 +152,7 @@ def build_record(
         "the selected choice label."
     )
     return {
-        "data_source": "vision_opd_6k_visual_seed",
+        "data_source": "vision_opd_6k_groove",
         "prompt": [{"role": "user", "content": prompt}],
         "images": [{"path": str(image_path)}],
         "ability": "visual_question_answering",
@@ -175,11 +182,21 @@ def main() -> None:
     source = args.source.resolve()
     source_root = source.parent
     output_dir = args.output_dir.resolve()
-    rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line]
+    all_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line]
+    if args.max_source_rows is not None:
+        if args.max_source_rows <= 0:
+            raise ValueError("--max-source-rows must be positive")
+        if args.max_source_rows > len(all_rows):
+            raise ValueError(
+                f"--max-source-rows={args.max_source_rows} exceeds source size {len(all_rows)}"
+            )
+        rows = all_rows[: args.max_source_rows]
+    else:
+        rows = all_rows
     if args.extract_original_images:
         ensure_original_images(rows, source_root)
 
-    train_indices, test_indices = stratified_split_indices(rows, args.test_ratio, args.seed)
+    train_indices, test_indices = stratified_split_indices(rows, args.test_ratio, args.random_state)
     if set(train_indices) & set(test_indices):
         raise RuntimeError("Train/test split overlap detected")
     if len(train_indices) + len(test_indices) != len(rows):
@@ -201,7 +218,10 @@ def main() -> None:
     manifest = {
         "source": str(source),
         "source_sha256": source_sha256,
-        "seed": args.seed,
+        "source_rows": len(all_rows),
+        "selected_source_rows": len(rows),
+        "max_source_rows": args.max_source_rows,
+        "random_state": args.random_state,
         "test_ratio": args.test_ratio,
         "student_image_policy": "unboxed_original_images_only",
         "oracle_metadata_visible_to_model": False,

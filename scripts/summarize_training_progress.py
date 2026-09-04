@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a compact Markdown handoff from a visual-SEED training run."""
+"""Create a compact Markdown handoff from a visual-evidence training run."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def main() -> None:
     checkpoint_files = sorted((args.checkpoint_dir / f"global_step_{checkpoint_step}" / "actor").glob("*.pt"))
 
     lines = [
-        "# Visual-SEED training progress",
+        "# Visual-evidence training progress",
         "",
         f"- Completed logged steps: {steps[0]}–{steps[-1]}",
         f"- Latest resumable checkpoint: `global_step_{checkpoint_step}`",
@@ -76,8 +76,11 @@ def main() -> None:
         "",
         f"- Evidence ready rate: {statuses['ready']}/{len(evidence)} ({statuses['ready'] / max(len(evidence), 1):.1%})",
         f"- Analyzer routes: visual/DINO {routes['visual']}, text/OCR {routes['text']}",
-        f"- Mean OPD loss: {mean(values('actor/seed_opd_loss')):.6f}",
-        f"- Mean OPD active-token ratio: {mean(values('actor/seed_opd_active_token_ratio')):.1%}",
+        f"- Mean signed OPSD advantage: {mean(values('actor/groove_opsd_advantage_mean')):.6f}",
+        f"- Mean OPSD active-token ratio: {mean(values('actor/groove_opsd_active_token_ratio')):.1%}",
+        f"- Mean positive/negative OPSD token fractions: "
+        f"{mean(values('actor/groove_opsd_positive_token_fraction')):.1%} / "
+        f"{mean(values('actor/groove_opsd_negative_token_fraction')):.1%}",
         f"- Mean answer reward: {mean(values('reward/answer_reward_mean')):.3f}",
         "",
         "## Resource envelope",

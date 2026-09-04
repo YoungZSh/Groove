@@ -1,0 +1,81 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    enable_activation_offload: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
+  actor:
+    optim:
+      lr: 1.0e-6
+      override_optimizer_config:
+        fused: true
+        foreach: false
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    calculate_entropy: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      reshard_after_forward: true
+    policy_loss:
+      loss_mode: groove
+    self_distillation:
+      teacher_always_on: true
+      teacher_model_source: current
+      teacher_image_key: groove_teacher_images
+      fallback_to_policy_loss_on_missing_teacher: true
+      opsd_advantage_coef: 0.01
+      opsd_advantage_clip: null
+      full_logit_distillation: false
+      distillation_topk: null
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+  rollout:
+    mode: async
+    n: 8
+    calculate_log_probs: true
+    log_prob_micro_batch_size_per_gpu: 1
+    gpu_memory_utilization: 0.6
+    free_cache_engine: true
+    enable_sleep_mode: true
+    layered_summon: false
+    enforce_eager: true
+    load_format: dummy
+    enable_chunked_prefill: true
+    max_num_seqs: 16
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+
+data:
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+custom_reward_function:
+  reward_kwargs:
+    answer_reward_weight: 0.9
+    format_reward_weight: 0.1
+
+trainer:
+  val_before_train: false
+
+ray_kwargs:
+  ray_init:
+    include_dashboard: false
+    object_store_memory: 8589934592

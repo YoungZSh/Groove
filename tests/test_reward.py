@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import torch
 
-from mmcot_opsd.reward import (
+from groove.reward import (
     answers_match,
     compute_score,
     extract_final_answer,
@@ -35,7 +35,7 @@ class RewardTest(unittest.TestCase):
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
             },
             non_tensors={
-                "data_source": np.array(["vision_opd_6k_visual_seed"], dtype=object),
+                "data_source": np.array(["vision_opd_6k_groove"], dtype=object),
                 "reward_model": np.array([{"ground_truth": "B"}], dtype=object),
                 "extra_info": np.array([{}], dtype=object),
             },
@@ -86,10 +86,10 @@ class RewardTest(unittest.TestCase):
         self.assertEqual(result["weighted_answer_reward"], 0.9)
         self.assertEqual(result["weighted_format_reward"], 0.1)
 
-    def test_visual_seed_logs_both_reward_components(self):
-        from mmcot_opsd.verl_trainer import VisualSeedRayPPOTrainer
+    def test_groove_logs_both_reward_components(self):
+        from groove.verl_trainer import GrooveRayPPOTrainer
 
-        metrics = VisualSeedRayPPOTrainer._reward_component_metrics(
+        metrics = GrooveRayPPOTrainer._reward_component_metrics(
             {
                 "answer_reward": [1.0, 0.0],
                 "format_reward": [1.0, 0.0],

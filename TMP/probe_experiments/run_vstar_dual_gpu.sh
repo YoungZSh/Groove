@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/root/siton-tmp/yzs/mmcot_opsd
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$ROOT/../.." && pwd)"
 PYTHON=/root/siton-tmp/yzs/miniconda3/envs/vstar-glq-depo/bin/python
-OUTPUT_DIR="$ROOT/outputs/qwen3.5-4b-vstar"
+OUTPUT_DIR="$PROJECT_ROOT/outputs/qwen3.5-4b-vstar"
 mkdir -p "$OUTPUT_DIR/logs"
 
 export TRANSFORMERS_OFFLINE=1

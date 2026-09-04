@@ -62,7 +62,7 @@ from probe_interleaved_opd import (
 
 
 DEFAULT_OUTPUT = Path(
-    "/root/siton-tmp/yzs/mmcot_opsd/outputs/dense-interleaved-opd-probe"
+    Path(__file__).resolve().parents[2] / "outputs/dense-interleaved-opd-probe"
 )
 METHODS = ("absolute", "relative_strict", "relative_stable")
 CONDITIONS = (

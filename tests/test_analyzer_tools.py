@@ -1,17 +1,18 @@
 import unittest
 from pathlib import Path
 
-from mmcot_opsd.analyzer import (
+from groove.analyzer import (
     OpenAIAnalyzerConfig,
     OpenAICompatibleAnalyzer,
     SYSTEM_PROMPT,
     ONE_SHOT_MESSAGES,
     _crop_data_url,
+    _tight_ocr_text_bbox,
     _tool_feedback_message,
     build_group_analysis_text,
 )
-from mmcot_opsd.analyzer_tools import ANALYZER_TOOL_SCHEMAS, AnalyzerVisionToolRegistry
-from mmcot_opsd.schemas import GroupRollout, Rollout
+from groove.analyzer_tools import ANALYZER_TOOL_SCHEMAS, AnalyzerVisionToolRegistry
+from groove.schemas import FocusProgram, GroupRollout, Rollout
 
 
 class AnalyzerToolsTest(unittest.TestCase):
@@ -28,6 +29,80 @@ class AnalyzerToolsTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             AnalyzerVisionToolRegistry._bbox([8, 4, 8, 9], (50, 100))
+
+    def test_tight_ocr_bbox_ignores_punctuation_noise(self):
+        result = {
+            "crop_bbox": [0, 0, 1044, 1311],
+            "text": [
+                {"text": "-", "bbox": [[198, 394], [200, 394], [200, 396], [198, 396]]},
+                {"text": "35.000", "bbox": [[70.5, 544.25], [99.25, 542.75], [99.5, 551.75], [71, 553.25]]},
+            ],
+        }
+
+        self.assertEqual(_tight_ocr_text_bbox(result), (70.5, 542.75, 99.5, 553.25))
+
+    def test_tight_ocr_bbox_prefers_text_matching_private_reference(self):
+        result = {
+            "crop_bbox": [0, 0, 2000, 1500],
+            "text": [
+                {
+                    "text": "TechnipFMC",
+                    "confidence": 0.95,
+                    "bbox": [[1392, 906], [1428, 906], [1428, 914], [1392, 914]],
+                },
+                {
+                    "text": "DHPENEWS",
+                    "confidence": 0.54,
+                    "bbox": [[678, 931], [701, 931], [701, 936], [678, 936]],
+                },
+            ],
+        }
+
+        self.assertEqual(
+            _tight_ocr_text_bbox(result, reference_text="Deep Energy vessel name"),
+            (678.0, 931.0, 701.0, 936.0),
+        )
+
+    def test_analyzer_uses_tight_ocr_text_box_for_teacher_crop(self):
+        from tempfile import TemporaryDirectory
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            image_path = Path(directory) / "image.jpg"
+            Image.new("RGB", (1000, 1000), color=(10, 20, 30)).save(image_path)
+            analyzer = OpenAICompatibleAnalyzer(
+                OpenAIAnalyzerConfig(base_url="http://localhost", api_key="test")
+            )
+            analyzer.last_tool_trace = [
+                {
+                    "round": 1,
+                    "name": "read_text",
+                    "result": {
+                        "crop_bbox": [0, 0, 900, 900],
+                        "text": [
+                            {
+                                "text": "35.000",
+                                "confidence": 0.95,
+                                "bbox": [[100, 200], [200, 200], [200, 240], [100, 240]],
+                            }
+                        ],
+                    },
+                }
+            ]
+            focus = FocusProgram(
+                group_summary="text",
+                visible_focus_instruction="Inspect the text.",
+                grounding_queries=["orange sign"],
+                crucial_evidence_type="text",
+                tool_route="ocr",
+                context_margin=0.12,
+            )
+
+            updated = analyzer._attach_tool_regions(focus, image_path)
+
+            self.assertEqual(len(updated.tool_regions), 1)
+            self.assertEqual(updated.tool_regions[0].expanded_box, (88, 195, 212, 245))
+            self.assertEqual(updated.tool_regions[0].source, "paddle_ocr_text")
 
     def test_group_text_is_programmatically_split_without_reward_values(self):
         group = GroupRollout(
@@ -167,7 +242,7 @@ class AnalyzerToolsTest(unittest.TestCase):
                     tool_feedback_max_side=32,
                 )
             )
-            with patch("mmcot_opsd.analyzer_tools.AnalyzerVisionToolRegistry", FakeRegistry):
+            with patch("groove.analyzer_tools.AnalyzerVisionToolRegistry", FakeRegistry):
                 focus = analyzer._analyze_with_tools(group, [])
 
             self.assertEqual(focus.grounding_queries, ["small blue sign"])

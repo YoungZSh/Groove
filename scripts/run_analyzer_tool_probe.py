@@ -7,8 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
-from mmcot_opsd.analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
-from mmcot_opsd.schemas import GroupRollout, Rollout
+from groove.analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
+from groove.schemas import GroupRollout, Rollout
 
 
 def _question_from_input(value: str) -> str:

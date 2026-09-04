@@ -29,13 +29,14 @@ from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 
 DEFAULT_MODEL = Path("/root/siton-tmp/yzs/ckpts/Qwen3.5-4B")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = Path(
     "/root/siton-tmp/yzs/datasets/vstar-bench/data/test-00000-of-00001.parquet"
 )
 DEFAULT_TRACES = Path(
-    "/root/siton-tmp/yzs/mmcot_opsd/outputs/qwen3.5-4b-vstar/traces.jsonl"
+    PROJECT_ROOT / "outputs/qwen3.5-4b-vstar/traces.jsonl"
 )
-DEFAULT_OUTPUT = Path("/root/siton-tmp/yzs/mmcot_opsd/outputs/attention-analysis")
+DEFAULT_OUTPUT = PROJECT_ROOT / "outputs/attention-analysis"
 DEFAULT_VISUAL = Path(
     "/root/siton-tmp/yzs/.codex/visualizations/2026/08/23/"
     "01a02f60-6fc9-7c42-b245-4c0ed1d73db6/qwen35-vstar-attention.html"

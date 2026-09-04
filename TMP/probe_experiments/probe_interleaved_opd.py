@@ -44,18 +44,19 @@ from analyze_vstar_attention import (
 
 
 DEFAULT_MODEL = Path("/root/siton-tmp/yzs/ckpts/Qwen3.5-4B")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = Path(
     "/root/siton-tmp/yzs/datasets/vstar-bench/data/test-00000-of-00001.parquet"
 )
 DEFAULT_TRACES = Path(
-    "/root/siton-tmp/yzs/mmcot_opsd/outputs/qwen3.5-4b-vstar/traces.jsonl"
+    PROJECT_ROOT / "outputs/qwen3.5-4b-vstar/traces.jsonl"
 )
 DEFAULT_ANNOTATIONS = Path(
     "/root/siton-tmp/yzs/GLaQ/benchmark_zoomeye_multibench/"
     "official_annotations/annotation_vstar.json"
 )
 DEFAULT_OUTPUT = Path(
-    "/root/siton-tmp/yzs/mmcot_opsd/outputs/interleaved-opd-probe"
+    PROJECT_ROOT / "outputs/interleaved-opd-probe"
 )
 IMAGE_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
 METHODS = ("absolute", "relative_strict", "relative_stable")

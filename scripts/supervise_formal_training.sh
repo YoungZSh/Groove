@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Keep the overnight Batch-8 visual-SEED run alive across a transient Ray/vLLM failure.
+# Keep the overnight Batch-8 visual-evidence run alive across a transient Ray/vLLM failure.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-EXPERIMENT_NAME="qwen35-4b-visual-seed-batch8-seq64-formal-v1"
+EXPERIMENT_NAME="qwen35-4b-groove-visual-evidence-batch8-seq64-formal-v1"
 CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 LOG_FILE="$PROJECT_ROOT/outputs/logs/$EXPERIMENT_NAME.log"
 SUPERVISOR_LOG="$PROJECT_ROOT/outputs/logs/$EXPERIMENT_NAME-supervisor.log"
 REPORT_FILE="$PROJECT_ROOT/outputs/reports/qwen35-4b-batch8-seq64-latest.md"
-TOKEN_DUMP_DIR="$PROJECT_ROOT/outputs/opd-token-dumps/$EXPERIMENT_NAME"
-TOKEN_REPORT_FILE="$PROJECT_ROOT/outputs/reports/qwen35-4b-opd-token-credit-latest.md"
+TOKEN_DUMP_DIR="$PROJECT_ROOT/outputs/opsd-token-dumps/$EXPERIMENT_NAME"
+TOKEN_REPORT_FILE="$PROJECT_ROOT/outputs/reports/qwen35-4b-opsd-token-credit-latest.md"
 TARGET_STEPS=741
 
 is_training_alive() {
   local pid args
   while IFS= read -r pid; do
     args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    if [[ "$args" == *"mmcot_opsd.verl_entrypoint"* && "$args" == *"trainer.experiment_name=$EXPERIMENT_NAME"* ]]; then
+    if [[ "$args" == *"groove.verl_entrypoint"* && "$args" == *"trainer.experiment_name=$EXPERIMENT_NAME"* ]]; then
       return 0
     fi
   done < <(pgrep -x python || true)
@@ -40,10 +40,11 @@ start_training() {
   export ANALYZER_TOOL_FEEDBACK_MAX_SIDE="${ANALYZER_TOOL_FEEDBACK_MAX_SIDE:-1024}"
   export ANALYZER_GROUNDING_URL="http://127.0.0.1:8011"
   export ANALYZER_OCR_URL="http://127.0.0.1:8012"
-  export VISUAL_SEED_EVIDENCE_DIR="$PROJECT_ROOT/outputs/evidence-batch8-seq64-formal-v1"
-  export VISUAL_SEED_REQUIRE_SLEEP_LEVEL_2=false
+  export GROOVE_EVIDENCE_DIR="$PROJECT_ROOT/outputs/evidence-batch8-seq64-formal-v1"
+  export GROOVE_REQUIRE_SLEEP_LEVEL_2=false
   export CUDA_VISIBLE_DEVICES=0,1
   export N_GPUS=2
+  export OPSD_ENABLED=true
   export ROLLOUT_TENSOR_PARALLEL_SIZE=2
   export ROLLOUT_GPU_MEMORY_UTILIZATION=0.12
   export ROLLOUT_MAX_NUM_SEQS=64
@@ -72,14 +73,14 @@ start_training() {
   export SAVE_FREQ=10
   export TEST_FREQ=100
   export MAX_ACTOR_CKPT_TO_KEEP=2
-  export OPD_LOG_PROB_DUMP_DIR="$PROJECT_ROOT/outputs/opd-token-dumps/$EXPERIMENT_NAME"
+  export OPSD_LOG_PROB_DUMP_DIR="$PROJECT_ROOT/outputs/opsd-token-dumps/$EXPERIMENT_NAME"
   export EXPERIMENT="$EXPERIMENT_NAME"
   export EXPERIMENT_NAME
   export CHECKPOINT_DIR
   export ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts-batch8-seq64-formal-v1"
 
   set -o pipefail
-  bash "$PROJECT_ROOT/scripts/run_visual_seed.sh" 2>&1 | tee -a "$LOG_FILE"
+  bash "$PROJECT_ROOT/scripts/run_groove.sh" 2>&1 | tee -a "$LOG_FILE"
 }
 
 write_progress_report() {
