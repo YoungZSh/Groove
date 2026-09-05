@@ -62,6 +62,7 @@ Judgement: 0
 """
 
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+ANSWER_TAG_PATTERN = re.compile(r"</?\s*answer\b[^>]*>", re.IGNORECASE)
 DEFAULT_ANSWER_REWARD_WEIGHT = 1.0
 DEFAULT_FORMAT_REWARD_WEIGHT = 0.2
 
@@ -93,18 +94,21 @@ def extract_answer(output: str) -> tuple[str, bool]:
 
     Semantic judging deliberately falls back to the complete output so that
     ``accuracy`` remains independent of presentation.  Format validity is
-    stricter: the response must consist of exactly one non-empty, lowercase
-    ``<answer>...</answer>`` pair, apart from surrounding whitespace.
+    stricter: exactly one non-empty, lowercase ``<answer>...</answer>`` pair
+    must terminate the response. Ordinary reasoning before that pair is valid.
     """
     text = output or ""
     matches = list(ANSWER_PATTERN.finditer(text))
     if matches:
         answer = matches[-1].group(1).strip()
-        stripped = text.strip()
+        # Count tag markers separately: one non-greedy regex match can still
+        # contain nested opening tags or follow an unmatched closing tag.
+        tags = [match.group(0) for match in ANSWER_TAG_PATTERN.finditer(text)]
         format_valid = (
             len(matches) == 1
             and bool(answer)
-            and matches[0].group(0) == stripped
+            and tags == ["<answer>", "</answer>"]
+            and not text[matches[0].end() :].strip()
         )
         return answer, format_valid
     return text.strip(), False

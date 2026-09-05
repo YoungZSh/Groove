@@ -21,6 +21,7 @@ from verl.utils.device import auto_set_device
 
 from .verl_trainer import GrooveRayPPOTrainer
 from .objective import validate_objective_config
+from .deepeyes_prompt import configure_deepeyes_response
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -218,6 +219,7 @@ def main() -> None:
     config_name = os.environ.get("VERL_CONFIG_NAME", "groove")
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         config = compose(config_name=config_name, overrides=sys.argv[1:])
+    configure_deepeyes_response(config)
     validate_objective_config(config)
     memory_guard = configure_ray_memory_guard(config)
     sleep_level = validate_full_time_sharing(config)
@@ -264,6 +266,9 @@ def main() -> None:
             f"{config.reward.custom_reward_function.name}",
             f"answer_reward_weight={reward_kwargs.get('answer_reward_weight')}",
             f"format_reward_weight={reward_kwargs.get('format_reward_weight')}",
+            f"response_format={config.data.get('response_format', 'original')}",
+            f"dataset_cls={config.data.custom_cls.name}",
+            f"custom_chat_template={config.actor_rollout_ref.model.custom_chat_template is not None}",
         )
         return
     runner = ray.remote(num_cpus=1)(GrooveTaskRunner)

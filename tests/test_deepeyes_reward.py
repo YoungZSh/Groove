@@ -111,8 +111,64 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         )
         self.assertEqual(
             extract_answer("reasoning <answer>green</answer>"),
-            ("green", False),
+            ("green", True),
         )
+
+    def test_reasoning_then_answer_keeps_full_reward_and_judges_only_final_answer(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        payload = {"choices": [{"message": {"content": "1"}}]}
+        reasoning = "I first considered blue, but the visible surface is green."
+        with (
+            patch.dict("os.environ", {"DEEPEYES_JUDGE_API_KEY": "test-key",
+                                      "DEEPEYES_REPETITION_ZERO_REWARD": "false"}),
+            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.deepeyes_reward.json.load", return_value=payload),
+        ):
+            result = _judge_one("What color?", "green", reasoning + "\n<answer>green</answer>")
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result["format_valid"], 1.0)
+        judge_input = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
+        self.assertNotIn(reasoning, judge_input)
+        self.assertIn("[Model_answer]: green\nJudgement:", judge_input)
+
+    def test_terminal_answer_rejects_nested_unbalanced_and_noncanonical_tags(self):
+        invalid = [
+            "Reason. <answer>green</answer> extra text",
+            "Reason. <answer>green<answer>green</answer>",
+            "Reason. </answer><answer>green</answer>",
+            "Reason. <answer>green</answer></answer>",
+            "<ANSWER>blue</ANSWER><answer>green</answer>",
+            "Reason. <ANSWER>green</ANSWER>",
+            "Reason. <answer class='final'>green</answer>",
+            "Reason. <answer>green",
+            "Reason. <answer> \n </answer>",
+            "Reason. <answer>blue</answer><answer>green</answer>",
+        ]
+        for output in invalid:
+            with self.subTest(output=output):
+                self.assertFalse(extract_answer(output)[1])
+        self.assertEqual(
+            extract_answer("\nReasoning on multiple lines.\nVisible evidence supports green.\n"
+                           "<answer> green </answer> \n"),
+            ("green", True),
+        )
+
+    def test_malformed_terminal_answer_preserves_semantic_accuracy(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with (
+            patch.dict("os.environ", {"DEEPEYES_JUDGE_API_KEY": "test-key",
+                                      "DEEPEYES_REPETITION_ZERO_REWARD": "false"}),
+            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.deepeyes_reward.json.load",
+                  return_value={"choices": [{"message": {"content": "1"}}]}),
+        ):
+            result = _judge_one("What color?", "green", "Reason. <answer>green</answer> trailing")
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["format_valid"], 0.0)
+        self.assertAlmostEqual(result["score"], 0.8)
 
     def test_unconstrained_explanation_is_not_guessed(self):
         with self.assertRaises(ValueError):

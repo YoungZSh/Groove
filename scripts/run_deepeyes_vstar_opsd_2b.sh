@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Signed-OPSD Qwen3.5-2B run, directly comparable with the screened V* GRPO baseline.
+# GRPO + OPSD Qwen3.5-2B run with ordinary reasoning and a terminal answer.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_opsd_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v4}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-grpo-opsd-reasoning-answer-seed20260904}"
 
-# Preserve the completed 2B GRPO run's model, data split, sampling, optimizer,
-# reward, and validation settings. OPSD only adds detached sampled reverse-KL
-# credit to the existing GRPO advantage before the shared PPO loss.
+# Keep the established model, split, sampling, and optimizer settings. Both 2B
+# launchers now use plain reasoning plus answer tags; their seeds still differ.
 export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
 export PREPARE_DATA=false
 export DATA_OUTPUT_DIR="$DATA_DIR"
@@ -57,6 +56,7 @@ export MAX_PROMPT_LENGTH=2048
 export MAX_RESPONSE_LENGTH=1024
 export MAX_MODEL_LEN=9216
 export ENABLE_THINKING=false
+export STUDENT_RESPONSE_FORMAT=reasoning_answer
 export STUDENT_IMAGE_MAX_PIXELS=null
 export STUDENT_IMAGE_PATCH_SIZE=16
 export MODEL_USE_REMOVE_PADDING=true

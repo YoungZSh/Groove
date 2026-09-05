@@ -32,14 +32,48 @@ adds a negative-only format term:
 
 ```text
 accuracy = LLM-Judge semantic correctness in {0, 1}
-format_penalty = 0 if the response is exactly one nonempty <answer>...</answer>
-                 pair, otherwise -1
+format_penalty = 0 if one nonempty lowercase <answer>...</answer> pair ends the
+                 response (preceding reasoning is allowed), otherwise -1
 score = accuracy + 0.2 * format_penalty
 ```
 
 Thus a strictly formatted correct answer receives `1.0`, while a semantically
 correct bare answer receives `0.8`. Analyzer grouping continues to use the raw
 `accuracy`, not this shaped `score`.
+
+### Plain reasoning followed by the final answer (next 2B runs)
+
+Both formal 2B launchers select `data.response_format=reasoning_answer`. The
+Student is instructed to explain its reasoning as ordinary text, then put only
+the final answer in one terminal `<answer>...</answer>` pair. No `<think>` or
+`<reason>` wrapper is requested, and there is no new reasoning-length reward.
+An answer-only completion still has valid answer formatting; reasoning is
+requested by the prompt rather than enforced by a separate correctness gate.
+
+`DeepEyesReasoningDataset` replaces the system instruction in memory for both
+train and validation. Existing parquet files, row order, questions, original
+images, reference labels, and Analyzer-only metadata are preserved. Only the
+original image and question enter the Student user message. Teacher prompts
+continue to derive from the Student prompt and add training-only evidence.
+
+Qwen3.5 remains in non-thinking mode. Before workers start, the entrypoint reads
+the model's original chat template and removes only its empty non-thinking
+`<think>\n\n</think>\n\n` generation prefill. The resolved custom template ends in
+the ordinary assistant header and is shared by Student and Teacher. The base
+checkpoint files are not edited. A template with an unexpected prefill fails
+configuration validation rather than silently selecting another format.
+
+Format validation counts opening and closing answer markers independently,
+rejecting nested, duplicated, empty, non-lowercase, or unbalanced tags and text
+after the answer. A correct `reasoning + <answer>answer</answer>` receives `1.0`;
+a semantically correct malformed completion receives `0.8`. The Judge sees the
+extracted answer, and raw `accuracy` and repetition handling are unchanged.
+
+These settings require a fresh experiment name. The historical format-0.2 run
+required the whole response to be one answer block and penalized reasoning
+outside it; its logged format rate is not comparable to the corrected rule.
+The two launchers currently retain different seeds (GRPO: 22, GRPO + OPSD:
+20260904), which must be aligned for a controlled comparison.
 
 The separate non-DeepEyes `FINAL: X` reward has two independent components:
 

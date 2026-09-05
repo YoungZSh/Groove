@@ -23,7 +23,7 @@ The deployment boundary is important:
 The checked-in execution path is authoritative. Read it in this order:
 
 1. `scripts/run_deepeyes_vstar_opsd_2b.sh` and
-   `scripts/run_deepeyes_vstar_grpo_2b.sh` define the exact current 2B
+   `scripts/run_grpo_2b.sh` define the exact current 2B
    experiments. `scripts/run_groove.sh` translates their environment into the
    resolved Hydra/VERL configuration.
 2. `src/groove/verl_trainer.py::_postprocess_advantages()` is the integration
@@ -93,7 +93,7 @@ Before handing off launcher changes, also run:
 
 ```bash
 bash -n scripts/run_groove.sh
-bash -n scripts/run_deepeyes_vstar_grpo_2b.sh
+bash -n scripts/run_grpo_2b.sh
 bash -n scripts/run_deepeyes_vstar_opsd_2b.sh
 git diff --check
 ```
@@ -145,8 +145,14 @@ from output formatting:
 - Analyzer success/failure grouping uses raw `accuracy`, never shaped `score`.
 - Semantic judging may fall back to the complete response when the tag is
   malformed so that format does not silently redefine semantic correctness.
-- A valid format is exactly one lowercase, nonempty terminal
-  `<answer>...</answer>` pair, allowing only surrounding whitespace.
+- A valid format has exactly one lowercase, nonempty terminal
+  `<answer>...</answer>` pair. Ordinary reasoning before it is allowed; only
+  whitespace may follow it. Nested, duplicated, or unbalanced answer tags fail.
+- The next 2B runs use `data.response_format=reasoning_answer`: plain reasoning
+  followed by the final answer. No think wrapper or reasoning-length gate is
+  added. A dataset adapter changes the instruction in memory without rewriting
+  historical parquet files. The shared Student/Teacher chat template removes
+  Qwen3.5's empty think prefill while keeping `enable_thinking=false`.
 - Current next-run shaping is:
 
 ```text

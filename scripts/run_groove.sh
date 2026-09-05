@@ -98,6 +98,7 @@ unset VLLM_ATTENTION_BACKEND
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
+STUDENT_RESPONSE_FORMAT="${STUDENT_RESPONSE_FORMAT:-original}"
 STUDENT_IMAGE_MAX_PIXELS="${STUDENT_IMAGE_MAX_PIXELS:-4194304}"
 STUDENT_IMAGE_PATCH_SIZE="${STUDENT_IMAGE_PATCH_SIZE:-16}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
@@ -193,6 +194,7 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   "data.train_files=['$TRAIN_FILE']" \
   "data.val_files=['$TEST_FILE']" \
   data.train_batch_size="$TRAIN_BATCH_SIZE" \
+  data.response_format="$STUDENT_RESPONSE_FORMAT" \
   data.max_prompt_length="$MAX_PROMPT_LENGTH" \
   data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING" \
   data.image_max_pixels="$STUDENT_IMAGE_MAX_PIXELS" \

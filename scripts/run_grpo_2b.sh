@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Pure-GRPO Qwen3.5-2B run on the screened 2.2K DeepEyes V* split.
+# Pure-GRPO Qwen3.5-2B run on the screened 2.2K visual-QA split.
 set -euo pipefail
 
-# This experiment intentionally uses Qwen3.5's non-thinking chat mode. Reject
-# command-line overrides so a resumed run cannot silently change the rollout
-# distribution and lose the final-answer tag to long hidden reasoning.
+# Generate reasoning as ordinary response text, without a native think prefill.
+# The reasoning/answer prompt and template are resolved by the entrypoint.
 for argument in "$@"; do
   if [[ "$argument" == *"enable_thinking="* && "$argument" != *"enable_thinking=false" ]]; then
     echo "Qwen3.5 thinking must remain disabled for this experiment: $argument" >&2
@@ -14,14 +13,14 @@ done
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_grpo_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2199-seed20260904-b16-kl001-verl090-v3}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-grpo-reasoning-answer-seed22}"
 
 export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
 export PREPARE_DATA=false
 export DATA_OUTPUT_DIR="$DATA_DIR"
 export TRAIN_FILE="$DATA_DIR/train.parquet"
 export TEST_FILE="$DATA_DIR/validation.parquet"
-export SEED=20260904
+export SEED=22
 
 # Keep the full training history locally without requiring network access or a
 # W&B login. The offline run can be synced after training completes.
@@ -53,6 +52,7 @@ export MAX_PROMPT_LENGTH=2048
 export MAX_RESPONSE_LENGTH=1024
 export MAX_MODEL_LEN=9216
 export ENABLE_THINKING=false
+export STUDENT_RESPONSE_FORMAT=reasoning_answer
 export STUDENT_IMAGE_MAX_PIXELS=null
 export STUDENT_IMAGE_PATCH_SIZE=16
 
