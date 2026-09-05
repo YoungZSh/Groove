@@ -4,7 +4,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_opsd_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v3}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v4}"
 
 # Preserve the completed 2B GRPO run's model, data split, sampling, optimizer,
 # reward, and validation settings. OPSD only adds detached sampled reverse-KL

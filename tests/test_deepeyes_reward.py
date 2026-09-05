@@ -51,6 +51,7 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
             result = _judge_one("What color?", "green", "green")
 
         body = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
         self.assertEqual(body["structured_outputs"], {"choice": ["0", "1"]})
         self.assertEqual(body["max_completion_tokens"], 4)
         self.assertEqual(result["score"], 1.0)

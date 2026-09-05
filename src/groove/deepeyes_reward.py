@@ -242,7 +242,10 @@ def _judge_one(question: str, ground_truth: str, output: str) -> dict[str, float
         "messages": [
             {
                 "role": "system",
-                "content": "You are a binary semantic-equivalence judge. Output exactly 0 or 1.",
+                # Preserve the permissive semantic boundary used by the original
+                # GRPO run. Exact binary formatting is enforced independently by
+                # constrained decoding below.
+                "content": "You are a helpful assistant.",
             },
             {
                 "role": "user",
