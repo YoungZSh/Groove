@@ -76,10 +76,10 @@ export ANALYZER_API_RETRIES="${ANALYZER_API_RETRIES:-5}"
 export ANALYZER_API_RETRY_DELAY="${ANALYZER_API_RETRY_DELAY:-1.0}"
 export GROOVE_EVIDENCE_DIR="${GROOVE_EVIDENCE_DIR:-$PROJECT_ROOT/outputs/evidence}"
 export GROOVE_MIXED_GROUPS_ONLY="${GROOVE_MIXED_GROUPS_ONLY:-false}"
-# The remote Analyzer vLLM service is configured with max-num-seqs=16. Keep
-# eight concurrent evidence groups by default; DINO/OCR remain single-worker
-# services behind their HTTP endpoints.
-export GROOVE_MAX_CONCURRENCY="${GROOVE_MAX_CONCURRENCY:-8}"
+# The remote Analyzer vLLM service is configured with max-num-seqs=64. Run 16
+# evidence groups concurrently; DINO/OCR remain single-worker services behind
+# their HTTP endpoints and may queue tool requests without changing worker count.
+export GROOVE_MAX_CONCURRENCY="${GROOVE_MAX_CONCURRENCY:-16}"
 # Bound each original/crop image in the Teacher prefix independently. This
 # prevents one high-resolution multi-crop example from exceeding its text
 # context budget while retaining all selected evidence images.

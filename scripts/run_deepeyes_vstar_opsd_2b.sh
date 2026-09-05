@@ -39,7 +39,9 @@ export ANALYZER_MAX_COMPLETION_TOKENS=2048
 export ANALYZER_TOOL_FEEDBACK_MAX_SIDE=1024
 export ANALYZER_GROUNDING_URL="${ANALYZER_GROUNDING_URL:-http://127.0.0.1:8011}"
 export ANALYZER_OCR_URL="${ANALYZER_OCR_URL:-http://127.0.0.1:8012}"
-export GROOVE_MAX_CONCURRENCY=8
+# Only Analyzer group orchestration is widened. The remote DINO and OCR
+# services intentionally remain one worker each.
+export GROOVE_MAX_CONCURRENCY=16
 export GROOVE_MIXED_GROUPS_ONLY=false
 export GROOVE_EVIDENCE_DIR="$PROJECT_ROOT/outputs/evidence/$EXPERIMENT_NAME"
 export GROOVE_TEACHER_MAX_IMAGE_PIXELS=1048576
