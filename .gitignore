@@ -43,6 +43,7 @@ data/**/.cache/
 data/vstar/images/
 data/deepeyes_47k/
 data/deepeyes_vstar_grpo_*/
+data/deepeyes_vstar_opsd_*/
 data/vision_opd_*_seed*/
 data/baseline_*_seed*/
 data/visual_evidence_source/

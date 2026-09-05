@@ -135,6 +135,9 @@ OPTIMIZER_IMPL="${OPTIMIZER_IMPL:-torch.optim}"
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-AdamW}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
+# Match the historical VERL behavior unless an experiment launcher explicitly
+# requests the per-rollout normalization used by the original GRPO objective.
+LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
 REFERENCE_KL_COEF="${REFERENCE_KL_COEF:-0.001}"
 OPSD_ADVANTAGE_COEF="${OPSD_ADVANTAGE_COEF:-0.01}"
 OPSD_ADVANTAGE_CLIP="${OPSD_ADVANTAGE_CLIP:-null}"
@@ -244,6 +247,7 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   actor_rollout_ref.actor.clip_ratio="$PPO_CLIP_RATIO" \
   actor_rollout_ref.actor.clip_ratio_low="$PPO_CLIP_RATIO" \
   actor_rollout_ref.actor.clip_ratio_high="$PPO_CLIP_RATIO" \
+  actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE" \
   actor_rollout_ref.actor.entropy_coeff=0.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=true \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU" \

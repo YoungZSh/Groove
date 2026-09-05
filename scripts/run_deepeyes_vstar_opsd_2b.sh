@@ -1,21 +1,14 @@
 #!/usr/bin/env bash
-# Pure-GRPO Qwen3.5-2B run on the screened 2.2K DeepEyes V* split.
+# Signed-OPSD Qwen3.5-2B run, directly comparable with the screened V* GRPO baseline.
 set -euo pipefail
 
-# This experiment intentionally uses Qwen3.5's non-thinking chat mode. Reject
-# command-line overrides so a resumed run cannot silently change the rollout
-# distribution and lose the final-answer tag to long hidden reasoning.
-for argument in "$@"; do
-  if [[ "$argument" == *"enable_thinking="* && "$argument" != *"enable_thinking=false" ]]; then
-    echo "Qwen3.5 thinking must remain disabled for this experiment: $argument" >&2
-    exit 2
-  fi
-done
-
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_grpo_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-grpo-2199-seed20260904-b16-kl001-verl090-v3}"
+DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_opsd_2200_seed20260904"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v2}"
 
+# Preserve the completed 2B GRPO run's model, data split, sampling, optimizer,
+# reward, and validation settings. OPSD only adds detached sampled reverse-KL
+# credit to the existing GRPO advantage before the shared PPO loss.
 export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
 export PREPARE_DATA=false
 export DATA_OUTPUT_DIR="$DATA_DIR"
@@ -23,8 +16,6 @@ export TRAIN_FILE="$DATA_DIR/train.parquet"
 export TEST_FILE="$DATA_DIR/validation.parquet"
 export SEED=20260904
 
-# Keep the full training history locally without requiring network access or a
-# W&B login. The offline run can be synced after training completes.
 export TRAINER_LOGGER='["console","wandb"]'
 export WANDB_MODE=offline
 export WANDB_PROJECT=groove-visual-evidence
@@ -33,8 +24,25 @@ export WANDB_DIR="$PROJECT_ROOT/outputs/wandb"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export N_GPUS=2
-export OPSD_ENABLED=false
+export OPSD_ENABLED=true
+export OPSD_ADVANTAGE_COEF=0.01
+export OPSD_ADVANTAGE_CLIP=null
 export GROOVE_REQUIRE_SLEEP_LEVEL_2=false
+
+export ANALYZER_BASE_URL="${ANALYZER_BASE_URL:-http://127.0.0.1:8002/v1}"
+export ANALYZER_API_KEY="${ANALYZER_API_KEY:-unused}"
+export ANALYZER_MODEL="${ANALYZER_MODEL:-Qwen3.8-27B}"
+export ANALYZER_DISABLE_THINKING=true
+export ANALYZER_USE_VISION_TOOLS=true
+export ANALYZER_MAX_TOOL_ROUNDS=3
+export ANALYZER_MAX_COMPLETION_TOKENS=2048
+export ANALYZER_TOOL_FEEDBACK_MAX_SIDE=1024
+export ANALYZER_GROUNDING_URL="${ANALYZER_GROUNDING_URL:-http://127.0.0.1:8011}"
+export ANALYZER_OCR_URL="${ANALYZER_OCR_URL:-http://127.0.0.1:8012}"
+export GROOVE_MAX_CONCURRENCY=8
+export GROOVE_MIXED_GROUPS_ONLY=false
+export GROOVE_EVIDENCE_DIR="$PROJECT_ROOT/outputs/evidence/$EXPERIMENT_NAME"
+export GROOVE_TEACHER_MAX_IMAGE_PIXELS=1048576
 
 export TRAIN_BATCH_SIZE=16
 export ROLLOUT_N=8
@@ -42,33 +50,21 @@ export PPO_MINI_BATCH_SIZE=16
 # Pool valid response tokens across the batch. With the severe-repetition reward
 # gate below, long failed trajectories receive proportionally more gradient.
 export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
-# Dynamic micro-batching for actor, reference, and log-prob passes. The first
-# end-to-end step used only ~19GB/GPU at 9K, so 32K materially improves GPU
-# occupancy while retaining ample room on the two 80GB cards.
 export ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-32768}"
-# The selected split's real multimodal prompts are far below this bound. Keep
-# a modest padding ceiling for the non-packed Qwen3.5 path without resizing or
-# cropping the original images.
 export MAX_PROMPT_LENGTH=2048
 export MAX_RESPONSE_LENGTH=1024
 export MAX_MODEL_LEN=9216
 export ENABLE_THINKING=false
 export STUDENT_IMAGE_MAX_PIXELS=null
 export STUDENT_IMAGE_PATCH_SIZE=16
-
-# VERL 0.9 passes packed cu_seqlens/seq_idx through Qwen3.5's Gated DeltaNet
-# and causal-convolution layers, preventing cross-sample state leakage.
 export MODEL_USE_REMOVE_PADDING=true
 
-# Each DP rollout replica receives about 64 completions per training step.
 export ROLLOUT_TENSOR_PARALLEL_SIZE=1
 export ROLLOUT_MAX_NUM_SEQS=64
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=32768
 export ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
 export ROLLOUT_ENFORCE_EAGER=true
 
-# The 2B model and optimizer fit comfortably on two 80GB GPUs. Avoid CPU
-# transfers between rollout and update phases to improve step time.
 export TRAINING_FSDP_STRATEGY=fsdp
 export ACTOR_PARAM_OFFLOAD=false
 export ACTOR_OPTIMIZER_OFFLOAD=false
@@ -78,16 +74,12 @@ export ACTOR_FSDP_OFFLOAD_POLICY=false
 export OPTIMIZER_IMPL=torch.optim
 export OPTIMIZER_NAME=AdamW
 export FUSED_ADAMW=true
+export LEARNING_RATE=1e-6
 export REFERENCE_KL_COEF=0.01
 
-# Use the screened-data judge protocol as the sole outcome reward. Missing
-# answer tags are diagnostic only and do not reduce the binary accuracy score.
 export CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/deepeyes_reward.py"
 export CUSTOM_REWARD_FUNCTION_NAME=compute_score
 export REWARD_MANAGER_NAME=naive
-# VERL 0.9's reward worker is an async Ray actor: concurrent trajectory calls
-# share its executor, so one process can keep many remote Judge requests in
-# flight without the instability and startup cost of dozens of worker actors.
 export REWARD_NUM_WORKERS=1
 export ANSWER_REWARD_WEIGHT=1.0
 export FORMAT_REWARD_WEIGHT=0.0
@@ -114,5 +106,9 @@ export MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-2}"
 export EXPERIMENT_NAME
 export CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 export ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME"
+export OPSD_LOG_PROB_DUMP_DIR="$PROJECT_ROOT/outputs/opsd-token-dumps/$EXPERIMENT_NAME"
+
+export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+export PYTHONUNBUFFERED=1
 
 exec "$PROJECT_ROOT/scripts/run_groove.sh" "$@"
