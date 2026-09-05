@@ -2,11 +2,10 @@
 
 **Group-Relative On-Policy Optimization via Visual Evidence**
 
-This repository is the first trainable version of the group-contrastive visual
-self-evolution idea discussed in this task.  It augments verl's GRPO advantage
-with a signed visual-evidence sampled-token OPSD advantage.  The privileged Teacher sees an
-Analyzer-selected visual prefix; the deployed Student sees only the original
-image.
+This repository implements group-contrastive visual-evidence training. It augments
+verl's GRPO advantage with a signed visual-evidence sampled-token OPSD advantage.
+The privileged Teacher sees an Analyzer-selected visual prefix; the deployed Student
+sees only the original image.
 
 ## Implemented objective
 
@@ -55,12 +54,11 @@ protocol can be reused by later non-MCQ data.
 
 1. Qwen3.5-4B receives the original image and produces eight ordinary-text
    reasoning rollouts. Thinking mode is disabled.
-2. The rule reward forms a GRPO group. An external VLM Analyzer sees the original
-   image plus all eight trajectories, predictions, and terminal rewards. A reward
-   above `0.5` denotes an answer-correct rollout; `0.1` versus `0.0` only records
-   whether an incorrect rollout used the `FINAL: X` protocol. It contrasts correct
-   and incorrect traces when both exist, and otherwise compares reasoning variations
-   to recover shared or missing visual evidence. It never sees the ground-truth label.
+2. The semantic answer evaluator labels each rollout correct or incorrect independently
+   from the shaped training reward. An external VLM Analyzer sees the original image,
+   question, and two pre-grouped lists containing successful and failed reasoning. It
+   never sees numeric rewards, predicted labels, rollout IDs, or the ground-truth answer.
+   Degenerate repeated suffixes are removed before reasoning reaches the Analyzer.
 3. The Analyzer returns an English inspection instruction and up to three concrete
    English object phrases for the GroundingDINO tool. Comparative visual descriptors
    are allowed, but explicit answer assertions and option letters are rejected.
@@ -72,8 +70,10 @@ protocol can be reused by later non-MCQ data.
    visual feedback image. The Analyzer inspects that preview and revises an English
    query when the crop misses the requested object.
 6. The current Student weights act as the no-gradient Teacher on a prefix made
-   from the original image, focus text, and the final confirmed crops.  Superseded
-   retry boxes remain audit-only. The sampled response is
+   from the original image, focus text, and the Analyzer-selected crops. Every
+   successful tool result receives a candidate ID; the Analyzer selects the best
+   one to three candidates after all attempts, without IoU deduplication. Unselected
+   boxes remain audit-only. The sampled response is
    unchanged, so Teacher and Student log probabilities align token by token.
 7. verl applies the joint loss above.  At inference time the Analyzer, DINO,
    crops, and privileged prefix are removed.
@@ -204,6 +204,5 @@ or loading the model, add `GROOVE_DRY_RUN=true`.
 
 ## References
 
-- Self-evolving on-policy distillation reference: <https://arxiv.org/abs/2607.14777>
 - Vision-OPD paper and official implementation: <https://arxiv.org/abs/2605.18740>,
   <https://github.com/VisionOPD/Vision-OPD>

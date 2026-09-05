@@ -16,9 +16,16 @@ avoids full-vocabulary logits and uses only sampled-token log probabilities.
 
 The Analyzer input contains:
 
-- original image and multiple-choice question;
-- eight sampled reasoning traces;
-- each trace's parsed prediction and terminal reward.
+- the original image and question;
+- reasoning traces programmatically separated into successful and failed lists
+  using the semantic evaluator's raw `accuracy` result.
+
+It does not contain rollout IDs, parsed predictions, numeric rewards, or the
+ground-truth answer. Training reward shaping is deliberately separate from this
+semantic split. For DeepEyes runs, an Antidoom-style detector sets the complete
+rollout reward to zero when one exact contiguous span repeats at least four times
+over at least 80 characters. The raw Judge `accuracy` remains unchanged, and the
+detected loop suffix is removed before the reasoning is sent to the Analyzer.
 
 The terminal reward has two independent components:
 
@@ -33,13 +40,13 @@ multiple-choice answer in ordinary response text receives `0.9`, and the missing
 `0.1` provides a clean incentive to emit the final answer anchor. For current
 Vision-OPD-6K labels, matching is letter-aware (`B`, `(B)`, or `FINAL: (B)` all
 match the label `B`); the `FINAL: X` grammar itself imposes no A/B/C/D restriction.
-Consequently, `reward > 0.5` is the correct/incorrect boundary exposed to the
-Analyzer and group logic, while `format_reward` is logged separately.
+For this rule-based dataset, `accuracy` is still the answer-match bit, but the
+Analyzer consumes only the resulting successful/failed membership. It does not
+use the weighted terminal `score` as its correctness decision.
 
-It does not contain `reward_model.ground_truth` or `extra_info.answer`.
-Nevertheless, a successful rollout plus its binary reward makes the answer
-inferable to the Analyzer; that hindsight is intentional, while direct answer
-leakage into Teacher-visible text is not. The Analyzer's visible instruction is
+A successful rollout makes its answer inferable to the Analyzer; that hindsight
+is intentional, while direct answer leakage into Teacher-visible text is not.
+The Analyzer's visible instruction is
 required to describe an inspection action, not an option or conclusion. Comparative
 visual descriptors such as candidate colors or shapes are allowed when they tell
 the Teacher what to inspect; explicit answer assertions and option letters are
@@ -47,9 +54,11 @@ still rejected. Analyzer messages and GroundingDINO queries use English; the lat
 is an explicit tool contract because the deployed DINO checkpoint is English-oriented.
 After each visual-tool call, the exact returned crop is sent back to the Analyzer as
 an image message so it can verify or revise the query before finalizing the focus
-program. Only the latest successful tool round selected for the final focus is
-promoted to the Teacher; superseded retry boxes remain audit-only. Exact grounding
-phrases stay in the private execution record and are not Student targets.
+program. Every usable crop receives a candidate ID. After all tool attempts, the
+Analyzer selects the best one to three candidates needed for the visual comparison;
+there is no IoU deduplication or implicit latest-round preference. Unselected boxes
+remain audit-only. Exact grounding phrases stay in the private execution record and
+are not Student targets.
 
 ## Mask semantics
 
@@ -114,17 +123,7 @@ verl's reference-policy KL. Entropy regularization is disabled, and the KL
 coefficient uses verl's `0.001` default instead of the reference `0.01`, because
 this is a short single-turn VQA task rather than a long-horizon exploration environment.
 
-A second deliberate difference is Analyzer evolution. A paper-style pipeline first
-uses an external model to annotate trajectories, trains
-the policy for three SFT epochs to acquire trajectory-analysis ability, and then
-uses the latest policy snapshot as both actor and `policy_vllm` Analyzer during RL.
-Version one here skips that Stage-1 SFT and keeps the requested external GPT-5.6
-Analyzer fixed. The Student/privileged-Teacher model still self-evolves on-policy,
-but the visual-focus generator does not yet evolve. This is a clean ablation axis:
-once the external-Analyzer experiment works, its accepted focus programs can form
-the SFT data for a later synchronized Qwen Analyzer.
-
-## Self-evolution behavior
+## Teacher scoring and refresh behavior
 
 Both scoring passes use the pre-update actor under `no_grad`. Their signed gap
 is cached in the combined advantage before any actor optimizer step and stays
