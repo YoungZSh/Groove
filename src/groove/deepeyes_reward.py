@@ -13,7 +13,6 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from typing import Any
 
 
@@ -63,12 +62,22 @@ Judgement: 0
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 
 
-@dataclass(frozen=True)
 class RepetitionHit:
-    start: int
-    end: int
-    period: int
-    repeats: int
+    """Small import-loader-safe record for one contiguous repetition."""
+
+    __slots__ = ("start", "end", "period", "repeats")
+
+    def __init__(self, *, start: int, end: int, period: int, repeats: int) -> None:
+        self.start = start
+        self.end = end
+        self.period = period
+        self.repeats = repeats
+
+    def __repr__(self) -> str:
+        return (
+            f"RepetitionHit(start={self.start}, end={self.end}, "
+            f"period={self.period}, repeats={self.repeats})"
+        )
 
     @property
     def total_characters(self) -> int:

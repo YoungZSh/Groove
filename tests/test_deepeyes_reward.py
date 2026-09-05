@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from groove.deepeyes_reward import (
@@ -57,6 +58,14 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
     def test_unconstrained_explanation_is_not_guessed(self):
         with self.assertRaises(ValueError):
             parse_judgement("The answers describe different objects.")
+
+    def test_reward_module_supports_verl_external_object_loader(self):
+        from verl.utils.import_utils import load_extern_object
+
+        module_path = Path(__file__).parents[1] / "src/groove/deepeyes_reward.py"
+        loaded = load_extern_object(module_path=str(module_path), object_name="compute_score")
+
+        self.assertTrue(callable(loaded))
 
     def test_severe_repetition_zeroes_reward_but_preserves_accuracy(self):
         response = MagicMock()
