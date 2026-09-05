@@ -14,7 +14,7 @@ class Rollout(BaseModel):
     rollout_id: int
     completion: str
     predicted_label: str | None
-    reward: float
+    is_correct: bool
 
 
 class GroupRollout(BaseModel):
@@ -27,7 +27,7 @@ class GroupRollout(BaseModel):
 
     @property
     def is_mixed(self) -> bool:
-        outcomes = {float(item.reward) > 0.5 for item in self.rollouts}
+        outcomes = {item.is_correct for item in self.rollouts}
         return len(outcomes) > 1
 
 
@@ -51,6 +51,7 @@ class FocusProgram(BaseModel):
     tool_route: Literal["ocr", "dino"] = "dino"
     visible_focus_instruction: str
     grounding_queries: list[str] = Field(min_length=1, max_length=3)
+    selected_candidate_ids: list[str] = Field(default_factory=list, max_length=3)
     context_margin: float = Field(default=0.12, ge=0.10, le=0.15)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     tool_regions: list[ToolRegion] = Field(default_factory=list)
@@ -65,6 +66,16 @@ class FocusProgram(BaseModel):
                 normalized.append(query)
         if not normalized:
             raise ValueError("At least one non-empty grounding query is required")
+        return normalized
+
+    @field_validator("selected_candidate_ids")
+    @classmethod
+    def normalize_candidate_ids(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values:
+            candidate_id = str(value).strip()
+            if candidate_id and candidate_id not in normalized:
+                normalized.append(candidate_id)
         return normalized
 
 

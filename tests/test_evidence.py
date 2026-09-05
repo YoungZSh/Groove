@@ -10,6 +10,7 @@ from groove.analyzer import StaticAnalyzer
 from groove.evidence import (
     EvidenceBuilderConfig,
     TeacherEvidenceBuilder,
+    build_teacher_prompt_from_student,
     teacher_payload,
     validate_visible_focus,
 )
@@ -17,7 +18,7 @@ from groove.grounding import StaticGrounder, enlarge_crop
 from groove.schemas import FocusProgram, GroupRollout, Rollout
 
 
-def rollout_group(image_path: Path, rewards: list[float]) -> GroupRollout:
+def rollout_group(image_path: Path, correctness: list[float]) -> GroupRollout:
     return GroupRollout(
         uid="group-1",
         question="Which marks should be compared?\n(A) one\n(B) two",
@@ -25,11 +26,11 @@ def rollout_group(image_path: Path, rewards: list[float]) -> GroupRollout:
         rollouts=[
             Rollout(
                 rollout_id=index,
-                completion=f"reasoning {index} FINAL: {'A' if reward else 'B'}",
-                predicted_label="A" if reward else "B",
-                reward=reward,
+                completion=f"reasoning {index} FINAL: {'A' if correct else 'B'}",
+                predicted_label="A" if correct else "B",
+                is_correct=bool(correct),
             )
-            for index, reward in enumerate(rewards)
+            for index, correct in enumerate(correctness)
         ],
     )
 
@@ -50,6 +51,37 @@ class EvidenceTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_teacher_preserves_student_answer_tag_protocol(self):
+        student_prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a visual question-answering assistant. Analyze the image and answer "
+                    "the question. Put only the final answer inside <answer>...</answer> tags."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": object()},
+                    {"type": "text", "text": "What color is the door?"},
+                ],
+            },
+        ]
+
+        teacher_prompt = build_teacher_prompt_from_student(
+            student_prompt,
+            "Inspect the door color.",
+            crop_count=1,
+        )
+
+        self.assertEqual(teacher_prompt[0], student_prompt[0])
+        self.assertIn("<answer>...</answer>", teacher_prompt[0]["content"])
+        self.assertNotIn("FINAL:", str(teacher_prompt))
+        self.assertEqual(teacher_prompt[1]["content"].count("<image>"), 2)
+        self.assertTrue(teacher_prompt[1]["content"].startswith("<image>What color is the door?"))
+        self.assertIn("Hindsight visual focus", teacher_prompt[1]["content"])
 
     def test_multiple_objects_become_independent_crops(self):
         builder = TeacherEvidenceBuilder(

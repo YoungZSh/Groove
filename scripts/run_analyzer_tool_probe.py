@@ -39,7 +39,7 @@ def main() -> None:
                 rollout_id=index,
                 completion=str(row["output"]),
                 predicted_label=row.get("predicted_label"),
-                reward=float(row["score"]),
+                is_correct=bool(float(row.get("accuracy", row["score"])) > 0.5),
             )
             for index, row in enumerate(rows)
         ],

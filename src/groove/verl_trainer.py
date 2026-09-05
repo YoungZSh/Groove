@@ -22,7 +22,13 @@ from verl.utils.model import compute_position_id_with_mask
 
 from .analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
 from .advantage_metrics import compute_advantage_metrics
-from .evidence import SAFE_FOCUS_FALLBACK, EvidenceBuilderConfig, TeacherEvidenceBuilder, teacher_payload
+from .evidence import (
+    SAFE_FOCUS_FALLBACK,
+    EvidenceBuilderConfig,
+    TeacherEvidenceBuilder,
+    student_prompt_template,
+    teacher_payload,
+)
 from .grounding import GroundingDinoConfig, GroundingDinoGrounder
 from .losses import combine_grpo_opsd_advantages, groove_opsd_advantages
 from .objective import validate_objective_config
@@ -116,7 +122,8 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
     def _build_online_teacher_columns(
         self,
         batch: Any,
-        reward_tensor: torch.Tensor,
+        judge_accuracies: Any,
+        repetition_starts: Any = None,
     ) -> dict[str, float]:
         uids = list(batch.non_tensor_batch["uid"])
         grouped_indices: dict[str, list[int]] = defaultdict(list)
@@ -126,7 +133,27 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         batch_size = len(uids)
         teacher_images: list[list[dict[str, Any]]] = [[] for _ in range(batch_size)]
         teacher_prompts: list[list[dict[str, str]]] = [[] for _ in range(batch_size)]
-        sequence_rewards = reward_tensor.sum(dim=-1).detach().float().cpu().tolist()
+        if judge_accuracies is None:
+            raise ValueError(
+                "groove Analyzer grouping requires the raw Judge accuracy reward component"
+            )
+        judge_accuracies = np.asarray(judge_accuracies, dtype=np.float32).reshape(-1)
+        if judge_accuracies.size != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} Judge accuracy values, found {judge_accuracies.size}"
+            )
+        if not np.isfinite(judge_accuracies).all():
+            raise ValueError("Judge accuracy values must be finite")
+        if repetition_starts is None:
+            repetition_starts = np.full(batch_size, -1, dtype=np.int64)
+        else:
+            repetition_starts = np.asarray(repetition_starts, dtype=np.float64).reshape(-1)
+            if repetition_starts.size != batch_size:
+                raise ValueError(
+                    f"Expected {batch_size} repetition offsets, found {repetition_starts.size}"
+                )
+            if not np.isfinite(repetition_starts).all():
+                raise ValueError("Repetition offsets must be finite")
         status_counts = defaultdict(int)
         route_counts = defaultdict(int)
         crop_counts: list[int] = []
@@ -135,6 +162,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         dino_scores: list[float] = []
         ocr_scores: list[float] = []
         sanitized_count = 0
+        repetition_trimmed_count = 0
         correct_counts: list[int] = []
         mixed_group_count = 0
         evidence_build_seconds = 0.0
@@ -145,7 +173,10 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         if teacher_max_image_pixels <= 0:
             raise ValueError("GROOVE_TEACHER_MAX_IMAGE_PIXELS must be positive")
 
-        group_jobs: list[tuple[str, list[int], str, GroupRollout]] = []
+        group_jobs: list[tuple[str, list[int], str, GroupRollout, list[dict]]] = []
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt")
+        if raw_prompts is None:
+            raise ValueError("groove requires the original Student raw_prompt")
         for uid, indices in grouped_indices.items():
             first_extra = self._extra(batch, indices[0])
             question = str(first_extra.get("question", "")).strip()
@@ -158,12 +189,16 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             rollouts = []
             for rollout_id, sample_index in enumerate(indices):
                 completion = self._decode_rollout(batch, sample_index)
+                repetition_start = int(repetition_starts[sample_index])
+                if 0 <= repetition_start < len(completion):
+                    completion = completion[:repetition_start].rstrip()
+                    repetition_trimmed_count += 1
                 rollouts.append(
                     Rollout(
                         rollout_id=rollout_id,
                         completion=completion,
                         predicted_label=extract_option(completion),
-                        reward=float(sequence_rewards[sample_index]),
+                        is_correct=bool(judge_accuracies[sample_index] > 0.5),
                     )
                 )
             group = GroupRollout(
@@ -172,11 +207,14 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
                 image_path=image_path,
                 rollouts=rollouts,
             )
-            correct_count = sum(item.reward > 0.5 for item in rollouts)
+            raw_prompt = raw_prompts[indices[0]]
+            raw_prompt = raw_prompt.tolist() if isinstance(raw_prompt, np.ndarray) else list(raw_prompt)
+            prompt_template = student_prompt_template(raw_prompt)
+            correct_count = sum(item.is_correct for item in rollouts)
             correct_counts.append(correct_count)
             mixed_group_count += int(0 < correct_count < len(rollouts))
 
-            group_jobs.append((str(uid), indices, question, group))
+            group_jobs.append((str(uid), indices, question, group, prompt_template))
 
         requested_workers = int(os.environ.get("GROOVE_MAX_CONCURRENCY", "8"))
         if requested_workers <= 0:
@@ -192,15 +230,15 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         )
         worker_count = min(requested_workers, len(group_jobs)) if parallel_tools else 1
 
-        def build_one(job: tuple[str, list[int], str, GroupRollout]):
-            _uid, _indices, _question, group = job
+        def build_one(job: tuple[str, list[int], str, GroupRollout, list[dict]]):
+            _uid, _indices, _question, group, prompt_template = job
             builder = (
                 self._new_groove_builder()
                 if worker_count > 1
                 else self._get_groove_builder()
             )
             build_start = time.perf_counter()
-            result = builder.build(group)
+            result = builder.build(group, student_prompt=prompt_template)
             return result, time.perf_counter() - build_start
 
         wall_start = time.perf_counter()
@@ -214,7 +252,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             built_results = [build_one(job) for job in group_jobs]
         evidence_build_wall_seconds = time.perf_counter() - wall_start
 
-        for (uid, indices, question, _group), (evidence, build_seconds) in zip(
+        for (uid, indices, question, _group, _prompt_template), (evidence, build_seconds) in zip(
             group_jobs, built_results, strict=True
         ):
             evidence_build_seconds += build_seconds
@@ -257,6 +295,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             "groove/focus_sanitized_fraction": sanitized_count / ready_count,
             "groove/mixed_group_fraction": mixed_group_count / group_count,
             "groove/correct_rollout_fraction": sum(correct_counts) / max(batch_size, 1),
+            "groove/analyzer_repetition_trimmed_fraction": repetition_trimmed_count / max(batch_size, 1),
             "timing_s/groove/evidence_build_total": evidence_build_seconds,
             "timing_s/groove/evidence_build_mean": evidence_build_seconds / group_count,
             "timing_s/groove/evidence_build_wall": evidence_build_wall_seconds,
@@ -587,7 +626,23 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             return batch, metrics
         validate_objective_config(self.config)
 
-        metrics.update(self._build_online_teacher_columns(batch, reward_tensor))
+        judge_accuracies = (
+            reward_extra_infos_dict.get("accuracy")
+            if reward_extra_infos_dict
+            else None
+        )
+        repetition_starts = (
+            reward_extra_infos_dict.get("repetition_start_character")
+            if reward_extra_infos_dict
+            else None
+        )
+        metrics.update(
+            self._build_online_teacher_columns(
+                batch,
+                judge_accuracies,
+                repetition_starts,
+            )
+        )
         teacher_batch, evidence_mask, teacher_metrics = self._build_groove_teacher_batch(batch)
         metrics.update(teacher_metrics)
         # Both scores use the same pre-update actor weights. Cache their detached

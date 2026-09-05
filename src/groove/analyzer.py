@@ -22,142 +22,40 @@ from .grounding import expand_box
 from .schemas import FocusProgram, GroupRollout
 
 
-SYSTEM_PROMPT = """You are the multimodal self-evolution Analyzer.
+SYSTEM_PROMPT = """You are a multimodal visual-evidence Analyzer.
 
-You receive the original image, the question, and trajectories that the program has
-already divided into successful and failed Student rollouts. Do not decide the reward
-and do not answer the question directly.
+You receive an original image, a question, and successful/failed Student reasoning.
+Do not answer the question or reassess the outcome labels. Find the smallest
+answer-neutral visual evidence that explains the disagreement.
 
-Compare the two rollout groups and find the smallest sufficient Crucial Evidence: an
-observable visual detail that explains their disagreement and could correct the key
-visual mistake. It may be text, an object, a local attribute, a count, a relation, a
-mark, or a texture. It must not be the answer itself or a restatement of a successful
-rollout.
+Use the native tools before returning:
+- For text, digits, labels, signs, or documents, use read_text. If the text is tiny
+  or its location is uncertain, call ground_image first and pass its bbox to read_text.
+- For objects, colors, shapes, counts, spatial relations, materials, or textures,
+  use ground_image.
 
-Follow this procedure:
-1. Compare what the successful and failed rollouts relied on, and identify the key
-   visual disagreement.
-2. Summarize the Crucial Evidence in one sentence.
-3. Choose the evidence type and use the native visual tools:
-   - text: the evidence depends on characters, digits, labels, signs, or documents.
-     Use OCR. If the text is tiny or its location is uncertain, first use DINO to
-     locate the text carrier and then pass the returned bbox to OCR.
-   - visual: the evidence depends on an object, color, shape, count, spatial relation,
-     mark, material, or texture. Use DINO only, not OCR.
-4. Locate and crop multiple targets independently. Never create one union crop spanning
-   separate objects.
-5. After every ground_image call, inspect the returned visual preview. If it does not
-   contain the requested target, rewrite the query and call the tool again. Confirm the
-   evidence visually before returning JSON.
+Locate separate targets independently. Inspect every returned visual preview; if it
+misses the target, retry with a more precise short English noun phrase.
+Every usable tool result has a candidate_id. In the final response, select the best
+verified candidate for each required target. Select one candidate for a single target
+and multiple candidates only when comparison, counting, or spatial reasoning requires
+distinct regions. Never invent an ID or select a crop that misses its target.
 
-Language and tool contract:
-- Write every Analyzer message, tool query, and JSON string in English.
-- `ground_image.query` and `grounding_queries` must be short, concrete English noun
-  phrases that Grounding DINO can localize. Do not use Chinese or other non-English
-  translations for tool queries.
-- `visible_focus_instruction` is shown to the Teacher and must be written in English
-  while remaining answer-neutral. It may name observable attributes and comparative
-  descriptors (including candidate colors or shapes) needed to inspect the image,
-  but must not reveal an option letter, assert an answer conclusion, state a reward,
-  expose rollout outcomes, or reproduce OCR text.
+Write tool queries and JSON strings in English. visible_focus_instruction must tell
+the Teacher what to inspect without revealing an answer or option, rollout outcomes,
+rewards, or recognized OCR text.
 
-Return exactly this JSON schema:
+After tool inspection is complete, return only this JSON object:
 {
-  "group_summary": "Private summary of the key visual disagreement",
+  "group_summary": "Private summary of the visual disagreement",
   "crucial_evidence": "Smallest sufficient visual evidence",
   "crucial_evidence_type": "text or visual",
   "tool_route": "ocr or dino",
   "visible_focus_instruction": "Short answer-neutral inspection instruction",
   "grounding_queries": ["one to three concrete English visual targets"],
+  "selected_candidate_ids": ["one to three candidate IDs from tool results"],
   "confidence": 0.0
-}
-Return JSON only, with no Markdown or extra commentary."""
-
-
-TOOL_USE_APPENDIX = """
-
-The ground_image and read_text tools are Analyzer-only and are never exposed to the
-Student. Tool definitions and results are injected by the Qwen native tool-calling
-template."""
-
-
-ONE_SHOT_MESSAGES = [
-    {
-        "role": "user",
-        "content": (
-            "Question: What street name is written on the small sign under the bridge?\n\n"
-            "Successful rollouts:\n- Zoomed into and read the characters on the sign.\n"
-            "- Answered from the visible text.\n\n"
-            "Failed rollouts:\n- Guessed from the surrounding road scene.\n"
-            "- Answered without reading the sign clearly."
-        ),
-    },
-    {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {
-                "id": "example_ground",
-                "type": "function",
-                "function": {
-                    "name": "ground_image",
-                    "arguments": json.dumps(
-                        {"query": "small street sign under the bridge", "context_margin": 0.12},
-                        ensure_ascii=False,
-                    ),
-                },
-            }
-        ],
-    },
-    {
-        "role": "tool",
-        "tool_call_id": "example_ground",
-        "content": json.dumps(
-            {"found": True, "score": 0.84, "bbox": [420, 610, 690, 790]},
-            ensure_ascii=False,
-        ),
-    },
-    {
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {
-                "id": "example_ocr",
-                "type": "function",
-                "function": {
-                    "name": "read_text",
-                    "arguments": json.dumps(
-                        {"bbox": [420, 610, 690, 790], "scale": 4},
-                        ensure_ascii=False,
-                    ),
-                },
-            }
-        ],
-    },
-    {
-        "role": "tool",
-        "tool_call_id": "example_ocr",
-        "content": json.dumps(
-            {"crop_bbox": [420, 610, 690, 790], "text": [{"text": "<OCR result>", "confidence": 0.97}]},
-            ensure_ascii=False,
-        ),
-    },
-    {
-        "role": "assistant",
-        "content": json.dumps(
-            {
-                "group_summary": "Successful rollouts read the sign characters; failed rollouts guessed from scene priors.",
-                "crucial_evidence": "Text on the small street sign under the bridge",
-                "crucial_evidence_type": "text",
-                "tool_route": "ocr",
-                "visible_focus_instruction": "Inspect the enlarged small street sign under the bridge and read its characters carefully.",
-                "grounding_queries": ["small street sign under the bridge"],
-                "confidence": 0.94,
-            },
-            ensure_ascii=False,
-        ),
-    },
-]
+}"""
 
 
 class Analyzer(Protocol):
@@ -186,19 +84,25 @@ def _extract_json(text: str) -> dict:
 
 
 def build_group_analysis_text(group: GroupRollout) -> str:
-    def record(item) -> dict:
-        return {
-            "rollout_id": item.rollout_id,
-            "predicted_label": item.predicted_label,
-            "reasoning": item.completion,
-        }
-
-    correct = [record(item) for item in group.rollouts if item.reward > 0.5]
-    incorrect = [record(item) for item in group.rollouts if item.reward <= 0.5]
-    return (
-        f"Question:\n{group.question}\n\n"
-        f"Successful rollouts:\n{json.dumps(correct, ensure_ascii=False, indent=2)}\n\n"
-        f"Failed rollouts:\n{json.dumps(incorrect, ensure_ascii=False, indent=2)}"
+    # Success/failure membership already carries the outcome signal. JSON
+    # preserves exact boundaries around untrusted, multiline model outputs;
+    # IDs, parsed labels, and numeric rewards add no visual evidence.
+    return json.dumps(
+        {
+            "question": group.question,
+            "successful_reasoning": [
+                str(item.completion).strip()
+                for item in group.rollouts
+                if item.is_correct
+            ],
+            "failed_reasoning": [
+                str(item.completion).strip()
+                for item in group.rollouts
+                if not item.is_correct
+            ],
+        },
+        ensure_ascii=False,
+        indent=2,
     )
 
 
@@ -254,6 +158,8 @@ def _tool_feedback_message(
     if preview_url is None:
         return None
     query = str(arguments.get("query") or result.get("query") or tool_name).strip()
+    candidate_id = str(result.get("candidate_id", "")).strip()
+    candidate_text = f"Candidate `{candidate_id}`. " if candidate_id else ""
     score = result.get("score")
     score_text = f" with score {float(score):.3f}" if isinstance(score, (int, float)) else ""
     coordinates = ", ".join(str(value) for value in bbox)
@@ -263,7 +169,7 @@ def _tool_feedback_message(
             {
                 "type": "text",
                 "text": (
-                    f"Visual feedback for the `{tool_name}` query `{query}`{score_text}. "
+                    f"{candidate_text}Visual feedback for the `{tool_name}` query `{query}`{score_text}. "
                     f"The attached image is the exact local crop returned by the tool "
                     f"(original-image bbox: [{coordinates}]). Inspect this crop against "
                     "the original image. If it does not contain the requested target, "
@@ -545,11 +451,7 @@ class OpenAICompatibleAnalyzer:
             message = self._request(body)["choices"][0]["message"]
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
-                return self._attach_tool_regions(
-                    FocusProgram.model_validate(_extract_json(self._message_content(message))),
-                    group.image_path,
-                    self._ocr_reference_text(group, message),
-                )
+                return self._finalize_focus_selection(group, message, tool_messages)
 
             tool_messages.append(
                 {
@@ -560,6 +462,7 @@ class OpenAICompatibleAnalyzer:
             )
             for call in tool_calls:
                 call_id = str(call.get("id", ""))
+                candidate_id = f"candidate_{len(self.last_tool_trace) + 1}"
                 function = call.get("function", {})
                 name = str(function.get("name", ""))
                 raw_arguments = function.get("arguments", "{}")
@@ -571,9 +474,13 @@ class OpenAICompatibleAnalyzer:
                     result = registry.execute(group.image_path, name, arguments)
                 except Exception as exc:
                     result = {"error": f"{type(exc).__name__}: {exc}"}
+                if not isinstance(result, dict):
+                    result = {"error": f"Tool returned {type(result).__name__}, expected a dictionary"}
+                result = {**result, "candidate_id": candidate_id}
                 self.last_tool_trace.append(
                     {
                         "round": _tool_round + 1,
+                        "candidate_id": candidate_id,
                         "name": name,
                         "arguments": arguments,
                         "result": result,
@@ -611,11 +518,70 @@ class OpenAICompatibleAnalyzer:
             }
         )
         message = self._request(self._base_body(tool_messages))["choices"][0]["message"]
-        return self._attach_tool_regions(
-            FocusProgram.model_validate(_extract_json(self._message_content(message))),
-            group.image_path,
-            self._ocr_reference_text(group, message),
-        )
+        return self._finalize_focus_selection(group, message, tool_messages)
+
+    def _candidate_selection_summary(self) -> list[dict]:
+        candidates = []
+        for trace in self.last_tool_trace:
+            result = trace.get("result", {})
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            name = str(trace.get("name", ""))
+            bbox_key = "bbox" if name == "ground_image" else "crop_bbox"
+            bbox = result.get(bbox_key)
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            if name == "ground_image" and not result.get("found", True):
+                continue
+            candidates.append(
+                {
+                    "candidate_id": trace.get("candidate_id"),
+                    "tool": name,
+                    "query": trace.get("arguments", {}).get("query", result.get("query", "")),
+                    "bbox": bbox,
+                }
+            )
+        return candidates
+
+    def _finalize_focus_selection(
+        self,
+        group: GroupRollout,
+        message: dict,
+        tool_messages: list[dict],
+    ) -> FocusProgram:
+        content = self._message_content(message)
+        try:
+            focus = FocusProgram.model_validate(_extract_json(content))
+            return self._attach_tool_regions(
+                focus,
+                group.image_path,
+                self._ocr_reference_text(group, message),
+            )
+        except (TypeError, ValueError) as first_error:
+            candidates = self._candidate_selection_summary()
+            if not candidates:
+                raise ValueError("Analyzer produced no selectable evidence candidates") from first_error
+            repair_messages = list(tool_messages)
+            repair_messages.append({"role": "assistant", "content": content})
+            repair_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your final candidate selection was missing or invalid. Do not call another tool. "
+                        "Return the required JSON object again, selecting one to three IDs only from these "
+                        f"verified candidates:\n{json.dumps(candidates, ensure_ascii=False, indent=2)}"
+                    ),
+                }
+            )
+            repaired_message = self._request(self._base_body(repair_messages))["choices"][0]["message"]
+            repaired_focus = FocusProgram.model_validate(
+                _extract_json(self._message_content(repaired_message))
+            )
+            return self._attach_tool_regions(
+                repaired_focus,
+                group.image_path,
+                self._ocr_reference_text(group, repaired_message),
+            )
 
     @staticmethod
     def _ocr_reference_text(group: GroupRollout, message: dict) -> str:
@@ -629,27 +595,21 @@ class OpenAICompatibleAnalyzer:
         image_path: Path,
         reference_text: str = "",
     ) -> FocusProgram:
-        """Promote only the final confirmed tool round into private crop regions.
-
-        Earlier tool calls are diagnostic attempts that the Analyzer explicitly
-        superseded after seeing their visual feedback.  Exposing them to the
-        Teacher would mix failed and successful hypotheses in the privileged
-        prefix, so only the latest successful round for the selected route is kept.
-        """
+        """Promote exactly the candidates selected after visual verification."""
         from .schemas import ToolRegion
 
-        ocr_regions: list[tuple[int, ToolRegion]] = []
-        dino_regions: list[tuple[int, ToolRegion]] = []
+        candidate_regions: dict[str, ToolRegion] = {}
         with Image.open(image_path) as loaded:
             image_size = loaded.size
         for trace in self.last_tool_trace:
             result = trace.get("result", {})
-            if not isinstance(result, dict):
+            if not isinstance(result, dict) or result.get("error"):
                 continue
-            try:
-                trace_round = int(trace.get("round", 0))
-            except (TypeError, ValueError):
-                trace_round = 0
+            candidate_id = str(trace.get("candidate_id") or result.get("candidate_id") or "").strip()
+            if not candidate_id:
+                continue
+            if candidate_id in candidate_regions:
+                raise ValueError(f"Duplicate Analyzer candidate ID: {candidate_id}")
             if trace.get("name") == "read_text" and isinstance(result.get("crop_bbox"), list):
                 bbox = result["crop_bbox"]
                 if len(bbox) == 4:
@@ -672,16 +632,11 @@ class OpenAICompatibleAnalyzer:
                         query = "OCR context: " + ", ".join(
                             str(item.get("text", "")) for item in result["text"][:3] if isinstance(item, dict)
                         )
-                    ocr_regions.append(
-                        (
-                            trace_round,
-                            ToolRegion(
-                                query=query,
-                                expanded_box=tuple(int(value) for value in bbox),
-                                score=(selected_confidence if tight_bbox is not None else max(confidences, default=0.0)),
-                                source="paddle_ocr_text" if tight_bbox is not None else "paddle_ocr_context",
-                            ),
-                        )
+                    candidate_regions[candidate_id] = ToolRegion(
+                        query=query,
+                        expanded_box=tuple(int(value) for value in bbox),
+                        score=(selected_confidence if tight_bbox is not None else max(confidences, default=0.0)),
+                        source="paddle_ocr_text" if tight_bbox is not None else "paddle_ocr_context",
                     )
             elif (
                 trace.get("name") == "ground_image"
@@ -690,32 +645,20 @@ class OpenAICompatibleAnalyzer:
             ):
                 bbox = result["bbox"]
                 if len(bbox) == 4:
-                    dino_regions.append(
-                        (
-                            trace_round,
-                            ToolRegion(
-                                query=str(result.get("query", "Grounding DINO target")),
-                                expanded_box=tuple(int(value) for value in bbox),
-                                score=float(result.get("score", 0.0)),
-                                source="grounding_dino",
-                            ),
-                        )
+                    candidate_regions[candidate_id] = ToolRegion(
+                        query=str(result.get("query", "Grounding DINO target")),
+                        expanded_box=tuple(int(value) for value in bbox),
+                        score=float(result.get("score", 0.0)),
+                        source="grounding_dino",
                     )
 
-        def final_round(regions: list[tuple[int, ToolRegion]]) -> list[ToolRegion]:
-            if not regions:
-                return []
-            latest = max(round_number for round_number, _region in regions)
-            return [region for round_number, region in regions if round_number == latest]
-
-        final_ocr_regions = final_round(ocr_regions)
-        final_dino_regions = final_round(dino_regions)
-        # The Analyzer's explicit Crucial Evidence decision selects the crop
-        # source. Incidental OCR can therefore never replace a visual DINO box.
-        if focus.crucial_evidence_type == "text" and focus.tool_route == "ocr":
-            selected_regions = final_ocr_regions or final_dino_regions
-        else:
-            selected_regions = final_dino_regions
+        selected_ids = focus.selected_candidate_ids
+        if not selected_ids:
+            raise ValueError("Analyzer must select at least one evidence candidate")
+        missing = [candidate_id for candidate_id in selected_ids if candidate_id not in candidate_regions]
+        if missing:
+            raise ValueError(f"Analyzer selected unavailable candidate IDs: {missing}")
+        selected_regions = [candidate_regions[candidate_id] for candidate_id in selected_ids]
         return focus.model_copy(update={"tool_regions": selected_regions})
 
     def analyze(self, group: GroupRollout) -> FocusProgram:
@@ -726,11 +669,9 @@ class OpenAICompatibleAnalyzer:
         messages = [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT + (TOOL_USE_APPENDIX if self.config.use_vision_tools else ""),
+                "content": SYSTEM_PROMPT,
             },
         ]
-        if self.config.use_vision_tools:
-            messages.extend(ONE_SHOT_MESSAGES)
         messages.append({"role": "user", "content": content})
         if self.config.use_vision_tools:
             return self._analyze_with_tools(group, messages)

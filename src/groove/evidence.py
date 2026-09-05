@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,14 +15,6 @@ from .schemas import GroupRollout, TeacherEvidence
 
 CHOICE_PATTERN = re.compile(r"(?im)^\s*(?:\(([A-D])\)|([A-D])[.)])\s*(.+?)\s*$")
 
-
-RESPONSE_FORMAT_INSTRUCTION = (
-    "Inspect the image carefully and reason only from visible evidence. State one concise, "
-    "evidence-first rationale without <think> tags or hidden-chain-of-thought. Do not hedge, "
-    "revise, or mention this instruction. On the final line write exactly `FINAL: X`, where X "
-    "is the direct final answer. If the question explicitly uses labeled answer choices, X is "
-    "the selected choice label."
-)
 
 SAFE_FOCUS_FALLBACK = (
     "Inspect the provided zoomed visual evidence and compare only directly visible "
@@ -56,7 +49,7 @@ def validate_visible_focus(group: GroupRollout, focus_instruction: str) -> None:
     successful_labels = {
         str(item.predicted_label).upper()
         for item in group.rollouts
-        if item.reward > 0.5 and item.predicted_label
+        if item.is_correct and item.predicted_label
     }
     for label in successful_labels:
         if re.search(rf"(?i)\boption\s*{re.escape(label)}\b", text):
@@ -96,27 +89,73 @@ def validate_visible_focus(group: GroupRollout, focus_instruction: str) -> None:
                 raise ValueError("visible focus instruction contains an answer conclusion")
 
 
-def build_teacher_prompt(question: str, focus_instruction: str, crop_count: int) -> list[dict]:
-    content = [
-        "<image>",
-        question.strip(),
-        "\nHindsight visual focus:",
-        focus_instruction.strip(),
-    ]
+def student_prompt_template(messages: list[dict]) -> list[dict]:
+    """Convert runtime multimodal messages back to a reusable placeholder template."""
+
+    template = []
+    for message in messages:
+        copied = {key: deepcopy(value) for key, value in message.items() if key != "content"}
+        content = message.get("content", "")
+        if isinstance(content, str):
+            copied["content"] = content
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    raise TypeError("Student prompt content items must be dictionaries")
+                if item.get("type") == "image":
+                    parts.append("<image>")
+                elif item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    raise ValueError(f"Unsupported Student prompt content type: {item.get('type')!r}")
+            copied["content"] = "".join(parts)
+        else:
+            raise TypeError("Student prompt content must be a string or structured list")
+        template.append(copied)
+    return template
+
+
+def build_teacher_prompt_from_student(
+    student_prompt: list[dict],
+    focus_instruction: str,
+    crop_count: int,
+) -> list[dict]:
+    """Add privileged evidence while preserving the Student output protocol exactly."""
+
+    if crop_count < 0:
+        raise ValueError("crop_count must be non-negative")
+    prompt = student_prompt_template(student_prompt)
+    user_indices = [index for index, message in enumerate(prompt) if message.get("role") == "user"]
+    if not user_indices:
+        raise ValueError("Student prompt must contain a user message")
+    user_index = user_indices[-1]
+    content = str(prompt[user_index]["content"]).rstrip()
+    evidence_suffix = ["\n\nHindsight visual focus:\n", focus_instruction.strip()]
     for index in range(crop_count):
-        content.extend([f"\nZoomed visual evidence {index + 1}:", "<image>"])
-    content.extend(["\nResponse requirements:", RESPONSE_FORMAT_INSTRUCTION])
-    return [{"role": "user", "content": "\n".join(content)}]
+        evidence_suffix.extend([f"\n\nZoomed visual evidence {index + 1}:\n", "<image>"])
+    prompt[user_index]["content"] = content + "".join(evidence_suffix)
+    image_count = sum(str(message.get("content", "")).count("<image>") for message in prompt)
+    if image_count != crop_count + 1:
+        raise ValueError(
+            f"Expected one Student image plus {crop_count} evidence crops, found {image_count} placeholders"
+        )
+    return prompt
+
+
+def build_teacher_prompt(question: str, focus_instruction: str, crop_count: int) -> list[dict]:
+    """Compatibility helper for callers without a full Student prompt."""
+
+    return build_teacher_prompt_from_student(
+        [{"role": "user", "content": f"<image>{question.strip()}"}],
+        focus_instruction,
+        crop_count,
+    )
 
 
 def fallback_teacher_prompt(question: str) -> list[dict[str, str]]:
     """One-placeholder prompt matching the original image used by verl fallback."""
-    return [
-        {
-            "role": "user",
-            "content": f"<image>\n{question.strip()}\n\n{RESPONSE_FORMAT_INSTRUCTION}",
-        }
-    ]
+    return [{"role": "user", "content": f"<image>{question.strip()}"}]
 
 
 def teacher_payload(
@@ -168,11 +207,25 @@ class TeacherEvidenceBuilder:
         safe_uid = "".join(char if char.isalnum() or char in "-_" else "_" for char in group.uid)
         return self.config.output_dir / safe_uid / "evidence.json"
 
-    def build(self, group: GroupRollout) -> TeacherEvidence:
+    def build(
+        self,
+        group: GroupRollout,
+        *,
+        student_prompt: list[dict] | None = None,
+    ) -> TeacherEvidence:
         record_path = self._record_path(group)
         if self.config.reuse_cache and record_path.exists():
             cached = TeacherEvidence.model_validate_json(record_path.read_text(encoding="utf-8"))
             if cached.status != "error":
+                if cached.status == "ready" and student_prompt is not None:
+                    rebased_prompt = build_teacher_prompt_from_student(
+                        student_prompt,
+                        cached.focus.visible_focus_instruction,
+                        len(cached.crops),
+                    )
+                    if cached.teacher_prompt != rebased_prompt:
+                        cached = cached.model_copy(update={"teacher_prompt": rebased_prompt})
+                        return self._save(cached, record_path)
                 return cached
 
         if len(group.rollouts) < self.config.min_rollouts:
@@ -220,10 +273,18 @@ class TeacherEvidenceBuilder:
                 focus=focus,
                 original_image_path=group.image_path.resolve(),
                 crops=crops,
-                teacher_prompt=build_teacher_prompt(
-                    group.question,
-                    focus.visible_focus_instruction,
-                    len(crops),
+                teacher_prompt=(
+                    build_teacher_prompt_from_student(
+                        student_prompt,
+                        focus.visible_focus_instruction,
+                        len(crops),
+                    )
+                    if student_prompt is not None
+                    else build_teacher_prompt(
+                        group.question,
+                        focus.visible_focus_instruction,
+                        len(crops),
+                    )
                 ),
             )
         except Exception as exc:

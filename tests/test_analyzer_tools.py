@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -5,7 +6,6 @@ from groove.analyzer import (
     OpenAIAnalyzerConfig,
     OpenAICompatibleAnalyzer,
     SYSTEM_PROMPT,
-    ONE_SHOT_MESSAGES,
     _crop_data_url,
     _tight_ocr_text_bbox,
     _tool_feedback_message,
@@ -76,6 +76,7 @@ class AnalyzerToolsTest(unittest.TestCase):
             analyzer.last_tool_trace = [
                 {
                     "round": 1,
+                    "candidate_id": "candidate_1",
                     "name": "read_text",
                     "result": {
                         "crop_bbox": [0, 0, 900, 900],
@@ -95,6 +96,7 @@ class AnalyzerToolsTest(unittest.TestCase):
                 grounding_queries=["orange sign"],
                 crucial_evidence_type="text",
                 tool_route="ocr",
+                selected_candidate_ids=["candidate_1"],
                 context_margin=0.12,
             )
 
@@ -110,26 +112,28 @@ class AnalyzerToolsTest(unittest.TestCase):
             question="question",
             image_path=Path("image.jpg"),
             rollouts=[
-                Rollout(rollout_id=0, completion="correct trace", predicted_label="A", reward=1.0),
-                Rollout(rollout_id=1, completion="wrong trace", predicted_label="B", reward=0.1),
+                Rollout(rollout_id=0, completion="correct trace", predicted_label="A", is_correct=True),
+                Rollout(rollout_id=1, completion="wrong trace", predicted_label="B", is_correct=False),
             ],
         )
 
         text = build_group_analysis_text(group)
+        payload = json.loads(text)
 
-        self.assertIn("Successful rollouts", text)
-        self.assertIn("Failed rollouts", text)
-        self.assertNotIn('"reward"', text)
-        self.assertLess(text.index("correct trace"), text.index("wrong trace"))
-
-    def test_analyzer_prompt_and_examples_are_english(self):
-        prompt_text = SYSTEM_PROMPT + "\n" + "\n".join(
-            str(message.get("content", ""))
-            for message in ONE_SHOT_MESSAGES
-            if isinstance(message.get("content"), str)
+        self.assertEqual(
+            set(payload),
+            {"question", "successful_reasoning", "failed_reasoning"},
         )
-        self.assertNotRegex(prompt_text, r"[\u3400-\u9fff]")
-        self.assertIn("concrete English noun", prompt_text)
+        self.assertEqual(payload["question"], "question")
+        self.assertEqual(payload["successful_reasoning"], ["correct trace"])
+        self.assertEqual(payload["failed_reasoning"], ["wrong trace"])
+        self.assertNotIn('"reward"', text)
+        self.assertNotIn("rollout_id", text)
+        self.assertNotIn("predicted_label", text)
+
+    def test_analyzer_prompt_is_english(self):
+        self.assertNotRegex(SYSTEM_PROMPT, r"[\u3400-\u9fff]")
+        self.assertIn("short English noun phrase", SYSTEM_PROMPT)
 
         for schema in ANALYZER_TOOL_SCHEMAS:
             description = schema["function"].get("description", "")
@@ -215,6 +219,7 @@ class AnalyzerToolsTest(unittest.TestCase):
                                     '"tool_route":"dino",'
                                     '"visible_focus_instruction":"Inspect the sign.",'
                                     '"grounding_queries":["small blue sign"],'
+                                    '"selected_candidate_ids":["candidate_2"],'
                                     '"confidence":0.8}'
                                 )
                             }
@@ -231,7 +236,7 @@ class AnalyzerToolsTest(unittest.TestCase):
                 question="What is visible?",
                 image_path=image_path,
                 rollouts=[
-                    Rollout(rollout_id=0, completion="trace", predicted_label="A", reward=1.0),
+                    Rollout(rollout_id=0, completion="trace", predicted_label="A", is_correct=True),
                 ],
             )
             analyzer = FakeAnalyzer(
@@ -257,9 +262,124 @@ class AnalyzerToolsTest(unittest.TestCase):
             self.assertEqual(feedback[0]["content"][1]["type"], "image_url")
             self.assertTrue(analyzer.last_tool_trace[0]["visual_feedback_attached"])
             self.assertEqual([trace["round"] for trace in analyzer.last_tool_trace], [1, 2])
+            self.assertEqual(
+                [trace["candidate_id"] for trace in analyzer.last_tool_trace],
+                ["candidate_1", "candidate_2"],
+            )
             self.assertEqual(len(focus.tool_regions), 1)
             self.assertEqual(focus.tool_regions[0].query, "small blue sign")
             self.assertEqual(focus.tool_regions[0].expanded_box, (4, 3, 30, 18))
+
+    def test_analyzer_honors_multiple_selected_candidates_without_iou_deduplication(self):
+        from tempfile import TemporaryDirectory
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            image_path = Path(directory) / "image.jpg"
+            Image.new("RGB", (40, 30), color=(10, 20, 30)).save(image_path)
+            analyzer = OpenAICompatibleAnalyzer(
+                OpenAIAnalyzerConfig(base_url="http://localhost", api_key="test")
+            )
+            analyzer.last_tool_trace = [
+                {
+                    "candidate_id": "candidate_1",
+                    "name": "ground_image",
+                    "arguments": {"query": "first target"},
+                    "result": {"found": True, "query": "first target", "bbox": [2, 2, 25, 25], "score": 0.8},
+                },
+                {
+                    "candidate_id": "candidate_2",
+                    "name": "ground_image",
+                    "arguments": {"query": "second target"},
+                    "result": {"found": True, "query": "second target", "bbox": [3, 3, 24, 24], "score": 0.7},
+                },
+            ]
+            focus = FocusProgram(
+                group_summary="Two targets are needed.",
+                visible_focus_instruction="Inspect both targets.",
+                grounding_queries=["first target", "second target"],
+                selected_candidate_ids=["candidate_2", "candidate_1"],
+            )
+
+            updated = analyzer._attach_tool_regions(focus, image_path)
+
+            self.assertEqual(
+                [region.query for region in updated.tool_regions],
+                ["second target", "first target"],
+            )
+
+    def test_analyzer_rejects_an_unavailable_candidate(self):
+        from tempfile import TemporaryDirectory
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            image_path = Path(directory) / "image.jpg"
+            Image.new("RGB", (40, 30), color=(10, 20, 30)).save(image_path)
+            analyzer = OpenAICompatibleAnalyzer(
+                OpenAIAnalyzerConfig(base_url="http://localhost", api_key="test")
+            )
+            analyzer.last_tool_trace = []
+            focus = FocusProgram(
+                group_summary="Missing target.",
+                visible_focus_instruction="Inspect the target.",
+                grounding_queries=["target"],
+                selected_candidate_ids=["candidate_99"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "unavailable candidate"):
+                analyzer._attach_tool_regions(focus, image_path)
+
+    def test_analyzer_repairs_a_missing_final_selection_once(self):
+        from tempfile import TemporaryDirectory
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            image_path = Path(directory) / "image.jpg"
+            Image.new("RGB", (40, 30), color=(10, 20, 30)).save(image_path)
+            group = GroupRollout(
+                uid="repair",
+                question="What is shown?",
+                image_path=image_path,
+                rollouts=[Rollout(rollout_id=0, completion="trace", predicted_label=None, is_correct=True)],
+            )
+            analyzer = OpenAICompatibleAnalyzer(
+                OpenAIAnalyzerConfig(base_url="http://localhost", api_key="test")
+            )
+            analyzer.last_tool_trace = [
+                {
+                    "candidate_id": "candidate_1",
+                    "name": "ground_image",
+                    "arguments": {"query": "target"},
+                    "result": {"found": True, "query": "target", "bbox": [2, 2, 25, 25], "score": 0.8},
+                }
+            ]
+            repaired = (
+                '{"group_summary":"Target found.",'
+                '"visible_focus_instruction":"Inspect the target.",'
+                '"grounding_queries":["target"],'
+                '"selected_candidate_ids":["candidate_1"]}'
+            )
+            requests = []
+
+            def repair_request(body):
+                requests.append(body)
+                return {"choices": [{"message": {"content": repaired}}]}
+
+            analyzer._request = repair_request
+            initial = {
+                "content": (
+                    '{"group_summary":"Target found.",'
+                    '"visible_focus_instruction":"Inspect the target.",'
+                    '"grounding_queries":["target"]}'
+                )
+            }
+
+            focus = analyzer._finalize_focus_selection(group, initial, [])
+
+            self.assertEqual(focus.selected_candidate_ids, ["candidate_1"])
+            self.assertEqual(focus.tool_regions[0].query, "target")
+            self.assertEqual(len(requests), 1)
+            self.assertIn("candidate_1", requests[0]["messages"][-1]["content"])
 
     def test_grounding_rejects_cjk_queries(self):
         registry = object.__new__(AnalyzerVisionToolRegistry)
@@ -285,7 +405,12 @@ class AnalyzerToolsTest(unittest.TestCase):
                     image_path,
                     "ground_image",
                     {"query": "small blue sign"},
-                    {"query": "small blue sign", "bbox": [5, 4, 30, 18], "score": 0.8},
+                    {
+                        "candidate_id": "candidate_1",
+                        "query": "small blue sign",
+                        "bbox": [5, 4, 30, 18],
+                        "score": 0.8,
+                    },
                     max_side=32,
                 )
                 self.assertEqual(message["role"], "user")
@@ -293,6 +418,7 @@ class AnalyzerToolsTest(unittest.TestCase):
                 self.assertEqual(message["content"][0]["type"], "text")
                 self.assertEqual(message["content"][1]["type"], "image_url")
                 self.assertIn("exact local crop", message["content"][0]["text"])
+                self.assertIn("candidate_1", message["content"][0]["text"])
 
 
 if __name__ == "__main__":

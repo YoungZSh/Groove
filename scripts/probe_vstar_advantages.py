@@ -164,7 +164,8 @@ def evidence(args, manifest):
         group = GroupRollout(uid=f"vstar-{record['question_id']}", question=row["extra_info"]["question"],
                              image_path=Path(row["extra_info"]["image_path"]),
                              rollouts=[Rollout(rollout_id=x["rollout_id"], completion=x["completion"],
-                                               predicted_label=x["reward"]["predicted_label"], reward=x["reward"]["score"])
+                                               predicted_label=x["reward"]["predicted_label"],
+                                               is_correct=bool(x["reward"].get("accuracy", x["reward"]["score"]) > 0.5))
                                        for x in record["completions"]])
         analyzer.last_tool_trace = []
         started = time.monotonic()

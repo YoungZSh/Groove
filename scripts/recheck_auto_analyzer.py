@@ -75,7 +75,7 @@ def load_group(rollouts_dir: Path, sample: dict) -> GroupRollout:
                 rollout_id=index,
                 completion=str(row["output"]),
                 predicted_label=row.get("predicted_label"),
-                reward=float(row.get("score", 0.0)),
+                is_correct=bool(float(row.get("accuracy", row.get("score", 0.0))) > 0.5),
             )
             for index, row in enumerate(rows)
         ],
@@ -159,10 +159,10 @@ def write_sample(
             "available": True,
             "uid": group.uid,
             "rollouts": len(group.rollouts),
-            "correct": sum(item.reward > 0.5 for item in group.rollouts),
+            "correct": sum(item.is_correct for item in group.rollouts),
             "predicted_labels": [item.predicted_label or "" for item in group.rollouts],
             "ground_truth": next(
-                (str(item.predicted_label) for item in group.rollouts if item.reward > 0.5),
+                (str(item.predicted_label) for item in group.rollouts if item.is_correct),
                 None,
             ),
             "uid_source": "question_fallback",
