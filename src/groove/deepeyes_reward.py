@@ -1,13 +1,15 @@
-"""Batched semantic reward for DeepEyes-style visual QA.
+"""Batched semantic and format reward for DeepEyes-style visual QA.
 The policy receives only the raw image and question.  A remote text-only judge
 compares the policy's final answer with the private reference answer and emits
-an independent binary reward for every rollout.
+an independent binary accuracy for every rollout.  The training score combines
+that accuracy with the negative-only format reward used by DeepEyes.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import json
+import math
 import os
 import re
 import time
@@ -59,7 +61,9 @@ Judgement: 0
 Judgement: 0
 """
 
-ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+DEFAULT_ANSWER_REWARD_WEIGHT = 1.0
+DEFAULT_FORMAT_REWARD_WEIGHT = 0.2
 
 
 class RepetitionHit:
@@ -85,11 +89,38 @@ class RepetitionHit:
 
 
 def extract_answer(output: str) -> tuple[str, bool]:
-    """Extract the last complete answer tag, falling back to the full output."""
-    matches = ANSWER_PATTERN.findall(output or "")
+    """Extract the judged answer and report strict terminal-tag validity.
+
+    Semantic judging deliberately falls back to the complete output so that
+    ``accuracy`` remains independent of presentation.  Format validity is
+    stricter: the response must consist of exactly one non-empty, lowercase
+    ``<answer>...</answer>`` pair, apart from surrounding whitespace.
+    """
+    text = output or ""
+    matches = list(ANSWER_PATTERN.finditer(text))
     if matches:
-        return matches[-1].strip(), True
-    return (output or "").strip(), False
+        answer = matches[-1].group(1).strip()
+        stripped = text.strip()
+        format_valid = (
+            len(matches) == 1
+            and bool(answer)
+            and matches[0].group(0) == stripped
+        )
+        return answer, format_valid
+    return text.strip(), False
+
+
+def _validate_reward_weights(
+    answer_reward_weight: float,
+    format_reward_weight: float,
+) -> tuple[float, float]:
+    answer_weight = float(answer_reward_weight)
+    format_weight = float(format_reward_weight)
+    if not math.isfinite(answer_weight) or not math.isfinite(format_weight):
+        raise ValueError("DeepEyes reward weights must be finite")
+    if answer_weight < 0.0 or format_weight < 0.0:
+        raise ValueError("DeepEyes reward weights must be non-negative")
+    return answer_weight, format_weight
 
 
 def judge_prompt(question: str, ground_truth: str, answer: str) -> str:
@@ -225,7 +256,14 @@ def _configured_repetition_hit(output: str) -> RepetitionHit | None:
     )
 
 
-def _judge_one(question: str, ground_truth: str, output: str) -> dict[str, float]:
+def _judge_one(
+    question: str,
+    ground_truth: str,
+    output: str,
+    *,
+    answer_reward_weight: float = DEFAULT_ANSWER_REWARD_WEIGHT,
+    format_reward_weight: float = DEFAULT_FORMAT_REWARD_WEIGHT,
+) -> dict[str, float]:
     base_url = os.environ.get("DEEPEYES_JUDGE_BASE_URL", "http://127.0.0.1:8002/v1").rstrip("/")
     api_key = os.environ.get("DEEPEYES_JUDGE_API_KEY", "")
     model = os.environ.get("DEEPEYES_JUDGE_MODEL", "Qwen3.8-27B")
@@ -234,7 +272,11 @@ def _judge_one(question: str, ground_truth: str, output: str) -> dict[str, float
     if not api_key:
         raise RuntimeError("DEEPEYES_JUDGE_API_KEY is required")
 
-    answer, has_answer_tag = extract_answer(output)
+    answer_weight, format_weight = _validate_reward_weights(
+        answer_reward_weight,
+        format_reward_weight,
+    )
+    answer, format_valid = extract_answer(output)
     repetition_hit = _configured_repetition_hit(output)
     severe_repetition = repetition_hit is not None
     body = {
@@ -276,15 +318,29 @@ def _judge_one(question: str, ground_truth: str, output: str) -> dict[str, float
                 payload = json.load(response)
             content = str(payload["choices"][0]["message"].get("content") or "").strip()
             correct = float(parse_judgement(content))
-            rewarded = 0.0 if severe_repetition else correct
+            answer_reward = 0.0 if severe_repetition else correct
+            format_reward = 0.0 if format_valid else -1.0
+            weighted_answer_reward = answer_weight * answer_reward
+            weighted_format_reward = format_weight * format_reward
+            combined_reward = weighted_answer_reward + weighted_format_reward
+            # A repeated trajectory must never receive a positive reward, but
+            # it must not escape an already-negative format penalty either.
+            rewarded = min(combined_reward, 0.0) if severe_repetition else combined_reward
             return {
                 "score": rewarded,
-                # Preserve semantic accuracy for diagnosis while gating only
-                # the reward consumed by GRPO/OPSD.
+                # Preserve semantic accuracy for Analyzer grouping and
+                # diagnosis. Only score is consumed by GRPO/OPSD.
                 "accuracy": correct,
-                "answer_reward": rewarded,
-                # Format is diagnostic only and never contributes to score.
-                "has_answer_tag": float(has_answer_tag),
+                "answer_reward": answer_reward,
+                "format_reward": format_reward,
+                "weighted_answer_reward": weighted_answer_reward,
+                "weighted_format_reward": weighted_format_reward,
+                "answer_reward_weight": answer_weight,
+                "format_reward_weight": format_weight,
+                "format_valid": float(format_valid),
+                # Retain the established metric name, now with strict
+                # terminal-tag semantics.
+                "has_answer_tag": float(format_valid),
                 "answer_characters": float(len(answer)),
                 "severe_repetition": float(severe_repetition),
                 "repetition_zeroed_reward": float(severe_repetition and correct > 0.0),
@@ -307,6 +363,8 @@ def compute_score_batched(
     solution_strs,
     ground_truths,
     extra_infos,
+    answer_reward_weight: float = DEFAULT_ANSWER_REWARD_WEIGHT,
+    format_reward_weight: float = DEFAULT_FORMAT_REWARD_WEIGHT,
     **_: Any,
 ) -> list[dict[str, float]]:
     """Score a rollout batch concurrently while preserving input order."""
@@ -330,6 +388,8 @@ def compute_score_batched(
                 questions[index],
                 str(ground_truths[index]),
                 str(solution_strs[index]),
+                answer_reward_weight=answer_reward_weight,
+                format_reward_weight=format_reward_weight,
             ): index
             for index in range(count)
         }
@@ -345,6 +405,8 @@ def compute_score(
     solution_str: str,
     ground_truth: str,
     extra_info: dict[str, Any],
+    answer_reward_weight: float = DEFAULT_ANSWER_REWARD_WEIGHT,
+    format_reward_weight: float = DEFAULT_FORMAT_REWARD_WEIGHT,
     **_: Any,
 ) -> dict[str, float]:
     """VERL 0.9 reward-loop adapter for one streamed rollout."""
@@ -352,4 +414,10 @@ def compute_score(
     question = str((extra_info or {}).get("question", "")).strip()
     if not question:
         raise ValueError("DeepEyes reward requires extra_info.question")
-    return _judge_one(question, str(ground_truth), str(solution_str))
+    return _judge_one(
+        question,
+        str(ground_truth),
+        str(solution_str),
+        answer_reward_weight=answer_reward_weight,
+        format_reward_weight=format_reward_weight,
+    )

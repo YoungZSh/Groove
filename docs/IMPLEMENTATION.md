@@ -22,12 +22,26 @@ The Analyzer input contains:
 
 It does not contain rollout IDs, parsed predictions, numeric rewards, or the
 ground-truth answer. Training reward shaping is deliberately separate from this
-semantic split. For DeepEyes runs, an Antidoom-style detector sets the complete
-rollout reward to zero when one exact contiguous span repeats at least four times
-over at least 80 characters. The raw Judge `accuracy` remains unchanged, and the
-detected loop suffix is removed before the reasoning is sent to the Analyzer.
+semantic split. For DeepEyes runs, an Antidoom-style detector prevents a rollout
+from receiving positive reward when one exact contiguous span repeats at least
+four times over at least 80 characters. The raw Judge `accuracy` remains unchanged,
+and the detected loop suffix is removed before the reasoning is sent to the Analyzer.
 
-The terminal reward has two independent components:
+DeepEyes training keeps semantic correctness on the original `[0, 1]` scale and
+adds a negative-only format term:
+
+```text
+accuracy = LLM-Judge semantic correctness in {0, 1}
+format_penalty = 0 if the response is exactly one nonempty <answer>...</answer>
+                 pair, otherwise -1
+score = accuracy + 0.2 * format_penalty
+```
+
+Thus a strictly formatted correct answer receives `1.0`, while a semantically
+correct bare answer receives `0.8`. Analyzer grouping continues to use the raw
+`accuracy`, not this shaped `score`.
+
+The separate non-DeepEyes `FINAL: X` reward has two independent components:
 
 ```text
 answer_reward = 1[parsed answer matches ground truth]

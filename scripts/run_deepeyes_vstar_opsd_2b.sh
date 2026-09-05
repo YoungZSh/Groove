@@ -83,8 +83,10 @@ export CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/deepeyes_reward.py"
 export CUSTOM_REWARD_FUNCTION_NAME=compute_score
 export REWARD_MANAGER_NAME=naive
 export REWARD_NUM_WORKERS=1
+# DeepEyes-style negative-only format penalty while retaining 1.0 as the
+# maximum semantic reward: score = accuracy - 0.2 * format_error.
 export ANSWER_REWARD_WEIGHT=1.0
-export FORMAT_REWARD_WEIGHT=0.0
+export FORMAT_REWARD_WEIGHT=0.2
 export DEEPEYES_JUDGE_BASE_URL=http://127.0.0.1:8002/v1
 export DEEPEYES_JUDGE_API_KEY="${DEEPEYES_JUDGE_API_KEY:-remote-qwen38}"
 export DEEPEYES_JUDGE_MODEL=Qwen3.8-27B

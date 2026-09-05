@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from groove.deepeyes_reward import (
     _judge_one,
     compute_score,
+    extract_answer,
     find_inner_repetition,
     parse_judgement,
 )
@@ -29,6 +30,8 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
             "What color is the kite?",
             "The kite is green.",
             "<answer>green</answer>",
+            answer_reward_weight=1.0,
+            format_reward_weight=0.2,
         )
 
     def test_scalar_reward_adapter_requires_question(self):
@@ -48,13 +51,68 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
             patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response) as urlopen,
             patch("groove.deepeyes_reward.json.load", return_value=payload),
         ):
-            result = _judge_one("What color?", "green", "green")
+            result = _judge_one("What color?", "green", "<answer>green</answer>")
 
         body = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
         self.assertEqual(body["structured_outputs"], {"choice": ["0", "1"]})
         self.assertEqual(body["max_completion_tokens"], 4)
         self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result["format_reward"], 0.0)
+
+    def test_bare_correct_answer_gets_deepeyes_format_penalty(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        payload = {"choices": [{"message": {"content": "1"}}]}
+        environment = {
+            "DEEPEYES_JUDGE_API_KEY": "test-key",
+            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
+            "DEEPEYES_REPETITION_ZERO_REWARD": "false",
+        }
+        with (
+            patch.dict("os.environ", environment, clear=False),
+            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.deepeyes_reward.json.load", return_value=payload),
+        ):
+            result = _judge_one("What color?", "green", "green")
+
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["format_valid"], 0.0)
+        self.assertEqual(result["format_reward"], -1.0)
+        self.assertAlmostEqual(result["score"], 0.8)
+
+    def test_wrong_malformed_answer_gets_negative_format_penalty(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        payload = {"choices": [{"message": {"content": "0"}}]}
+        environment = {
+            "DEEPEYES_JUDGE_API_KEY": "test-key",
+            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
+            "DEEPEYES_REPETITION_ZERO_REWARD": "false",
+        }
+        with (
+            patch.dict("os.environ", environment, clear=False),
+            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.deepeyes_reward.json.load", return_value=payload),
+        ):
+            result = _judge_one("What color?", "green", "blue")
+
+        self.assertEqual(result["accuracy"], 0.0)
+        self.assertEqual(result["format_reward"], -1.0)
+        self.assertAlmostEqual(result["score"], -0.2)
+
+    def test_format_requires_one_nonempty_terminal_answer_pair(self):
+        self.assertEqual(extract_answer(" <answer>green</answer> "), ("green", True))
+        self.assertEqual(extract_answer("green"), ("green", False))
+        self.assertEqual(extract_answer("<answer> </answer>"), ("", False))
+        self.assertEqual(
+            extract_answer("<answer>blue</answer><answer>green</answer>"),
+            ("green", False),
+        )
+        self.assertEqual(
+            extract_answer("reasoning <answer>green</answer>"),
+            ("green", False),
+        )
 
     def test_unconstrained_explanation_is_not_guessed(self):
         with self.assertRaises(ValueError):
@@ -72,7 +130,7 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         response = MagicMock()
         response.__enter__.return_value = response
         payload = {"choices": [{"message": {"content": "1"}}]}
-        repeated_output = ("The answer is blue. <answer>blue</answer> " * 40).strip()
+        repeated_output = "<answer>" + ("blue " * 40).strip() + "</answer>"
         environment = {
             "DEEPEYES_JUDGE_API_KEY": "test-key",
             "DEEPEYES_JUDGE_MAX_RETRIES": "0",
@@ -88,6 +146,7 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         self.assertEqual(result["score"], 0.0)
         self.assertEqual(result["answer_reward"], 0.0)
         self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["format_reward"], 0.0)
         self.assertEqual(result["severe_repetition"], 1.0)
         self.assertEqual(result["repetition_zeroed_reward"], 1.0)
 
@@ -125,7 +184,7 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
             patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
             patch("groove.deepeyes_reward.json.load", return_value=payload),
         ):
-            result = _judge_one("What color?", "blue", "blue blue blue <answer>blue</answer>")
+            result = _judge_one("What color?", "blue", "<answer>blue blue blue</answer>")
 
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["severe_repetition"], 0.0)

@@ -80,8 +80,8 @@ export OPTIMIZER_NAME=AdamW
 export FUSED_ADAMW=true
 export REFERENCE_KL_COEF=0.01
 
-# Use the screened-data judge protocol as the sole outcome reward. Missing
-# answer tags are diagnostic only and do not reduce the binary accuracy score.
+# Keep semantic judging independent, then subtract a 0.2 DeepEyes-style
+# negative format penalty while retaining 1.0 as the maximum reward.
 export CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/deepeyes_reward.py"
 export CUSTOM_REWARD_FUNCTION_NAME=compute_score
 export REWARD_MANAGER_NAME=naive
@@ -90,7 +90,7 @@ export REWARD_MANAGER_NAME=naive
 # flight without the instability and startup cost of dozens of worker actors.
 export REWARD_NUM_WORKERS=1
 export ANSWER_REWARD_WEIGHT=1.0
-export FORMAT_REWARD_WEIGHT=0.0
+export FORMAT_REWARD_WEIGHT=0.2
 export DEEPEYES_JUDGE_BASE_URL=http://127.0.0.1:8002/v1
 export DEEPEYES_JUDGE_API_KEY="${DEEPEYES_JUDGE_API_KEY:-remote-qwen38}"
 export DEEPEYES_JUDGE_MODEL=Qwen3.8-27B
