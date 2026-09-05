@@ -2,8 +2,6 @@
 
 Downloaded from the corresponding arXiv records:
 
-- `Self-Evolving-On-Policy-Distillation-for-Agentic-Reinforcement-Learning.pdf`
-  - https://arxiv.org/abs/2607.14777
 - `OPID__On-Policy-Skill-Distillation-for-Agentic-Reinforcement-Learning.pdf`
   - https://arxiv.org/abs/2606.26790
 - `Skill-SD__Skill-Conditioned-Self-Distillation-for-Multi-turn-LLM-Agents.pdf`
