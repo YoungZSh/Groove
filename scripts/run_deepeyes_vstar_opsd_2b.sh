@@ -4,7 +4,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data/deepeyes_vstar_opsd_2200_seed20260904"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v2}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-deepeyes-vstar-signed-opsd-2199-seed20260904-b16-v3}"
 
 # Preserve the completed 2B GRPO run's model, data split, sampling, optimizer,
 # reward, and validation settings. OPSD only adds detached sampled reverse-KL
@@ -100,8 +100,8 @@ export DEEPEYES_REPETITION_SAMPLE_INTERVAL="${DEEPEYES_REPETITION_SAMPLE_INTERVA
 export TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 export TOTAL_STEPS="${TOTAL_STEPS:-null}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
-export TEST_FREQ="${TEST_FREQ:-25}"
-export SAVE_FREQ="${SAVE_FREQ:-25}"
+export TEST_FREQ="${TEST_FREQ:-10}"
+export SAVE_FREQ="${SAVE_FREQ:-10}"
 export MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-2}"
 export EXPERIMENT_NAME
 export CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
