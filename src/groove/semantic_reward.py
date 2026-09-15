@@ -3,6 +3,7 @@ The policy receives only the raw image and question.  A remote text-only judge
 compares the policy's final answer with the private reference answer and emits
 an independent binary accuracy for every rollout.  The training score combines
 that accuracy with the negative-only format reward.
+V*Bench validation uses the shared deterministic option scorer instead.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+from groove.vstar_bench import DATA_SOURCE as VSTAR_DATA_SOURCE, compute_validation_score
 
 
 JUDGE_INSTRUCTION = """Below are two answers to a question. Question is [Question], [Standard Answer] is the standard answer to the question, and [Model_answer] is the answer extracted from a model's output to this question. Determine whether these two answers are consistent.
@@ -372,26 +375,24 @@ def compute_score_batched(
     **_: Any,
 ) -> list[dict[str, float]]:
     """Score a rollout batch concurrently while preserving input order."""
-    del data_sources
     count = len(solution_strs)
-    if not (len(ground_truths) == len(extra_infos) == count):
+    if not (len(data_sources) == len(ground_truths) == len(extra_infos) == count):
         raise ValueError("batched reward inputs must have equal lengths")
+    if count == 0:
+        return []
     concurrency = int(os.environ.get("GROOVE_JUDGE_CONCURRENCY", "128"))
     if concurrency <= 0:
         raise ValueError("GROOVE_JUDGE_CONCURRENCY must be positive")
-
-    questions = [str((info or {}).get("question", "")) for info in extra_infos]
-    if any(not question for question in questions):
-        raise ValueError("every semantic reward item requires extra_info.question")
 
     scores: list[dict[str, float] | None] = [None] * count
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, count)) as executor:
         future_to_index = {
             executor.submit(
-                _judge_one,
-                questions[index],
-                str(ground_truths[index]),
+                compute_score,
+                str(data_sources[index]),
                 str(solution_strs[index]),
+                str(ground_truths[index]),
+                extra_infos[index],
                 answer_reward_weight=answer_reward_weight,
                 format_reward_weight=format_reward_weight,
             ): index
@@ -414,7 +415,8 @@ def compute_score(
     **_: Any,
 ) -> dict[str, float]:
     """VERL 0.9 reward-loop adapter for one streamed rollout."""
-    del data_source
+    if data_source == VSTAR_DATA_SOURCE:
+        return compute_validation_score(str(solution_str), str(ground_truth), extra_info or {})
     question = str((extra_info or {}).get("question", "")).strip()
     if not question:
         raise ValueError("Semantic reward requires extra_info.question")

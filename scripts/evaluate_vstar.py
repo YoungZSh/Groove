@@ -14,71 +14,18 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import re
+import sys
 import time
+
+# Keep the shared scorer available when this script is run from a checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from groove.vstar_bench import CHOICE_RE, parse_prediction, question_text
 
 
 SYSTEM_PROMPT = (
     "You are a visual question-answering assistant. Analyze the image and answer "
     "the question. Put only the final answer inside <answer>...</answer> tags."
 )
-ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-TAG_RE = re.compile(r"</?\s*answer\b[^>]*>", re.IGNORECASE)
-CHOICE_RE = re.compile(r"^\(([A-D])\)\s*(.+)$", re.MULTILINE)
-
-
-def question_text(text: str) -> str:
-    # Replace only the source's output-format instruction; retain question/options.
-    question = re.sub(
-        r"\nAnswer with the option(?:'s)? letter.*$", "", text.strip(), flags=re.I
-    )
-    return question + "\nReturn the selected option letter inside <answer>...</answer>."
-
-
-def normalized(text: str) -> str:
-    return " ".join(text.strip().strip("*` ").split()).rstrip(".! ").casefold()
-
-
-def parse_prediction(output: str, choices: dict[str, str]) -> dict:
-    """Parse a final answer without looking for arbitrary letters in reasoning.
-
-    Accept an isolated option label, a label followed by its matching option
-    text, or an exact unambiguous option text. Ambiguous finals remain unparsed.
-    """
-    matches = list(ANSWER_RE.finditer(output))
-    candidate = matches[-1].group(1).strip() if matches else output.strip()
-    tags = TAG_RE.findall(output)
-    format_valid = bool(
-        len(matches) == 1 and candidate and tags == ["<answer>", "</answer>"]
-        and not output[matches[-1].end():].strip()
-    )
-    # Without a complete tag, only use an explicitly marked final line or the
-    # full short response; never guess from letters discussed in the rationale.
-    if not matches and "\n" in candidate:
-        last = candidate.splitlines()[-1].strip()
-        if re.match(r"(?i)^(?:final(?: answer)?|answer)\s*[:：]", last):
-            candidate = last
-    cleaned = candidate.strip().strip("*` ")
-    cleaned = re.sub(r"(?i)^(?:(?:the\s+)?(?:final\s+)?answer|option)\s*(?:is\s*)?[:：]?\s*", "", cleaned)
-    label = re.fullmatch(r"\(?([A-D])\)?(?:[.:：\-]\s*|\s+)?(.*?)", cleaned, re.DOTALL)
-    prediction = None
-    method = "unparsed"
-    if label and label.group(1) in choices:
-        suffix = label.group(2).strip()
-        if not suffix or normalized(suffix) == normalized(choices[label.group(1)]):
-            prediction = label.group(1)
-            method = "option_label"
-    if prediction is None:
-        equivalent = [key for key, value in choices.items() if normalized(candidate) == normalized(value)]
-        if len(equivalent) == 1:
-            prediction = equivalent[0]
-            method = "exact_option_text"
-    return {
-        "answer_text": candidate, "predicted_label": prediction,
-        "parse_method": method, "format_valid": format_valid,
-        "has_complete_answer_tag": bool(matches),
-    }
-
 
 def summary(rows: list[dict]) -> dict:
     def rates(items):

@@ -41,6 +41,7 @@ ray_results/
 data/**/*.parquet
 data/**/.cache/
 data/vstar/images/
+data/vstar_bench/
 data/*_47k
 data/*vstar_grpo_*
 data/*vstar_opsd_*
