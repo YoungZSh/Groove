@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evaluate a merged Student checkpoint on the original V*Bench test parquet.
 
-Uses original image bytes, the historical DeepEyes Student system instruction,
+Uses original image bytes, the historical Visual QA Student system instruction,
 and the checkpoint's chat template. No Teacher, external tools, or LLM judge.
 """
 

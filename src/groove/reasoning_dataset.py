@@ -6,15 +6,15 @@ from copy import deepcopy
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-from groove.deepeyes_prompt import REASONING_SYSTEM_PROMPT
+from groove.response_prompt import REASONING_SYSTEM_PROMPT
 
 
-class DeepEyesReasoningDataset(RLHFDataset):
+class ReasoningAnswerDataset(RLHFDataset):
     def _build_messages(self, example: dict, key: str | None = None):
         prompt_key = key or self.prompt_key
         messages = deepcopy(example[prompt_key])
         if not messages or messages[-1]["role"] != "user":
-            raise ValueError("DeepEyes Student prompt must end with the original user question")
+            raise ValueError("Student prompt must end with the original user question")
         if messages[0]["role"] == "system":
             messages[0]["content"] = REASONING_SYSTEM_PROMPT
         else:

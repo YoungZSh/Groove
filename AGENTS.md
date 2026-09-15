@@ -22,7 +22,7 @@ The deployment boundary is important:
 
 The checked-in execution path is authoritative. Read it in this order:
 
-1. `scripts/run_deepeyes_vstar_opsd_2b.sh` and
+1. `scripts/run_grpo_opsd_2b.sh` and
    `scripts/run_grpo_2b.sh` define the exact current 2B
    experiments. `scripts/run_groove.sh` translates their environment into the
    resolved Hydra/VERL configuration.
@@ -37,7 +37,7 @@ The checked-in execution path is authoritative. Read it in this order:
 4. `src/groove/objective.py::validate_objective_config()` defines the allowed
    objective configuration: GRPO advantage estimation, one vanilla PPO policy
    loss, reference KL in the loss, and no separate distillation objective.
-5. `src/groove/deepeyes_reward.py` defines semantic Judge accuracy, format
+5. `src/groove/semantic_reward.py` defines semantic Judge accuracy, format
    shaping, retry behavior, and repetition handling.
 6. `src/groove/analyzer.py`, `src/groove/analyzer_tools.py`, and
    `src/groove/evidence.py` define Analyzer inputs, tool use, crop selection,
@@ -51,7 +51,7 @@ path above, follow the current code and update the stale document separately.
 
 The generic README also describes older Vision-OPD/4B configurations. Do not
 copy its generic batch size, response length, KL coefficient, checkpoint
-cadence, or service topology into a 2B DeepEyes run without checking the 2B
+cadence, or service topology into a 2B visual-QA run without checking the 2B
 launcher.
 
 Treat files under `Papers/` and `TMP/probe_experiments/` as references and
@@ -86,7 +86,7 @@ Targeted reward tests:
 ```bash
 PYTHONPATH="$PWD/src" \
   /home/yzs/miniconda3/envs/vision-opd/bin/python \
-  -m unittest discover -s tests -p 'test_deepeyes_reward.py' -v
+  -m unittest discover -s tests -p 'test_semantic_reward.py' -v
 ```
 
 Before handing off launcher changes, also run:
@@ -94,7 +94,7 @@ Before handing off launcher changes, also run:
 ```bash
 bash -n scripts/run_groove.sh
 bash -n scripts/run_grpo_2b.sh
-bash -n scripts/run_deepeyes_vstar_opsd_2b.sh
+bash -n scripts/run_grpo_opsd_2b.sh
 git diff --check
 ```
 
@@ -136,9 +136,9 @@ an algorithmic change:
 For the current 2B launchers, reference KL uses coefficient `0.01`, training
 uses `token-mean`, learning rate `1e-6`, one PPO epoch, and clip ratio `0.2`.
 
-## DeepEyes reward contract
+## Semantic reward contract
 
-`src/groove/deepeyes_reward.py` deliberately separates semantic correctness
+`src/groove/semantic_reward.py` deliberately separates semantic correctness
 from output formatting:
 
 - The remote Judge returns constrained `0` or `1` semantic `accuracy`.

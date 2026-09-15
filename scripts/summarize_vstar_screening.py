@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a judged DeepEyes V* screening run as a Markdown report."""
+"""Summarize a judged V* screening run as a Markdown report."""
 
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def main() -> None:
     )
 
     lines = [
-        f"# Qwen3.5-2B · DeepEyes V* · {len(rollouts):,}-question screening report",
+        f"# Qwen3.5-2B · V* · {len(rollouts):,}-question screening report",
         "",
         "## Run summary",
         "",

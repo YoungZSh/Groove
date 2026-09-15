@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Judge DeepEyes V* rollout answers through an OpenAI-compatible endpoint."""
+"""Judge V* rollout answers through an OpenAI-compatible endpoint."""
 
 from __future__ import annotations
 
@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def deepeyes_answer_text(output: str) -> str:
-    """Match DeepEyes' V* fallback: no answer tag means judge the full output."""
+def answer_text(output: str) -> str:
+    """If no answer tag is present, judge the full output."""
     return output.split("<answer>")[-1].split("</answer>")[0].strip()
 
 
@@ -121,7 +121,7 @@ def post_json(url: str, api_key: str, body: dict, timeout: float) -> dict:
 
 
 def judge_one(item: dict, args: argparse.Namespace, api_key: str) -> dict:
-    answer = deepeyes_answer_text(item["model_output"])
+    answer = answer_text(item["model_output"])
     body = {
         "model": args.model,
         "messages": [

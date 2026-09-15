@@ -22,12 +22,12 @@ The Analyzer input contains:
 
 It does not contain rollout IDs, parsed predictions, numeric rewards, or the
 ground-truth answer. Training reward shaping is deliberately separate from this
-semantic split. For DeepEyes runs, an Antidoom-style detector prevents a rollout
+semantic split. For visual-QA runs, an Antidoom-style detector prevents a rollout
 from receiving positive reward when one exact contiguous span repeats at least
 four times over at least 80 characters. The raw Judge `accuracy` remains unchanged,
 and the detected loop suffix is removed before the reasoning is sent to the Analyzer.
 
-DeepEyes training keeps semantic correctness on the original `[0, 1]` scale and
+Visual-QA training keeps semantic correctness on the original `[0, 1]` scale and
 adds a negative-only format term:
 
 ```text
@@ -43,6 +43,22 @@ correct bare answer receives `0.8`. Analyzer grouping continues to use the raw
 
 ### Plain reasoning followed by the final answer (next 2B runs)
 
+The response instruction and native chat-template setup live in
+`src/groove/response_prompt.py`; `configure_response_format()` installs
+`ReasoningAnswerDataset` from `src/groove/reasoning_dataset.py`. Semantic
+judging, format shaping, and repetition handling live in
+`src/groove/semantic_reward.py`. The Judge environment variables use the
+`GROOVE_JUDGE_` prefix, and repetition settings use `GROOVE_REPETITION_`.
+
+The formal launchers are `scripts/run_grpo_2b.sh` and
+`scripts/run_grpo_opsd_2b.sh`. Their default prepared-data directories are
+`data/vstar_grpo_2200_seed20260904` and
+`data/vstar_opsd_2200_seed20260904`. Set `DATA_DIR` to an existing split or
+provide a local directory symlink at the default path; each split must contain
+`train.parquet` and `validation.parquet`. Existing datasets and archived run
+records are preserved, including embedded image paths and source metadata.
+The naming change does not alter prompts, rewards, or optimizer settings.
+
 Both formal 2B launchers select `data.response_format=reasoning_answer`. The
 Student is instructed to explain its reasoning as ordinary text, then put only
 the final answer in one terminal `<answer>...</answer>` pair. No `<think>` or
@@ -50,7 +66,7 @@ the final answer in one terminal `<answer>...</answer>` pair. No `<think>` or
 An answer-only completion still has valid answer formatting; reasoning is
 requested by the prompt rather than enforced by a separate correctness gate.
 
-`DeepEyesReasoningDataset` replaces the system instruction in memory for both
+`ReasoningAnswerDataset` replaces the system instruction in memory for both
 train and validation. Existing parquet files, row order, questions, original
 images, reference labels, and Analyzer-only metadata are preserved. Only the
 original image and question enter the Student user message. Teacher prompts
@@ -79,7 +95,7 @@ outside it; its logged format rate is not comparable to the corrected rule.
 The two launchers currently retain different seeds (GRPO: 22, GRPO + OPSD:
 20260904), which must be aligned for a controlled comparison.
 
-The separate non-DeepEyes `FINAL: X` reward has two independent components:
+The separate rule-based `FINAL: X` reward has two independent components:
 
 ```text
 answer_reward = 1[parsed answer matches ground truth]

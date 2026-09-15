@@ -41,9 +41,9 @@ ray_results/
 data/**/*.parquet
 data/**/.cache/
 data/vstar/images/
-data/deepeyes_47k/
-data/deepeyes_vstar_grpo_*/
-data/deepeyes_vstar_opsd_*/
+data/*_47k
+data/*vstar_grpo_*
+data/*vstar_opsd_*
 data/vision_opd_*_seed*/
 data/baseline_*_seed*/
 data/visual_evidence_source/

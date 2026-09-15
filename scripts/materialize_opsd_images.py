@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add local image paths to an existing embedded-image DeepEyes split."""
+"""Add local image paths to an existing embedded-image visual-QA split."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "data/deepeyes_vstar_grpo_2200_seed20260904"
+DEFAULT_INPUT = ROOT / "data/vstar_grpo_2200_seed20260904"
 
 
 def parse_args() -> argparse.Namespace:

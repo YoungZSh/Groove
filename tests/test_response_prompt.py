@@ -8,18 +8,18 @@ import unittest
 from jinja2 import Environment
 from omegaconf import OmegaConf
 
-from groove.deepeyes_dataset import DeepEyesReasoningDataset
-from groove.deepeyes_prompt import (
+from groove.reasoning_dataset import ReasoningAnswerDataset
+from groove.response_prompt import (
     REASONING_SYSTEM_PROMPT,
-    configure_deepeyes_response,
+    configure_response_format,
 )
-from groove.deepeyes_reward import extract_answer
+from groove.semantic_reward import extract_answer
 from groove.evidence import build_teacher_prompt_from_student, student_prompt_template
 
 
-class DeepEyesReasoningPromptTest(unittest.TestCase):
+class ResponsePromptTest(unittest.TestCase):
     def make_dataset(self):
-        dataset = object.__new__(DeepEyesReasoningDataset)
+        dataset = object.__new__(ReasoningAnswerDataset)
         dataset.prompt_key = "prompt"
         dataset.image_key = "images"
         dataset.video_key = "videos"
@@ -79,8 +79,8 @@ class DeepEyesReasoningPromptTest(unittest.TestCase):
                          "custom_cls": {"path": None, "name": None}},
                 "actor_rollout_ref": {"model": {"path": folder, "custom_chat_template": None}},
             })
-            configure_deepeyes_response(config)
-            self.assertEqual(config.data.custom_cls.name, "DeepEyesReasoningDataset")
+            configure_response_format(config)
+            self.assertEqual(config.data.custom_cls.name, "ReasoningAnswerDataset")
             self.assertTrue(Path(config.data.custom_cls.path).is_file())
             self.assertEqual(config.actor_rollout_ref.model.custom_chat_template, native)
             self.assertEqual((Path(folder) / "chat_template.jinja").read_text(), native)
@@ -111,19 +111,19 @@ class DeepEyesReasoningPromptTest(unittest.TestCase):
             "actor_rollout_ref": {"model": {"custom_chat_template": "modified template"}},
         })
         with self.assertRaisesRegex(ValueError, "original model template unchanged"):
-            configure_deepeyes_response(config)
+            configure_response_format(config)
 
     def test_original_configuration_is_untouched(self):
         config = OmegaConf.create({"data": {"response_format": "original"}})
         before = OmegaConf.to_container(config)
-        configure_deepeyes_response(config)
+        configure_response_format(config)
         self.assertEqual(OmegaConf.to_container(config), before)
 
     def test_native_thinking_cannot_conflict_with_plain_reasoning_mode(self):
         config = OmegaConf.create({"data": {"response_format": "reasoning_answer",
                                              "apply_chat_template_kwargs": {"enable_thinking": True}}})
         with self.assertRaisesRegex(ValueError, "enable_thinking=false"):
-            configure_deepeyes_response(config)
+            configure_response_format(config)
 
 
 if __name__ == "__main__":

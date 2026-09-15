@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build reproducible train/validation splits from screened DeepEyes V* rows."""
+"""Build reproducible train/validation splits from screened V* rows."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ import pyarrow.parquet as pq
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE = ROOT / "data/deepeyes_47k/data_0.1.2_visual_toolbox_v2.parquet"
+DEFAULT_SOURCE = ROOT / "data/visual_toolbox_47k/data_0.1.2_visual_toolbox_v2.parquet"
 DEFAULT_JUDGE_SUMMARY = (
     ROOT
-    / "outputs/qwen35-2b-deepeyes-vstar-vllm-full/judge-summary-qwen38-27b.json"
+    / "outputs/qwen35-2b-vstar-vllm-full/judge-summary-qwen38-27b.json"
 )
 SYSTEM_PROMPT = (
     "You are a visual question-answering assistant. "
@@ -138,7 +138,7 @@ def build_record(
     question = str(row["extra_info"]["question"]).strip()
     ground_truth = str(row["extra_info"]["answer"]).strip()
     return {
-        "data_source": "deepeyes_vstar_grpo",
+        "data_source": "vstar_grpo",
         "prompt": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"<image>{question}"},
@@ -152,7 +152,7 @@ def build_record(
             "answer": ground_truth,
             "question": question,
             "index": str(source_index),
-            "question_id": f"deepeyes-vstar-{source_index:06d}",
+            "question_id": f"vstar-{source_index:06d}",
             "source_index": source_index,
             "split": split,
             "screening_correct_count": correct_count,

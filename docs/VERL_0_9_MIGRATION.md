@@ -18,7 +18,7 @@ Project behavior is layered on top instead of retaining stale upstream files.
 2. The launcher uses v0.9's prompt-level `ppo_mini_batch_size` semantics. A
    Batch-16, `n=8` step sets the value to 16; VERL expands it to 128
    completions internally.
-3. DeepEyes judging uses the v0.9 reward-loop interface. A single asynchronous
+3. Semantic judging uses the v0.9 reward-loop interface. A single asynchronous
    reward actor accepts concurrent trajectory calls and dispatches blocking
    HTTP requests through its executor, preserving rollout/judge overlap without
    spawning dozens of Ray actors.
@@ -45,8 +45,8 @@ therefore use `MODEL_USE_REMOVE_PADDING=true` again.
 ## Validation
 
 - Project unit tests: 44 passed.
-- Three-step end-to-end probe:
-  `outputs/logs/qwen35-2b-deepeyes-vstar-grpo-verl090-rmpad-3step-probe-v3.log`
+- Three-step end-to-end probe: the archived log under `outputs/logs/` matching
+  `*verl090-rmpad-3step-probe-v3.log`.
 - Rollout-vs-actor mean probability difference by step:
   `0.00701`, `0.00665`, `0.00640`.
 - Pearson correlation by step:

@@ -1,8 +1,8 @@
-"""Batched semantic and format reward for DeepEyes-style visual QA.
+"""Batched semantic and format reward for visual QA.
 The policy receives only the raw image and question.  A remote text-only judge
 compares the policy's final answer with the private reference answer and emits
 an independent binary accuracy for every rollout.  The training score combines
-that accuracy with the negative-only format reward used by DeepEyes.
+that accuracy with the negative-only format reward.
 """
 
 from __future__ import annotations
@@ -121,9 +121,9 @@ def _validate_reward_weights(
     answer_weight = float(answer_reward_weight)
     format_weight = float(format_reward_weight)
     if not math.isfinite(answer_weight) or not math.isfinite(format_weight):
-        raise ValueError("DeepEyes reward weights must be finite")
+        raise ValueError("Semantic reward weights must be finite")
     if answer_weight < 0.0 or format_weight < 0.0:
-        raise ValueError("DeepEyes reward weights must be non-negative")
+        raise ValueError("Semantic reward weights must be non-negative")
     return answer_weight, format_weight
 
 
@@ -243,20 +243,20 @@ def find_inner_repetition(
 
 
 def _configured_repetition_hit(output: str) -> RepetitionHit | None:
-    enabled = os.environ.get("DEEPEYES_REPETITION_ZERO_REWARD", "false").strip().lower()
+    enabled = os.environ.get("GROOVE_REPETITION_ZERO_REWARD", "false").strip().lower()
     if enabled not in {"true", "false"}:
-        raise ValueError("DEEPEYES_REPETITION_ZERO_REWARD must be true or false")
+        raise ValueError("GROOVE_REPETITION_ZERO_REWARD must be true or false")
     if enabled == "false":
         return None
 
     return find_inner_repetition(
         output,
-        min_repeats=int(os.environ.get("DEEPEYES_REPETITION_MIN_REPEATS", "4")),
-        min_total_characters=int(os.environ.get("DEEPEYES_REPETITION_MIN_TOTAL_CHARACTERS", "80")),
-        min_period=int(os.environ.get("DEEPEYES_REPETITION_MIN_PERIOD", "1")),
-        max_period=int(os.environ.get("DEEPEYES_REPETITION_MAX_PERIOD", "1024")),
-        sample_length=int(os.environ.get("DEEPEYES_REPETITION_SAMPLE_LENGTH", "16")),
-        sample_interval=int(os.environ.get("DEEPEYES_REPETITION_SAMPLE_INTERVAL", "32")),
+        min_repeats=int(os.environ.get("GROOVE_REPETITION_MIN_REPEATS", "4")),
+        min_total_characters=int(os.environ.get("GROOVE_REPETITION_MIN_TOTAL_CHARACTERS", "80")),
+        min_period=int(os.environ.get("GROOVE_REPETITION_MIN_PERIOD", "1")),
+        max_period=int(os.environ.get("GROOVE_REPETITION_MAX_PERIOD", "1024")),
+        sample_length=int(os.environ.get("GROOVE_REPETITION_SAMPLE_LENGTH", "16")),
+        sample_interval=int(os.environ.get("GROOVE_REPETITION_SAMPLE_INTERVAL", "32")),
     )
 
 
@@ -268,13 +268,13 @@ def _judge_one(
     answer_reward_weight: float = DEFAULT_ANSWER_REWARD_WEIGHT,
     format_reward_weight: float = DEFAULT_FORMAT_REWARD_WEIGHT,
 ) -> dict[str, float]:
-    base_url = os.environ.get("DEEPEYES_JUDGE_BASE_URL", "http://127.0.0.1:8002/v1").rstrip("/")
-    api_key = os.environ.get("DEEPEYES_JUDGE_API_KEY", "")
-    model = os.environ.get("DEEPEYES_JUDGE_MODEL", "Qwen3.8-27B")
-    timeout = float(os.environ.get("DEEPEYES_JUDGE_TIMEOUT_SECONDS", "180"))
-    max_retries = int(os.environ.get("DEEPEYES_JUDGE_MAX_RETRIES", "5"))
+    base_url = os.environ.get("GROOVE_JUDGE_BASE_URL", "http://127.0.0.1:8002/v1").rstrip("/")
+    api_key = os.environ.get("GROOVE_JUDGE_API_KEY", "")
+    model = os.environ.get("GROOVE_JUDGE_MODEL", "Qwen3.8-27B")
+    timeout = float(os.environ.get("GROOVE_JUDGE_TIMEOUT_SECONDS", "180"))
+    max_retries = int(os.environ.get("GROOVE_JUDGE_MAX_RETRIES", "5"))
     if not api_key:
-        raise RuntimeError("DEEPEYES_JUDGE_API_KEY is required")
+        raise RuntimeError("GROOVE_JUDGE_API_KEY is required")
 
     answer_weight, format_weight = _validate_reward_weights(
         answer_reward_weight,
@@ -359,7 +359,7 @@ def _judge_one(
             last_error = exc
             if attempt < max_retries:
                 time.sleep(0.5 * (2**attempt))
-    raise RuntimeError(f"remote DeepEyes judge failed after retries: {last_error}")
+    raise RuntimeError(f"remote semantic judge failed after retries: {last_error}")
 
 
 def compute_score_batched(
@@ -376,13 +376,13 @@ def compute_score_batched(
     count = len(solution_strs)
     if not (len(ground_truths) == len(extra_infos) == count):
         raise ValueError("batched reward inputs must have equal lengths")
-    concurrency = int(os.environ.get("DEEPEYES_JUDGE_CONCURRENCY", "128"))
+    concurrency = int(os.environ.get("GROOVE_JUDGE_CONCURRENCY", "128"))
     if concurrency <= 0:
-        raise ValueError("DEEPEYES_JUDGE_CONCURRENCY must be positive")
+        raise ValueError("GROOVE_JUDGE_CONCURRENCY must be positive")
 
     questions = [str((info or {}).get("question", "")) for info in extra_infos]
     if any(not question for question in questions):
-        raise ValueError("every DeepEyes reward item requires extra_info.question")
+        raise ValueError("every semantic reward item requires extra_info.question")
 
     scores: list[dict[str, float] | None] = [None] * count
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, count)) as executor:
@@ -417,7 +417,7 @@ def compute_score(
     del data_source
     question = str((extra_info or {}).get("question", "")).strip()
     if not question:
-        raise ValueError("DeepEyes reward requires extra_info.question")
+        raise ValueError("Semantic reward requires extra_info.question")
     return _judge_one(
         question,
         str(ground_truth),

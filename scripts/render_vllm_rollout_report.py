@@ -89,7 +89,7 @@ def main() -> None:
     )
 
     sections = [
-        "# Qwen3.5-2B · DeepEyes V* · 10-question rollout",
+        "# Qwen3.5-2B · V* · 10-question rollout",
         "",
         "## Settings",
         "",

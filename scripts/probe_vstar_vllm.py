@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a bounded Qwen3.5 vLLM sampling probe on the DeepEyes V* data."""
+"""Run a bounded Qwen3.5 vLLM sampling probe on the V* data."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from vllm import LLM, SamplingParams
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = Path("/root/siton-tmp/yzs/ckpts/Qwen3.5-2B")
-DEFAULT_DATA = ROOT / "data/deepeyes_47k/data_0.1.2_visual_toolbox_v2.parquet"
+DEFAULT_DATA = ROOT / "data/visual_toolbox_47k/data_0.1.2_visual_toolbox_v2.parquet"
 
 
 def parse_args() -> argparse.Namespace:

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from groove.deepeyes_reward import (
+from groove.semantic_reward import (
     _judge_one,
     compute_score,
     extract_answer,
@@ -14,12 +14,12 @@ from groove.deepeyes_reward import (
 )
 
 
-class DeepEyesRewardLoopTest(unittest.TestCase):
+class SemanticRewardLoopTest(unittest.TestCase):
     def test_scalar_reward_adapter_forwards_question_and_answers(self):
         expected = {"score": 1.0, "accuracy": 1.0}
-        with patch("groove.deepeyes_reward._judge_one", return_value=expected) as judge:
+        with patch("groove.semantic_reward._judge_one", return_value=expected) as judge:
             result = compute_score(
-                data_source="deepeyes_vstar_grpo",
+                data_source="vstar_grpo",
                 solution_str="<answer>green</answer>",
                 ground_truth="The kite is green.",
                 extra_info={"question": "What color is the kite?"},
@@ -43,13 +43,13 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         response.__enter__.return_value = response
         payload = {"choices": [{"message": {"content": "1"}}]}
         environment = {
-            "DEEPEYES_JUDGE_API_KEY": "test-key",
-            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_JUDGE_API_KEY": "test-key",
+            "GROOVE_JUDGE_MAX_RETRIES": "0",
         }
         with (
             patch.dict("os.environ", environment, clear=False),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response) as urlopen,
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "green", "<answer>green</answer>")
 
@@ -60,19 +60,19 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["format_reward"], 0.0)
 
-    def test_bare_correct_answer_gets_deepeyes_format_penalty(self):
+    def test_bare_correct_answer_gets_format_penalty(self):
         response = MagicMock()
         response.__enter__.return_value = response
         payload = {"choices": [{"message": {"content": "1"}}]}
         environment = {
-            "DEEPEYES_JUDGE_API_KEY": "test-key",
-            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
-            "DEEPEYES_REPETITION_ZERO_REWARD": "false",
+            "GROOVE_JUDGE_API_KEY": "test-key",
+            "GROOVE_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_REPETITION_ZERO_REWARD": "false",
         }
         with (
             patch.dict("os.environ", environment, clear=False),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "green", "green")
 
@@ -86,14 +86,14 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         response.__enter__.return_value = response
         payload = {"choices": [{"message": {"content": "0"}}]}
         environment = {
-            "DEEPEYES_JUDGE_API_KEY": "test-key",
-            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
-            "DEEPEYES_REPETITION_ZERO_REWARD": "false",
+            "GROOVE_JUDGE_API_KEY": "test-key",
+            "GROOVE_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_REPETITION_ZERO_REWARD": "false",
         }
         with (
             patch.dict("os.environ", environment, clear=False),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "green", "blue")
 
@@ -120,10 +120,10 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         payload = {"choices": [{"message": {"content": "1"}}]}
         reasoning = "I first considered blue, but the visible surface is green."
         with (
-            patch.dict("os.environ", {"DEEPEYES_JUDGE_API_KEY": "test-key",
-                                      "DEEPEYES_REPETITION_ZERO_REWARD": "false"}),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response) as urlopen,
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key",
+                                      "GROOVE_REPETITION_ZERO_REWARD": "false"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "green", reasoning + "\n<answer>green</answer>")
         self.assertEqual(result["accuracy"], 1.0)
@@ -159,10 +159,10 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         response = MagicMock()
         response.__enter__.return_value = response
         with (
-            patch.dict("os.environ", {"DEEPEYES_JUDGE_API_KEY": "test-key",
-                                      "DEEPEYES_REPETITION_ZERO_REWARD": "false"}),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
-            patch("groove.deepeyes_reward.json.load",
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key",
+                                      "GROOVE_REPETITION_ZERO_REWARD": "false"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.semantic_reward.json.load",
                   return_value={"choices": [{"message": {"content": "1"}}]}),
         ):
             result = _judge_one("What color?", "green", "Reason. <answer>green</answer> trailing")
@@ -177,7 +177,7 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
     def test_reward_module_supports_verl_external_object_loader(self):
         from verl.utils.import_utils import load_extern_object
 
-        module_path = Path(__file__).parents[1] / "src/groove/deepeyes_reward.py"
+        module_path = Path(__file__).parents[1] / "src/groove/semantic_reward.py"
         loaded = load_extern_object(module_path=str(module_path), object_name="compute_score")
 
         self.assertTrue(callable(loaded))
@@ -188,14 +188,14 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         payload = {"choices": [{"message": {"content": "1"}}]}
         repeated_output = "<answer>" + ("blue " * 40).strip() + "</answer>"
         environment = {
-            "DEEPEYES_JUDGE_API_KEY": "test-key",
-            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
-            "DEEPEYES_REPETITION_ZERO_REWARD": "true",
+            "GROOVE_JUDGE_API_KEY": "test-key",
+            "GROOVE_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_REPETITION_ZERO_REWARD": "true",
         }
         with (
             patch.dict("os.environ", environment, clear=False),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "blue", repeated_output)
 
@@ -231,14 +231,14 @@ class DeepEyesRewardLoopTest(unittest.TestCase):
         response.__enter__.return_value = response
         payload = {"choices": [{"message": {"content": "1"}}]}
         environment = {
-            "DEEPEYES_JUDGE_API_KEY": "test-key",
-            "DEEPEYES_JUDGE_MAX_RETRIES": "0",
-            "DEEPEYES_REPETITION_ZERO_REWARD": "true",
+            "GROOVE_JUDGE_API_KEY": "test-key",
+            "GROOVE_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_REPETITION_ZERO_REWARD": "true",
         }
         with (
             patch.dict("os.environ", environment, clear=False),
-            patch("groove.deepeyes_reward.urllib.request.urlopen", return_value=response),
-            patch("groove.deepeyes_reward.json.load", return_value=payload),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response),
+            patch("groove.semantic_reward.json.load", return_value=payload),
         ):
             result = _judge_one("What color?", "blue", "<answer>blue blue blue</answer>")
 
