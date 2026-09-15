@@ -120,11 +120,16 @@ def build_teacher_prompt_from_student(
     student_prompt: list[dict],
     focus_instruction: str,
     crop_count: int,
+    *,
+    image_kinds: list[str] | None = None,
 ) -> list[dict]:
     """Add privileged evidence while preserving the Student output protocol exactly."""
 
     if crop_count < 0:
         raise ValueError("crop_count must be non-negative")
+    image_kinds = ["crop"] * crop_count if image_kinds is None else image_kinds
+    if len(image_kinds) != crop_count or any(kind not in {"crop", "instance_boxes"} for kind in image_kinds):
+        raise ValueError("image_kinds must match the selected evidence images")
     prompt = student_prompt_template(student_prompt)
     user_indices = [index for index, message in enumerate(prompt) if message.get("role") == "user"]
     if not user_indices:
@@ -132,8 +137,16 @@ def build_teacher_prompt_from_student(
     user_index = user_indices[-1]
     content = str(prompt[user_index]["content"]).rstrip()
     evidence_suffix = ["\n\nHindsight visual focus:\n", focus_instruction.strip()]
-    for index in range(crop_count):
-        evidence_suffix.extend([f"\n\nZoomed visual evidence {index + 1}:\n", "<image>"])
+    for index, kind in enumerate(image_kinds):
+        if kind == "instance_boxes":
+            evidence_suffix.extend([
+                f"\n\nCandidate instance boxes {index + 1}:\n", "<image>",
+                "\nThe boxes are predicted candidates on a copy of the original image. "
+                "Check them against the unmodified image for missed objects, duplicate "
+                "boxes, and false matches.",
+            ])
+        else:
+            evidence_suffix.extend([f"\n\nZoomed visual evidence {index + 1}:\n", "<image>"])
     prompt[user_index]["content"] = content + "".join(evidence_suffix)
     image_count = sum(str(message.get("content", "")).count("<image>") for message in prompt)
     if image_count != crop_count + 1:
@@ -143,13 +156,16 @@ def build_teacher_prompt_from_student(
     return prompt
 
 
-def build_teacher_prompt(question: str, focus_instruction: str, crop_count: int) -> list[dict]:
+def build_teacher_prompt(
+    question: str, focus_instruction: str, crop_count: int, *, image_kinds: list[str] | None = None,
+) -> list[dict]:
     """Compatibility helper for callers without a full Student prompt."""
 
     return build_teacher_prompt_from_student(
         [{"role": "user", "content": f"<image>{question.strip()}"}],
         focus_instruction,
         crop_count,
+        image_kinds=image_kinds,
     )
 
 
@@ -183,6 +199,7 @@ def teacher_payload(
             question,
             evidence.focus.visible_focus_instruction if evidence.focus else "Inspect the relevant details.",
             len(evidence.crops),
+            image_kinds=[crop.kind for crop in evidence.crops],
         )
     else:
         prompt = evidence.teacher_prompt
@@ -222,6 +239,7 @@ class TeacherEvidenceBuilder:
                         student_prompt,
                         cached.focus.visible_focus_instruction,
                         len(cached.crops),
+                        image_kinds=[crop.kind for crop in cached.crops],
                     )
                     if cached.teacher_prompt != rebased_prompt:
                         cached = cached.model_copy(update={"teacher_prompt": rebased_prompt})
@@ -273,17 +291,20 @@ class TeacherEvidenceBuilder:
                 focus=focus,
                 original_image_path=group.image_path.resolve(),
                 crops=crops,
+                tool_trace=deepcopy(getattr(self.analyzer, "last_tool_trace", [])),
                 teacher_prompt=(
                     build_teacher_prompt_from_student(
                         student_prompt,
                         focus.visible_focus_instruction,
                         len(crops),
+                        image_kinds=[crop.kind for crop in crops],
                     )
                     if student_prompt is not None
                     else build_teacher_prompt(
                         group.question,
                         focus.visible_focus_instruction,
                         len(crops),
+                        image_kinds=[crop.kind for crop in crops],
                     )
                 ),
             )
@@ -293,6 +314,7 @@ class TeacherEvidenceBuilder:
                 status="error",
                 original_image_path=group.image_path,
                 reason=f"{type(exc).__name__}: {exc}",
+                tool_trace=deepcopy(getattr(self.analyzer, "last_tool_trace", [])),
             )
         return self._save(result, record_path)
 

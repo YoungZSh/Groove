@@ -10,6 +10,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -19,6 +20,7 @@ from typing import Protocol
 from PIL import Image
 
 from .grounding import expand_box
+from .instance_boxes import normalize_instance_boxes, render_instance_boxes
 from .schemas import FocusProgram, GroupRollout
 
 
@@ -56,6 +58,22 @@ After tool inspection is complete, return only this JSON object:
   "selected_candidate_ids": ["one to three candidate IDs from tool results"],
   "confidence": 0.0
 }"""
+
+INSTANCE_BOX_GUIDANCE = """
+
+For counting, use ground_instances to inspect candidate objects across the full
+image, and use ground_image for ambiguous local details if needed. A ground_instances
+candidate is one full-image evidence view containing all returned boxes. Select it
+by its candidate_id just like a crop. Verify that the boxes mark distinct relevant
+objects; inspect missed objects, duplicates, and false matches. Tool predictions
+are not verified counts. Keep the Teacher instruction about visual inspection,
+without stating a total or assuming that every box is correct.
+"""
+
+COUNTING_GUIDANCE = INSTANCE_BOX_GUIDANCE.replace("ground_instances", "count_objects") + (
+    "For an enclosure or spatially restricted counting question, specify the relevant "
+    "region from the original image. Check the resulting boxes against that region.\n"
+)
 
 
 class Analyzer(Protocol):
@@ -152,6 +170,31 @@ def _tool_feedback_message(
     """Build a user multimodal message containing the exact tool-returned crop."""
     if result.get("error"):
         return None
+    if tool_name in {"ground_instances", "count_objects"}:
+        if not result.get("found"):
+            return None
+        with Image.open(image_path) as loaded:
+            image = loaded.convert("RGB")
+        if result.get("image_size") != list(image.size):
+            raise ValueError("instance preview coordinates do not match the original image")
+        instances = normalize_instance_boxes(result.get("instances"), image.size)
+        preview = render_instance_boxes(image, instances)
+        if max_side <= 0:
+            raise ValueError("max_side must be positive")
+        preview.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        encoded = BytesIO()
+        preview.save(encoded, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
+        return {"role": "user", "content": [
+            {"type": "text", "text": (
+                f"Candidate `{result.get('candidate_id', '')}`. This is the original image "
+                f"with candidate instance boxes for `{arguments.get('query') or arguments.get('target', '')}`. "
+                "Inspect each box against the original image for false matches, duplicate "
+                "coverage, and missed objects. Select this candidate only if its visual "
+                "evidence is useful; the boxes do not constitute a verified count."
+            )},
+            {"type": "image_url", "image_url": {"url": url}},
+        ]}
     bbox_key = "bbox" if tool_name == "ground_image" else "crop_bbox"
     bbox = result.get(bbox_key)
     preview_url = _crop_data_url(image_path, bbox, max_side=max_side)
@@ -443,7 +486,12 @@ class OpenAICompatibleAnalyzer:
         registry = AnalyzerVisionToolRegistry()
         if self.config.tool_feedback_max_side <= 0:
             raise ValueError("ANALYZER_TOOL_FEEDBACK_MAX_SIDE must be positive")
-        tool_messages = list(messages)
+        tool_messages = deepcopy(messages)
+        tool_names = {schema.get("function", {}).get("name") for schema in registry.schemas}
+        if "count_objects" in tool_names:
+            tool_messages[0]["content"] += COUNTING_GUIDANCE
+        elif "ground_instances" in tool_names:
+            tool_messages[0]["content"] += INSTANCE_BOX_GUIDANCE
         self.last_tool_trace = []
         for _tool_round in range(self.config.max_tool_rounds):
             body = self._base_body(tool_messages)
@@ -527,6 +575,19 @@ class OpenAICompatibleAnalyzer:
             if not isinstance(result, dict) or result.get("error"):
                 continue
             name = str(trace.get("name", ""))
+            if name in {"ground_instances", "count_objects"}:
+                size = result.get("image_size")
+                if not result.get("found") or not isinstance(size, list) or len(size) != 2:
+                    continue
+                instances = normalize_instance_boxes(result.get("instances"), tuple(size))
+                if instances:
+                    candidates.append({
+                        "candidate_id": trace.get("candidate_id"), "tool": name,
+                        "query": trace.get("arguments", {}).get("query", result.get("query", "")),
+                        "bbox": [0, 0, *size], "kind": "instance_boxes",
+                        "instance_candidates": len(instances),
+                    })
+                continue
             bbox_key = "bbox" if name == "ground_image" else "crop_bbox"
             bbox = result.get(bbox_key)
             if not isinstance(bbox, list) or len(bbox) != 4:
@@ -610,7 +671,18 @@ class OpenAICompatibleAnalyzer:
                 continue
             if candidate_id in candidate_regions:
                 raise ValueError(f"Duplicate Analyzer candidate ID: {candidate_id}")
-            if trace.get("name") == "read_text" and isinstance(result.get("crop_bbox"), list):
+            if trace.get("name") in {"ground_instances", "count_objects"} and result.get("found"):
+                if result.get("image_size") != list(image_size):
+                    raise ValueError("instance evidence coordinates do not match the original image")
+                instances = normalize_instance_boxes(result.get("instances"), image_size)
+                if instances:
+                    candidate_regions[candidate_id] = ToolRegion(
+                        query=str(result.get("query", "object instances")),
+                        expanded_box=(0, 0, *image_size),
+                        score=sum(item.score for item in instances) / len(instances),
+                        source="grounding_dino", kind="instance_boxes", instances=instances,
+                    )
+            elif trace.get("name") == "read_text" and isinstance(result.get("crop_bbox"), list):
                 bbox = result["crop_bbox"]
                 if len(bbox) == 4:
                     tight_bbox = _tight_ocr_text_bbox(result, reference_text=reference_text)

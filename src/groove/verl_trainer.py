@@ -157,6 +157,8 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         status_counts = defaultdict(int)
         route_counts = defaultdict(int)
         crop_counts: list[int] = []
+        instance_box_image_counts: list[int] = []
+        instance_box_counts: list[int] = []
         crop_area_fractions: list[float] = []
         crop_scores: list[float] = []
         dino_scores: list[float] = []
@@ -260,6 +262,8 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             if evidence.status == "ready" and evidence.focus is not None:
                 route_counts[evidence.focus.crucial_evidence_type] += 1
                 crop_counts.append(len(evidence.crops))
+                instance_box_image_counts.append(sum(crop.kind == "instance_boxes" for crop in evidence.crops))
+                instance_box_counts.append(sum(len(crop.instances) for crop in evidence.crops))
                 crop_area_fractions.extend(float(crop.area_fraction) for crop in evidence.crops)
                 crop_scores.extend(float(crop.score) for crop in evidence.crops)
                 sanitized_count += int(evidence.focus.visible_focus_instruction == SAFE_FOCUS_FALLBACK)
@@ -304,6 +308,8 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         if crop_counts:
             metrics["groove/crop_count_mean"] = float(np.mean(crop_counts))
             metrics["groove/crop_count_max"] = float(max(crop_counts))
+            metrics["groove/instance_box_image_count_mean"] = float(np.mean(instance_box_image_counts))
+            metrics["groove/instance_box_count_mean"] = float(np.mean(instance_box_counts))
         if crop_area_fractions:
             metrics["groove/crop_area_fraction_mean"] = float(np.mean(crop_area_fractions))
         if crop_scores:

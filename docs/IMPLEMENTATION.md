@@ -112,6 +112,83 @@ there is no IoU deduplication or implicit latest-round preference. Unselected bo
 remain audit-only. Exact grounding phrases stay in the private execution record and
 are not Student targets.
 
+### Full-image instance boxes for counting
+
+Counting can opt into `ANALYZER_ENABLE_INSTANCE_BOXES=true`. This exposes the
+native `ground_instances(query)` tool in addition to `ground_image` and
+`read_text`, with an extra Analyzer instruction to verify all candidate boxes.
+It uses the existing DINO detector as a multi-instance baseline. The local
+detector returns its full thresholded candidate set; a remote DINO server must
+support the `return_all=true` request and return an `instances` array. The
+updated `remote_tools/dino_server.py` advertises `ground_instances` in its health
+response. An older single-box response is rejected rather than treated as an
+exhaustive detection result. The opt-in is disabled by default until the serving
+endpoint is updated. Editing the server source locally does not deploy it.
+
+Each instance contains a finite positive-area `bbox` in original-image pixels
+and a detector `score`. Geometry is clipped to image bounds, with invalid boxes
+failing the result. Candidate order and overlaps are preserved; no implicit NMS,
+instance-count gate, or confidence-based advantage weighting is introduced.
+
+One tool result is one candidate image, even when it contains more than three
+boxes. The Analyzer sees a preview of the full original image with all candidate
+boxes, and selects its candidate ID through the existing one-to-three-image
+selection contract. It may combine that view with ordinary detail crops.
+`ToolRegion.kind=instance_boxes` and `instances` carry the validated coordinates
+to the renderer. The `crops` field retains its historical name in saved evidence;
+its selected images now carry `kind=crop` or `kind=instance_boxes`.
+
+The renderer produces a separate native-resolution PNG with thin, unfilled red
+rectangles. It does not paint instance IDs, a total count, OCR strings, or answer
+text. The original image file is preserved. Teacher input contains the original
+image first, then the selected supplementary images in their selected order.
+The prompt labels overlays as candidate instance boxes and asks the Teacher to
+check misses, duplicate boxes, and false matches against the original image.
+The Student still sees only its original image and question. Reward, GRPO,
+sampled-token OPSD, reference KL, and optimizer behavior are unchanged.
+
+Complete tool traces are now persisted privately in `TeacherEvidence.tool_trace`
+for new ready/error evidence records, including unselected candidates. They are
+never inserted into the Teacher prompt or Student input. Historical records
+without this field remain readable but do not acquire missing call histories.
+The trainer also logs selected instance-box image and box counts as diagnostics;
+these are candidate counts, not verified object counts or rewards.
+
+### Independent counting tool with a fixed DINO baseline
+
+`ANALYZER_ENABLE_COUNTING=true` exposes `count_objects(target, region=None)` as
+the counting interface. When both counting flags are enabled, the public tool
+list exposes `count_objects` instead of the raw `ground_instances` prototype.
+The regular `ground_image` and `read_text` tools remain available. Thresholds or
+a desired object count are not accepted as tool-call arguments.
+
+The first backend is DINO with a fixed profile in `src/groove/counting.py`:
+box threshold 0.35 and text threshold 0.25. Hard NMS is disabled by default:
+different occluded objects can have heavily overlapping boxes. The sheep probe
+found that IoU 0.5 suppression removed one overlapping candidate and reduced
+the ROI result from eight boxes to seven. Preserve such candidates for visual
+verification. An explicit NMS profile remains available for offline comparisons;
+it does not deduplicate Analyzer candidate images, ordinary crops, or raw
+`ground_instances` results.
+These values are baseline settings, not a promise of accurate counting on every
+image. They must not be fitted to a known answer on an individual example.
+
+For region-restricted questions the Analyzer can supply a rectangle in the
+original coordinate system. The tool crops that region before detection, maps
+the resulting boxes back into the full-image coordinate system, and uses the
+shared unfilled-box renderer. This preserves the global scene in the Teacher's
+marked image. Out-of-bounds regions are rejected, not silently clipped: this
+lets the Analyzer correct mixed coordinate units rather than count an unintended
+partial scene. With a remote detector, only the ROI is sent to the multi-instance
+endpoint; temporary ROI files are local and are removed after the request.
+
+The tool returns an estimated count, kept candidate indices, fixed profile,
+and original-coordinate boxes for inspection/audit. Only the image and the
+answer-neutral focus enter the Teacher prefix. Empty or invalid detections do
+not fabricate evidence. The serving DINO endpoint still needs multi-instance
+support; the cached local detector can be used for isolated CPU probes without
+changing or restarting the deployed services.
+
 ## Mask semantics
 
 The following mask semantics apply when the joint objective is enabled with

@@ -201,11 +201,30 @@ The Analyzer contract is defined in `src/groove/analyzer.py`.
   latest-crop preference.
 - One crop is sufficient for a single target. Multiple images are allowed for
   comparison, counting, or spatial relationships.
+- Counting overlays are available with `ANALYZER_ENABLE_INSTANCE_BOXES=true`
+  after deploying the multi-instance DINO endpoint. `ground_instances` returns
+  candidate boxes; one full-image overlay is one selectable evidence candidate,
+  regardless of its number of boxes. Preserve the original image, draw only
+  unfilled boxes (no IDs or total answer), and keep the overlay Teacher-only.
+  The flag defaults to false for compatibility with the existing single-box
+  service. Do not silently accept a single-box response as a counting result.
+- The independent `count_objects(target, region=None)` tool is opt-in via
+  `ANALYZER_ENABLE_COUNTING=true`. It uses a fixed DINO baseline profile and
+  preserves overlapping detections by default: overlap does not prove two
+  boxes represent the same object. Optional NMS is for explicit offline
+  comparisons, never Analyzer candidate images or the existing crop selection
+  path. Region
+  coordinates and returned boxes use the original image coordinate system.
+  Do not expose per-example threshold tuning or an expected count to the
+  Analyzer. This tool takes precedence over the raw `ground_instances` tool
+  when both flags are enabled.
 - `visible_focus_instruction` must be answer-neutral and must not leak OCR text,
   answer assertions, option letters, rewards, or rollout outcomes.
 
-Keep crop images and exact tool traces private to the Teacher/audit path.
-Unselected crops remain audit-only.
+Keep crop images, instance overlays, and exact tool traces private to the
+Teacher/audit path. New evidence records persist complete `tool_trace` data;
+historical missing traces cannot be reconstructed. Unselected candidates remain
+audit-only.
 
 ## Current 2B experiment settings
 

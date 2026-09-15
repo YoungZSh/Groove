@@ -8,6 +8,7 @@ from typing import Protocol
 
 from PIL import Image
 
+from .instance_boxes import normalize_instance_boxes, render_instance_boxes
 from .schemas import FocusProgram, ObjectCrop, ToolRegion
 
 
@@ -77,6 +78,20 @@ def crop_tool_regions(
     original_area = image.width * image.height
     crops: list[ObjectCrop] = []
     for index, region in enumerate(regions, start=1):
+        if region.kind == "instance_boxes":
+            instances = normalize_instance_boxes(region.instances, image.size)
+            annotated = render_instance_boxes(image, instances)
+            path = output_dir / f"tool-boxes-{index:02d}.png"
+            if path.resolve() == image_path.resolve():
+                raise ValueError("instance evidence must not overwrite the original image")
+            annotated.save(path)
+            crops.append(ObjectCrop(
+                query=region.query, score=region.score,
+                raw_box=(0.0, 0.0, float(image.width), float(image.height)),
+                expanded_box=(0, 0, image.width, image.height), path=path.resolve(),
+                area_fraction=1.0, kind="instance_boxes", instances=instances,
+            ))
+            continue
         x1, y1, x2, y2 = region.expanded_box
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(image.width, x2), min(image.height, y2)
@@ -133,7 +148,7 @@ class GroundingDinoGrounder:
             self._model.to(dtype=torch.float16)
         return self._processor, self._model
 
-    def _detect_one(self, image: Image.Image, query: str) -> tuple[tuple[float, ...], float] | None:
+    def _detect_all(self, image: Image.Image, query: str) -> list[tuple[tuple[float, ...], float]]:
         import torch
 
         processor, model = self._load()
@@ -157,10 +172,12 @@ class GroundingDinoGrounder:
             result = processor.post_process_grounded_object_detection(outputs, **kwargs)[0]
         scores = result["scores"].detach().float().cpu()
         boxes = result["boxes"].detach().float().cpu()
-        if scores.numel() == 0:
-            return None
-        best = int(scores.argmax())
-        return tuple(float(value) for value in boxes[best].tolist()), float(scores[best])
+        return [(tuple(float(value) for value in box.tolist()), float(score))
+                for box, score in zip(boxes, scores, strict=True)]
+
+    def _detect_one(self, image: Image.Image, query: str) -> tuple[tuple[float, ...], float] | None:
+        detections = self._detect_all(image, query)
+        return max(detections, key=lambda item: item[1]) if detections else None
 
     def crop_objects(
         self,

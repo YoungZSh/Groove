@@ -16,11 +16,15 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from PIL import Image
 
 from .grounding import GroundingDinoConfig, GroundingDinoGrounder, expand_box
+from .counting import DEFAULT_COUNTING_PROFILE, counting_region, select_counting_instances
+from .instance_boxes import normalize_instance_boxes
+from .schemas import InstanceBox
 
 
 NON_ENGLISH_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -87,6 +91,42 @@ READ_TEXT_TOOL_SCHEMA: dict[str, Any] = {
 
 ANALYZER_TOOL_SCHEMAS = [GROUND_IMAGE_TOOL_SCHEMA, READ_TEXT_TOOL_SCHEMA]
 
+GROUND_INSTANCES_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ground_instances",
+        "description": (
+            "Find candidate instances of one object category throughout the original image. "
+            "Use for counting: a full-image preview shows an unfilled box around each candidate. "
+            "Check for missed objects, duplicate boxes, and false matches before selecting the evidence. "
+            "The returned candidates are predictions, not a verified count."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "A short English object category, such as sheep."}},
+            "required": ["query"],
+        },
+    },
+}
+
+COUNT_OBJECTS_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "count_objects",
+        "description": (
+            "Detect and count candidate instances of one object category and return an original-image "
+            "preview with boxes. Filtering is fixed inside this tool. For a question restricted to "
+            "an enclosure or image area, provide that region in original-image pixels. Verify missed "
+            "objects and false matches; the estimated count is not a ground-truth answer."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "Short English object category, for example sheep."},
+            "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                       "description": "Optional [x1, y1, x2, y2] limiting counting to the relevant scene region."},
+        }, "required": ["target"]},
+    },
+}
+
 
 @dataclass(frozen=True)
 class AnalyzerVisionToolConfig:
@@ -101,6 +141,8 @@ class AnalyzerVisionToolConfig:
     grounding_local_files_only: bool = True
     grounding_url: str = ""
     ocr_url: str = ""
+    enable_instance_boxes: bool = False
+    enable_counting: bool = False
 
     @classmethod
     def from_env(cls) -> "AnalyzerVisionToolConfig":
@@ -130,6 +172,10 @@ class AnalyzerVisionToolConfig:
             in {"1", "true", "yes", "on"},
             grounding_url=os.environ.get("ANALYZER_GROUNDING_URL", "").rstrip("/"),
             ocr_url=os.environ.get("ANALYZER_OCR_URL", "").rstrip("/"),
+            enable_instance_boxes=os.environ.get("ANALYZER_ENABLE_INSTANCE_BOXES", "false").lower()
+            in {"1", "true", "yes", "on"},
+            enable_counting=os.environ.get("ANALYZER_ENABLE_COUNTING", "false").lower()
+            in {"1", "true", "yes", "on"},
         )
 
 
@@ -143,6 +189,7 @@ class AnalyzerVisionToolRegistry:
         if not self.config.ocr_url and not self.config.ocr_script.is_file():
             raise FileNotFoundError(f"Analyzer OCR runner is unavailable: {self.config.ocr_script}")
         self._grounder = None
+        self._counting_grounder = None
         if not self.config.grounding_url:
             self._grounder = GroundingDinoGrounder(
                 GroundingDinoConfig(
@@ -192,7 +239,9 @@ class AnalyzerVisionToolRegistry:
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
-        return ANALYZER_TOOL_SCHEMAS
+        if self.config.enable_counting:
+            return [*ANALYZER_TOOL_SCHEMAS, COUNT_OBJECTS_TOOL_SCHEMA]
+        return [*ANALYZER_TOOL_SCHEMAS, GROUND_INSTANCES_TOOL_SCHEMA] if self.config.enable_instance_boxes else ANALYZER_TOOL_SCHEMAS
 
     @staticmethod
     def _bbox(value: Any, image_size: tuple[int, int]) -> tuple[float, float, float, float]:
@@ -245,6 +294,82 @@ class AnalyzerVisionToolRegistry:
             "bbox": list(expanded),
             "image_size": list(image.size),
         }
+
+    def ground_instances(self, image_path: Path, query: str) -> dict[str, Any]:
+        if not self.config.enable_instance_boxes:
+            raise ValueError("ground_instances is not enabled")
+        query = str(query).strip()
+        if not query or NON_ENGLISH_CJK.search(query):
+            raise ValueError("ground_instances requires a nonempty English object query")
+        with Image.open(image_path) as loaded:
+            image_size = loaded.size
+        if self.config.grounding_url:
+            result = self._remote_call(self.config.grounding_url, image_path, {
+                "query": query, "return_all": True,
+                "box_threshold": self.config.grounding_box_threshold,
+                "text_threshold": self.config.grounding_text_threshold,
+            })
+            if "instances" not in result:
+                raise ValueError("DINO endpoint lacks multi-instance support; update its server before enabling ground_instances")
+            if result.get("image_size") != list(image_size):
+                raise ValueError("DINO instance coordinates do not match the original image size")
+            values = result["instances"]
+        else:
+            with Image.open(image_path) as loaded:
+                image = loaded.convert("RGB")
+            assert self._grounder is not None
+            values = [{"bbox": list(box), "score": score} for box, score in self._grounder._detect_all(image, query)]
+        instances = normalize_instance_boxes(values, image_size)
+        return {"query": query, "found": bool(instances), "image_size": list(image_size),
+                "instances": [item.model_dump(mode="json") for item in instances]}
+
+    def count_objects(self, image_path: Path, target: str, region=None) -> dict[str, Any]:
+        if not self.config.enable_counting:
+            raise ValueError("count_objects is not enabled")
+        target = str(target).strip()
+        if not target or NON_ENGLISH_CJK.search(target):
+            raise ValueError("count_objects requires a nonempty English target")
+        with Image.open(image_path) as loaded:
+            image = loaded.convert("RGB")
+        roi = counting_region(region, image.size)
+        cropped = image.crop(roi)
+        profile = DEFAULT_COUNTING_PROFILE
+        if self.config.grounding_url:
+            # The remote detector sees the ROI itself. Its boxes must be mapped
+            # back to the original coordinate system before drawing evidence.
+            with TemporaryDirectory(prefix="groove-counting-") as temporary:
+                path = Path(temporary) / "region.png"
+                cropped.save(path)
+                result = self._remote_call(self.config.grounding_url, path, {
+                    "query": target, "return_all": True,
+                    "box_threshold": profile.box_threshold, "text_threshold": profile.text_threshold,
+                })
+            if "instances" not in result:
+                raise ValueError("DINO endpoint lacks multi-instance support for count_objects")
+            if result.get("image_size") != list(cropped.size):
+                raise ValueError("counting detector coordinates do not match the requested region")
+            raw = result["instances"]
+        else:
+            if self._counting_grounder is None:
+                self._counting_grounder = GroundingDinoGrounder(GroundingDinoConfig(
+                    model=self.config.grounding_model, device=self.config.grounding_device,
+                    local_files_only=self.config.grounding_local_files_only,
+                    box_threshold=profile.box_threshold, text_threshold=profile.text_threshold))
+            raw = [{"bbox": list(box), "score": score}
+                   for box, score in self._counting_grounder._detect_all(cropped, target)]
+        candidates = normalize_instance_boxes(raw, cropped.size)
+        indices = select_counting_instances(candidates, profile)
+        original_candidates = [InstanceBox(bbox=(item.bbox[0]+roi[0], item.bbox[1]+roi[1],
+                                                item.bbox[2]+roi[0], item.bbox[3]+roi[1]), score=item.score)
+                               for item in candidates]
+        instances = [original_candidates[i] for i in indices]
+        return {"query": target, "found": bool(instances), "image_size": list(image.size),
+                "region": list(roi), "estimated_count": len(instances), "backend": "grounding_dino",
+                "raw_candidate_count": len(candidates), "kept_candidate_indices": indices,
+                "candidates_before_filtering": [item.model_dump(mode="json") for item in original_candidates],
+                "profile": {"box_threshold": profile.box_threshold, "text_threshold": profile.text_threshold,
+                            "nms_iou_threshold": profile.nms_iou_threshold},
+                "instances": [item.model_dump(mode="json") for item in instances]}
 
     def read_text(
         self,
@@ -302,6 +427,12 @@ class AnalyzerVisionToolRegistry:
         raise RuntimeError("PaddleOCR returned no JSON tool result")
 
     def execute(self, image_path: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "count_objects":
+            if set(arguments) - {"target", "region"}:
+                raise ValueError("count_objects accepts only target and region; filtering is fixed")
+            return self.count_objects(image_path, target=arguments.get("target", ""), region=arguments.get("region"))
+        if name == "ground_instances":
+            return self.ground_instances(image_path, query=arguments.get("query", ""))
         if name == "ground_image":
             return self.ground_image(
                 image_path,

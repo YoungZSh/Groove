@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +32,25 @@ class GroupRollout(BaseModel):
         return len(outcomes) > 1
 
 
+class InstanceBox(BaseModel):
+    """One detector candidate in original-image pixel coordinates, not a GT label."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bbox: tuple[float, float, float, float]
+    score: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox(cls, values):
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("instance bbox coordinates must be finite")
+        x1, y1, x2, y2 = values
+        if x1 >= x2 or y1 >= y2:
+            raise ValueError("instance bbox must have positive area")
+        return values
+
+
 class ToolRegion(BaseModel):
     """Private Analyzer-selected region, never inserted as Teacher text."""
 
@@ -38,6 +58,14 @@ class ToolRegion(BaseModel):
     expanded_box: tuple[int, int, int, int]
     score: float = Field(ge=0.0, le=1.0)
     source: str
+    kind: Literal["crop", "instance_boxes"] = "crop"
+    instances: list[InstanceBox] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_instances(self):
+        if (self.kind == "instance_boxes") != bool(self.instances):
+            raise ValueError("instance_boxes evidence requires nonempty instances; crops must not have instances")
+        return self
 
 
 class FocusProgram(BaseModel):
@@ -80,6 +108,7 @@ class FocusProgram(BaseModel):
 
 
 class ObjectCrop(BaseModel):
+    """A selected Teacher image; the legacy name also covers full-frame overlays."""
     model_config = ConfigDict(extra="forbid")
 
     query: str
@@ -88,6 +117,14 @@ class ObjectCrop(BaseModel):
     expanded_box: tuple[int, int, int, int]
     path: Path
     area_fraction: float
+    kind: Literal["crop", "instance_boxes"] = "crop"
+    instances: list[InstanceBox] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_instances(self):
+        if (self.kind == "instance_boxes") != bool(self.instances):
+            raise ValueError("instance_boxes image requires nonempty instances; crops must not have instances")
+        return self
 
 
 class TeacherEvidence(BaseModel):
@@ -100,6 +137,7 @@ class TeacherEvidence(BaseModel):
     crops: list[ObjectCrop] = Field(default_factory=list)
     teacher_prompt: list[dict] | None = None
     reason: str | None = None
+    tool_trace: list[dict] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def ready_requires_evidence(self) -> "TeacherEvidence":

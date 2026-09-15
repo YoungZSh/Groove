@@ -16,10 +16,8 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
 MODEL_PATH = os.environ.get("DINO_MODEL_PATH", "/data4/yzs/model_cache/grounding-dino-base")
-processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
-model = AutoModelForZeroShotObjectDetection.from_pretrained(
-    MODEL_PATH, local_files_only=True, dtype=torch.float32
-).cuda().eval()
+processor = None
+model = None
 NON_ENGLISH_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
@@ -43,6 +41,9 @@ def ground(payload):
     margin = float(payload.get("context_margin", 0.25))
     threshold = float(payload.get("box_threshold", 0.15))
     text_threshold = float(payload.get("text_threshold", 0.15))
+    return_all = payload.get("return_all", False)
+    if not isinstance(return_all, bool):
+        raise ValueError("return_all must be a boolean")
     inputs = {k: v.cuda() for k, v in processor(images=image, text=query, return_tensors="pt").items()}
     with torch.inference_mode():
         outputs = model(**inputs)
@@ -55,6 +56,22 @@ def ground(payload):
     )[0]
     if result["scores"].numel() == 0:
         value = {"found": False, "query": query.rstrip("."), "image_size": list(image.size)}
+        if return_all:
+            value["instances"] = []
+        del outputs, inputs, result
+        torch.cuda.empty_cache()
+        return value
+    if return_all:
+        # Counting needs the complete thresholded candidate set. Keep overlaps
+        # and scores available for Analyzer verification; do not invent a count.
+        boxes = result["boxes"].detach().float().cpu().tolist()
+        scores = result["scores"].detach().float().cpu().tolist()
+        value = {
+            "found": True, "query": query.rstrip("."), "image_size": list(image.size),
+            "instances": [{"bbox": [float(v) for v in box], "score": float(score)}
+                          for box, score in zip(boxes, scores, strict=True)],
+        }
+        del outputs, inputs, result
         torch.cuda.empty_cache()
         return value
     index = int(result["scores"].argmax())
@@ -82,7 +99,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        self._reply(200, {"status": "ok", "device": "cuda", "tool": "ground_image"})
+        self._reply(200, {"status": "ok", "device": "cuda", "tool": "ground_image",
+                          "capabilities": ["ground_image", "ground_instances"]})
 
     def do_POST(self):
         try:
@@ -97,4 +115,14 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-HTTPServer(("127.0.0.1", int(os.environ.get("DINO_PORT", "8011"))), Handler).serve_forever()
+def main():
+    global processor, model
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        MODEL_PATH, local_files_only=True, dtype=torch.float32
+    ).cuda().eval()
+    HTTPServer(("127.0.0.1", int(os.environ.get("DINO_PORT", "8011"))), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
