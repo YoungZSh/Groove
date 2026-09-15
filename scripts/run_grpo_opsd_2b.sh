@@ -7,13 +7,14 @@ DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_opsd_2200_seed20260904}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-grpo-opsd-reasoning-answer-seed20260904}"
 
 # Keep the established model, split, sampling, and optimizer settings. Both 2B
-# launchers now use plain reasoning plus answer tags; their seeds still differ.
-export MODEL_PATH="/root/siton-tmp/yzs/ckpts/Qwen3.5-2B"
+# launchers use plain reasoning plus answer tags; their default seeds differ.
+export MODEL_PATH="${MODEL_PATH:-/root/siton-tmp/yzs/ckpts/Qwen3.5-2B}"
 export PREPARE_DATA=false
 export DATA_OUTPUT_DIR="$DATA_DIR"
 export TRAIN_FILE="$DATA_DIR/train.parquet"
-export TEST_FILE="$DATA_DIR/validation.parquet"
-export SEED=20260904
+export TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}"
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-8}"
+export SEED="${SEED:-20260904}"
 
 export TRAINER_LOGGER='["console","wandb"]'
 export WANDB_MODE=offline
@@ -21,8 +22,8 @@ export WANDB_PROJECT=groove-visual-evidence
 export WANDB_NAME="$EXPERIMENT_NAME"
 export WANDB_DIR="$PROJECT_ROOT/outputs/wandb"
 
-export CUDA_VISIBLE_DEVICES=0,1
-export N_GPUS=2
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export N_GPUS="${N_GPUS:-2}"
 export OPSD_ENABLED=true
 export OPSD_ADVANTAGE_COEF=0.01
 export OPSD_ADVANTAGE_CLIP=null
@@ -52,9 +53,10 @@ export PPO_MINI_BATCH_SIZE=16
 # gate below, long failed trajectories receive proportionally more gradient.
 export LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
 export ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-32768}"
-export MAX_PROMPT_LENGTH=2048
+# Preserve the complete high-resolution V*Bench validation prompts.
+export MAX_PROMPT_LENGTH=9216
 export MAX_RESPONSE_LENGTH=1024
-export MAX_MODEL_LEN=9216
+export MAX_MODEL_LEN=10240
 export ENABLE_THINKING=false
 export STUDENT_RESPONSE_FORMAT=reasoning_answer
 export STUDENT_IMAGE_MAX_PIXELS=null
@@ -63,7 +65,7 @@ export MODEL_USE_REMOVE_PADDING=true
 
 export ROLLOUT_TENSOR_PARALLEL_SIZE=1
 export ROLLOUT_MAX_NUM_SEQS=64
-export ROLLOUT_MAX_NUM_BATCHED_TOKENS=32768
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-32768}"
 export ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
 export ROLLOUT_ENFORCE_EAGER=true
 
@@ -82,7 +84,7 @@ export REFERENCE_KL_COEF=0.01
 export CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/semantic_reward.py"
 export CUSTOM_REWARD_FUNCTION_NAME=compute_score
 export REWARD_MANAGER_NAME=naive
-export REWARD_NUM_WORKERS=1
+export REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-1}"
 # Negative-only format penalty while retaining 1.0 as the
 # maximum semantic reward: score = accuracy - 0.2 * format_error.
 export ANSWER_REWARD_WEIGHT=1.0

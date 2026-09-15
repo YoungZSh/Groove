@@ -20,7 +20,10 @@ class TrainingLauncherTest(unittest.TestCase):
     def test_both_launchers_accept_an_existing_data_directory(self):
         self._check_launchers(override_data=True)
 
-    def _check_launchers(self, *, override_data):
+    def test_both_launchers_accept_an_independent_validation_file(self):
+        self._check_launchers(override_data=False, override_validation=True)
+
+    def _check_launchers(self, *, override_data, override_validation=False):
         with TemporaryDirectory() as folder:
             project = Path(folder) / "project"
             (project / "scripts").mkdir(parents=True)
@@ -34,8 +37,12 @@ class TrainingLauncherTest(unittest.TestCase):
                 data_paths = dict.fromkeys(data_paths, Path(folder) / "existing split")
             for data in set(data_paths.values()):
                 data.mkdir(parents=True)
-                for split in ["train.parquet", "validation.parquet"]:
-                    (data / split).touch()
+                (data / "train.parquet").touch()
+            validation = project / "data/vstar_bench/validation.parquet"
+            if override_validation:
+                validation = Path(folder) / "custom validation.parquet"
+            validation.parent.mkdir(parents=True, exist_ok=True)
+            validation.touch()
             binary = Path(folder) / "bin" / "python"
             binary.parent.mkdir()
             binary.write_text(
@@ -57,9 +64,16 @@ class TrainingLauncherTest(unittest.TestCase):
                         "GROOVE_REPETITION_ZERO_REWARD": "false",
                         "GROOVE_REPETITION_MIN_REPEATS": "7",
                     }
-                    env.pop("DATA_DIR", None)
+                    for key in (
+                        "DATA_DIR", "VALIDATION_FILE", "MODEL_PATH", "SEED", "N_GPUS", "CUDA_VISIBLE_DEVICES",
+                        "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS",
+                        "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
+                    ):
+                        env.pop(key, None)
                     if override_data:
                         env["DATA_DIR"] = str(data_paths[name])
+                    if override_validation:
+                        env["VALIDATION_FILE"] = str(validation)
                     result = subprocess.run(
                         ["bash", str(project / "scripts" / name)], cwd=project,
                         env=env,
@@ -75,8 +89,15 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("data.train_batch_size=16", args)
                     self.assertIn("actor_rollout_ref.rollout.n=8", args)
                     self.assertIn("data.max_response_length=1024", args)
+                    self.assertIn("data.max_prompt_length=9216", args)
+                    self.assertIn("actor_rollout_ref.rollout.max_model_len=10240", args)
+                    self.assertIn("data.val_batch_size=8", args)
+                    self.assertIn("actor_rollout_ref.rollout.agent.num_workers=8", args)
+                    self.assertIn("reward.num_workers=1", args)
+                    self.assertIn("actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768", args)
+                    self.assertIn("actor_rollout_ref.rollout.max_num_batched_tokens=32768", args)
                     self.assertIn(f"data.train_files=['{data_paths[name] / 'train.parquet'}']", args)
-                    self.assertIn(f"data.val_files=['{data_paths[name] / 'validation.parquet'}']", args)
+                    self.assertIn(f"data.val_files=['{validation}']", args)
                     self.assertIn(
                         f"reward.custom_reward_function.path={project / 'src/groove/semantic_reward.py'}",
                         args,

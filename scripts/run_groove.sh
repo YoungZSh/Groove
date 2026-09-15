@@ -48,7 +48,8 @@ if [[ "${PREPARE_DATA:-true}" == "true" ]]; then
     --random-state "$SEED" \
     --max-source-rows "$DATA_MAX_SOURCE_ROWS"
 elif [[ ! -f "$TRAIN_FILE" || ! -f "$TEST_FILE" ]]; then
-  echo "Missing prepared data; set PREPARE_DATA=true or generate $DATA_OUTPUT_DIR first." >&2
+  echo "Missing prepared data; required training file: $TRAIN_FILE; validation file: $TEST_FILE." >&2
+  echo "Prepare the requested splits first; V*Bench validation uses scripts/prepare_vstar_validation.py." >&2
   exit 2
 fi
 if [[ "$OPSD_ENABLED" == "true" ]]; then
@@ -128,6 +129,7 @@ ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}"
 ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-true}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-16}"
 ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-1}"
+ROLLOUT_AGENT_NUM_WORKERS="${ROLLOUT_AGENT_NUM_WORKERS:-8}"
 ACTOR_USE_TORCH_COMPILE="${ACTOR_USE_TORCH_COMPILE:-false}"
 USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-true}"
 MODEL_USE_REMOVE_PADDING="${MODEL_USE_REMOVE_PADDING:-true}"
@@ -193,6 +195,7 @@ fi
 exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   "data.train_files=['$TRAIN_FILE']" \
   "data.val_files=['$TEST_FILE']" \
+  data.val_batch_size="${VAL_BATCH_SIZE:-null}" \
   data.train_batch_size="$TRAIN_BATCH_SIZE" \
   data.response_format="$STUDENT_RESPONSE_FORMAT" \
   data.max_prompt_length="$MAX_PROMPT_LENGTH" \
@@ -222,6 +225,7 @@ exec "$PYTHON_BIN" -m groove.verl_entrypoint \
   actor_rollout_ref.rollout.seed="$SEED" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.mode=async \
+  actor_rollout_ref.rollout.agent.num_workers="$ROLLOUT_AGENT_NUM_WORKERS" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TENSOR_PARALLEL_SIZE" \
   actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
   actor_rollout_ref.rollout.free_cache_engine="$ROLLOUT_FREE_CACHE_ENGINE" \

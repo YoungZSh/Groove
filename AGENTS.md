@@ -26,6 +26,9 @@ The checked-in execution path is authoritative. Read it in this order:
    `scripts/run_grpo_2b.sh` define the exact current 2B
    experiments. `scripts/run_groove.sh` translates their environment into the
    resolved Hydra/VERL configuration.
+   `scripts/run_2b_4gpu.sh` is the single-node four-GPU wrapper for both modes;
+   its shared seed and explicit Ray network settings are documented in
+   `docs/FOUR_GPU_TRAINING.md`.
 2. `src/groove/verl_trainer.py::_postprocess_advantages()` is the integration
    source of truth. It builds online Teacher evidence, computes pre-update
    Teacher log probabilities, constructs OPSD token advantages, combines them
@@ -95,6 +98,7 @@ Before handing off launcher changes, also run:
 bash -n scripts/run_groove.sh
 bash -n scripts/run_grpo_2b.sh
 bash -n scripts/run_grpo_opsd_2b.sh
+bash -n scripts/run_2b_4gpu.sh
 git diff --check
 ```
 
@@ -140,6 +144,12 @@ uses `token-mean`, learning rate `1e-6`, one PPO epoch, and clip ratio `0.2`.
 
 `src/groove/semantic_reward.py` deliberately separates semantic correctness
 from output formatting:
+
+- Training uses the remote semantic Judge described below. The current
+  validation set is all 191 V*Bench questions, routed by `data_source=vstar_bench`
+  to `src/groove/vstar_bench.py`. Benchmark `score` equals deterministic option
+  accuracy; format validity is diagnostic only. Keep this validation-only
+  dispatch separate from training reward shaping.
 
 - The remote Judge returns constrained `0` or `1` semantic `accuracy`.
 - Analyzer success/failure grouping uses raw `accuracy`, never shaped `score`.
@@ -246,6 +256,31 @@ The comparable GRPO and OPSD runs use:
 Never assume identical seeds alone imply a fair comparison. Confirm the model,
 parquet row order, shuffle settings, batch size, rollout count, Judge protocol,
 reward weights, and validation temperature.
+
+The four-GPU wrapper preserves the global prompt batch of 16 and 8 rollouts
+per group, defaults both modes to seed 20260904, and requires a new explicit
+`EXPERIMENT_NAME`. Its throughput profile uses 16 agent-loop workers, 4 local
+reward workers, and 65536-token per-GPU actor/log-prob and vLLM batch budgets.
+Keep TP=1 (one Qwen3.5-2B rollout replica per GPU) and response length 1024.
+The global batch must remain 16 when tuning these budgets; larger token limits
+do not imply a larger batch. Validation batch defaults to the agent-worker
+count (16), and `OMP_NUM_THREADS=4` is forwarded to Ray workers.
+Its single-node NCCL defaults are `NCCL_SOCKET_IFNAME=lo`
+and `NCCL_IB_DISABLE=1`, forwarded through Ray's runtime environment together
+with `NO_PROXY` and `no_proxy`. Dry-run can validate a four-GPU configuration
+on a smaller allocation; a real launch checks that CUDA sees four selected
+devices before starting Ray. Do not treat dry-run as a communication test.
+
+Both current 2B launchers, and therefore both four-GPU modes, use
+`data/vstar_bench/validation.parquet`: all 191 original benchmark questions
+(115 direct attributes, 76 relative position). Prepare it with
+`scripts/prepare_vstar_validation.py`; `VALIDATION_FILE` is independent of
+`DATA_DIR`. Keep the original image bytes and all options. The launchers use
+9216 prompt tokens, 10240 total context tokens, and validation batches of 8
+(16 in the four-GPU wrapper) to accommodate the high-resolution images.
+Do not append benchmark examples
+to training, overwrite the old 220-row validation files, or compare old and new
+validation scores as if they came from the same dataset.
 
 Completed reference runs:
 

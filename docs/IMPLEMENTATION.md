@@ -53,11 +53,57 @@ judging, format shaping, and repetition handling live in
 The formal launchers are `scripts/run_grpo_2b.sh` and
 `scripts/run_grpo_opsd_2b.sh`. Their default prepared-data directories are
 `data/vstar_grpo_2200_seed20260904` and
-`data/vstar_opsd_2200_seed20260904`. Set `DATA_DIR` to an existing split or
-provide a local directory symlink at the default path; each split must contain
-`train.parquet` and `validation.parquet`. Existing datasets and archived run
-records are preserved, including embedded image paths and source metadata.
+`data/vstar_opsd_2200_seed20260904`. Set `DATA_DIR` to an existing training
+split or provide a local directory symlink at the default path; each training
+directory must contain `train.parquet`. Both launchers use the independent
+`data/vstar_bench/validation.parquet` for validation, configurable through
+`VALIDATION_FILE`. Existing datasets and archived run records are preserved,
+including embedded image paths and source metadata.
 The naming change does not alter prompts, rewards, or optimizer settings.
+
+`scripts/run_2b_4gpu.sh` selects either 2B launcher for single-node four-GPU
+training. It preserves the global batch and objective, uses a common default
+seed of 20260904, and explicitly forwards the single-node NCCL and proxy-bypass
+settings to Ray workers. Its throughput profile uses 16 agent-loop workers,
+4 local reward workers, and 65536-token per-GPU actor/log-prob and vLLM batch
+budgets. The global batch stays 16 groups with 8 responses each; TP=1 gives four
+rollout replicas. See [four-GPU training](FOUR_GPU_TRAINING.md) for
+configuration, local reference scripts, and the distinction between dry-run
+validation and the hardware check performed before a real launch.
+
+### Full V*Bench validation
+
+The current GRPO and GRPO + OPSD launchers, including the four-GPU wrapper,
+validate on all 191 V*Bench questions: 115 direct-attribute and 76
+relative-position questions. `scripts/prepare_vstar_validation.py` prepares
+the independent validation parquet from the original benchmark, preserving
+image bytes, question/option text, labels, IDs, and row order. It changes only
+the requested output format to `<answer>...</answer>`, records source/output
+hashes, and refuses to overwrite existing artifacts. The historical 220-row
+validation splits and the 1979-row training splits are preserved.
+
+`groove.vstar_bench` shares the deterministic option parser with the standalone
+checkpoint evaluator. Records marked `data_source=vstar_bench` use this scorer
+through the normal reward adapter, with `score=accuracy` in `{0, 1}`. Answer
+format is diagnostic only for benchmark validation; there is no format penalty
+or remote Judge request. Training records still use the existing semantic
+Judge, format penalty, and repetition handling. V*Bench records are marked as
+validation and must not be added to training inputs.
+
+High-resolution benchmark images exceed the old 2048-token prompt limit. Both
+launchers reserve 9216 prompt tokens and a 10240-token model context, retaining
+1024 response tokens and the native image processing path. Validation batches
+contain 8 questions for the two-GPU entrypoints and 16 for the four-GPU wrapper,
+matching their agent-worker counts, with no sample limit or dropped final batch; sampling
+remains temperature 0, `do_sample=false`, and `n=1`. The global training batch,
+rollout count, learning rate, and GRPO + OPSD advantage computation are unchanged.
+
+The primary metric `val-core/vstar_bench/reward/mean@1` is benchmark accuracy.
+The accompanying `accuracy`, `format_valid`, and `unparsed` metrics are recorded
+under the same dataset name. Scores from this benchmark are not directly
+comparable with the historical 220-row validation scores.
+
+### Shared response format
 
 Both formal 2B launchers select `data.response_format=reasoning_answer`. The
 Student is instructed to explain its reasoning as ordinary text, then put only
