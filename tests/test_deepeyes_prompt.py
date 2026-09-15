@@ -12,7 +12,6 @@ from groove.deepeyes_dataset import DeepEyesReasoningDataset
 from groove.deepeyes_prompt import (
     REASONING_SYSTEM_PROMPT,
     configure_deepeyes_response,
-    without_empty_think_prefill,
 )
 from groove.deepeyes_reward import extract_answer
 from groove.evidence import build_teacher_prompt_from_student, student_prompt_template
@@ -64,31 +63,15 @@ class DeepEyesReasoningPromptTest(unittest.TestCase):
         self.assertEqual(messages[1]["content"], "What color?")
         self.assertEqual(len(example["prompt"]), 1)
 
-    def test_template_keeps_messages_and_generates_plain_assistant_prefix(self):
-        template = (
-            "{{ messages[0].content }}{{ messages[1].content }}"
-            "{% if add_generation_prompt %}"
-            "{{- '<|im_start|>assistant\\n' }}"
-            "{% if enable_thinking %}{{- '<think>\\n' }}"
-            "{% else %}{{- '<think>\\n\\n</think>\\n\\n' }}{% endif %}{% endif %}"
-        )
-        updated = without_empty_think_prefill(template)
-        rendered = Environment().from_string(updated).render(
-            messages=[{"content": REASONING_SYSTEM_PROMPT}, {"content": "Question"}],
-            add_generation_prompt=True, enable_thinking=False,
-        )
-        self.assertTrue(rendered.endswith("<|im_start|>assistant\n"))
-        self.assertNotIn("<think>", rendered)
-        self.assertIn(REASONING_SYSTEM_PROMPT, rendered)
-        self.assertEqual(extract_answer("Visual reasoning.\n<answer>green</answer>"), ("green", True))
-
-    def test_unrecognized_template_fails_instead_of_changing_unrelated_text(self):
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            without_empty_think_prefill("unrelated model template")
-
-    def test_opt_in_configuration_resolves_shared_template_and_dataset(self):
+    def test_student_and_teacher_preserve_native_non_thinking_prefill(self):
         with TemporaryDirectory() as folder:
-            native = "prefix {{- '<think>\\n\\n</think>\\n\\n' }}"
+            native = (
+                "{% for message in messages %}{{ message.content }}{% endfor %}"
+                "{% if add_generation_prompt %}"
+                "{{- '<|im_start|>assistant\\n' }}"
+                "{% if enable_thinking %}{{- '<think>\\n' }}"
+                "{% else %}{{- '<think>\\n\\n</think>\\n\\n' }}{% endif %}{% endif %}"
+            )
             (Path(folder) / "chat_template.jinja").write_text(native)
             config = OmegaConf.create({
                 "data": {"response_format": "reasoning_answer",
@@ -99,8 +82,36 @@ class DeepEyesReasoningPromptTest(unittest.TestCase):
             configure_deepeyes_response(config)
             self.assertEqual(config.data.custom_cls.name, "DeepEyesReasoningDataset")
             self.assertTrue(Path(config.data.custom_cls.path).is_file())
-            self.assertEqual(config.actor_rollout_ref.model.custom_chat_template, "prefix {{- '' }}")
+            self.assertEqual(config.actor_rollout_ref.model.custom_chat_template, native)
             self.assertEqual((Path(folder) / "chat_template.jinja").read_text(), native)
+            self.assertIs(config.data.apply_chat_template_kwargs.enable_thinking, False)
+
+            student = [
+                {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+                {"role": "user", "content": "<image>What color is the umbrella?"},
+            ]
+            teacher = build_teacher_prompt_from_student(student, "Inspect the umbrella surface.", 1)
+            template = Environment().from_string(config.actor_rollout_ref.model.custom_chat_template)
+            for messages in (student, teacher):
+                with self.subTest(role="student" if messages is student else "teacher"):
+                    rendered = template.render(
+                        messages=messages, add_generation_prompt=True,
+                        **dict(config.data.apply_chat_template_kwargs),
+                    )
+                    self.assertTrue(rendered.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+                    self.assertEqual(rendered.count("<think>"), 1)
+                    self.assertIn(REASONING_SYSTEM_PROMPT, rendered)
+            self.assertEqual(extract_answer("Visual reasoning.\n<answer>green</answer>"), ("green", True))
+
+    def test_reasoning_mode_rejects_a_custom_template_override(self):
+        config = OmegaConf.create({
+            "data": {"response_format": "reasoning_answer",
+                     "apply_chat_template_kwargs": {"enable_thinking": False},
+                     "custom_cls": {"path": None, "name": None}},
+            "actor_rollout_ref": {"model": {"custom_chat_template": "modified template"}},
+        })
+        with self.assertRaisesRegex(ValueError, "original model template unchanged"):
+            configure_deepeyes_response(config)
 
     def test_original_configuration_is_untouched(self):
         config = OmegaConf.create({"data": {"response_format": "original"}})

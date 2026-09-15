@@ -2,7 +2,7 @@
 # Pure-GRPO Qwen3.5-2B run on the screened 2.2K visual-QA split.
 set -euo pipefail
 
-# Generate reasoning as ordinary response text, without a native think prefill.
+# Generate reasoning as ordinary response text after the native no-thinking prefill.
 # The reasoning/answer prompt and template are resolved by the entrypoint.
 for argument in "$@"; do
   if [[ "$argument" == *"enable_thinking="* && "$argument" != *"enable_thinking=false" ]]; then

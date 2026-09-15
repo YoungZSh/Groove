@@ -151,8 +151,10 @@ from output formatting:
 - The next 2B runs use `data.response_format=reasoning_answer`: plain reasoning
   followed by the final answer. No think wrapper or reasoning-length gate is
   added. A dataset adapter changes the instruction in memory without rewriting
-  historical parquet files. The shared Student/Teacher chat template removes
-  Qwen3.5's empty think prefill while keeping `enable_thinking=false`.
+  historical parquet files. The shared Student/Teacher chat template preserves
+  Qwen3.5's native empty think prefill with `enable_thinking=false`. The prefill
+  belongs to the prompt, not the sampled response; do not strip it from the
+  template to request plain reasoning.
 - Current next-run shaping is:
 
 ```text

@@ -14,20 +14,13 @@ REASONING_SYSTEM_PROMPT = (
 )
 
 
-def without_empty_think_prefill(template: str) -> str:
-    """Remove only Qwen3.5's empty non-thinking prefill; preserve all other Jinja."""
-    empty_think = "{{- '<think>\\n\\n</think>\\n\\n' }}"
-    if template.count(empty_think) != 1:
-        raise ValueError("Expected exactly one Qwen3.5 empty think prefill in the chat template")
-    return template.replace(empty_think, "{{- '' }}")
-
-
 def configure_deepeyes_response(config) -> None:
     """Resolve the opt-in prompt and template before creating any Ray workers.
 
     The custom dataset transforms only messages in memory. Existing parquet
     files, questions, row order, labels, and image payloads remain untouched.
-    The resolved template is shared by rollout and Teacher prompt construction.
+    The original model template is shared unchanged by rollout and Teacher
+    prompt construction, including its empty non-thinking generation prefill.
     """
     from omegaconf import OmegaConf
 
@@ -43,10 +36,9 @@ def configure_deepeyes_response(config) -> None:
 
     model = config.actor_rollout_ref.model
     if model.get("custom_chat_template") is not None:
-        raise ValueError("reasoning_answer derives its template from the original model template")
+        raise ValueError("reasoning_answer uses the original model template unchanged")
     tokenizer_path = Path(model.get("tokenizer_path") or model.path).expanduser()
     native_template = (tokenizer_path / "chat_template.jinja").read_text(encoding="utf-8")
-    template = without_empty_think_prefill(native_template)
-    OmegaConf.update(config, "actor_rollout_ref.model.custom_chat_template", template)
+    OmegaConf.update(config, "actor_rollout_ref.model.custom_chat_template", native_template)
     OmegaConf.update(config, "data.custom_cls.path", str(Path(__file__).with_name("deepeyes_dataset.py")))
     OmegaConf.update(config, "data.custom_cls.name", "DeepEyesReasoningDataset")

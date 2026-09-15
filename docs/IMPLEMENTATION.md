@@ -56,12 +56,16 @@ images, reference labels, and Analyzer-only metadata are preserved. Only the
 original image and question enter the Student user message. Teacher prompts
 continue to derive from the Student prompt and add training-only evidence.
 
-Qwen3.5 remains in non-thinking mode. Before workers start, the entrypoint reads
-the model's original chat template and removes only its empty non-thinking
-`<think>\n\n</think>\n\n` generation prefill. The resolved custom template ends in
-the ordinary assistant header and is shared by Student and Teacher. The base
-checkpoint files are not edited. A template with an unexpected prefill fails
-configuration validation rather than silently selecting another format.
+Qwen3.5 uses its native non-thinking mode with `enable_thinking=false`. Before
+workers start, the entrypoint reads the model's original chat template unchanged
+and shares it between Student and Teacher. The generation prefix includes the
+assistant header followed by `<think>\n\n</think>\n\n`, closing the thinking block
+before response sampling begins. These prefilled tokens belong to the prompt,
+not the sampled response or its token advantages. The base checkpoint files are
+not edited, and explicit custom-template overrides are rejected in this mode.
+This restores the original template behavior for subsequent runs; the completed
+2026-09-06 reasoning experiments used a modified template with the prefill
+removed. The plain-reasoning instruction and format reward remain unchanged.
 
 Format validation counts opening and closing answer markers independently,
 rejecting nested, duplicated, empty, non-lowercase, or unbalanced tags and text
