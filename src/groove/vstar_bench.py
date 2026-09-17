@@ -24,12 +24,15 @@ def normalized(text: str) -> str:
     return " ".join(text.strip().strip("*` ").split()).rstrip(".! ").casefold()
 
 
-def parse_prediction(output: str, choices: dict[str, str]) -> dict:
+def parse_prediction(output: str, choices: dict[str, str | None]) -> dict:
     """Parse a final answer without looking for arbitrary letters in reasoning.
 
     Accept an isolated option label, a label followed by its matching option
     text, or an exact unambiguous option text. Ambiguous finals remain unparsed.
     """
+    # Arrow gives two-option rows null C/D fields when they share a parquet
+    # schema with four-option rows. These fields are not answer candidates.
+    choices = {key: value for key, value in choices.items() if isinstance(value, str) and value.strip()}
     matches = list(ANSWER_RE.finditer(output))
     candidate = matches[-1].group(1).strip() if matches else output.strip()
     tags = TAG_RE.findall(output)
@@ -71,7 +74,8 @@ def compute_validation_score(output: str, ground_truth: str, extra_info: dict) -
     if extra_info.get("split") != "validation":
         raise ValueError("V*Bench is reserved for validation")
     choices = extra_info.get("choices") or {}
-    if ground_truth not in choices:
+    reference = choices.get(ground_truth)
+    if not isinstance(reference, str) or not reference.strip():
         raise ValueError("V*Bench reference label must occur in the answer choices")
     parsed = parse_prediction(output, choices)
     accuracy = float(parsed["predicted_label"] == ground_truth)

@@ -112,11 +112,42 @@ class VStarValidationTest(unittest.TestCase):
             judge.assert_called_once_with("What material?", "rubber", "rubber",
                                           answer_reward_weight=1.0, format_reward_weight=0.2)
 
+    def test_parquet_null_options_are_not_answer_candidates(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "mixed-options.parquet"
+            pq.write_table(pa.Table.from_pylist([
+                {"choices": {"A": "rubber", "B": "leather"}},
+                {"choices": self.choices},
+            ]), path)
+            choices = pq.read_table(path).to_pylist()[0]["choices"]
+        self.assertIsNone(choices["C"])
+        self.assertIsNone(choices["D"])
+        info = {**self.info(), "choices": choices}
+        before = deepcopy(info)
+        for output, expected, unparsed in (
+            ("<answer>B</answer>", 1.0, 0.0),
+            ("<answer>B leather</answer>", 1.0, 0.0),
+            ("<answer>leather</answer>", 1.0, 0.0),
+            ("<answer>C</answer>", 0.0, 1.0),
+            ("<answer>C cotton</answer>", 0.0, 1.0),
+            ("<answer>unknown</answer>", 0.0, 1.0),
+            ("<answer>None</answer>", 0.0, 1.0),
+            ("<answer></answer>", 0.0, 1.0),
+        ):
+            with self.subTest(output=output):
+                result = compute_validation_score(output, "B", info)
+                self.assertEqual(result["score"], expected)
+                self.assertEqual(result["unparsed"], unparsed)
+        self.assertEqual(info, before)
+
     def test_benchmark_metadata_requires_validation_split_and_valid_reference(self):
         with self.assertRaises(ValueError):
             compute_validation_score("D", "D", {**self.info(), "split": "train"})
         with self.assertRaises(ValueError):
             compute_validation_score("D", "E", self.info())
+        for missing in (None, "", " "):
+            with self.subTest(reference=missing), self.assertRaises(ValueError):
+                compute_validation_score("D", "D", {**self.info(), "choices": {"A": "rubber", "D": missing}})
 
 
 if __name__ == "__main__":
