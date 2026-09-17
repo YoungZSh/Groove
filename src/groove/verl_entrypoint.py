@@ -41,7 +41,7 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
 
 
-def configure_ray_memory_guard(config) -> dict[str, float | int]:
+def configure_ray_memory_guard(config) -> dict[str, float | int | None]:
     """Configure Ray's node-wide OOM guard before ``ray.init`` starts raylet.
 
     Ray's memory monitor is a soft, node-wide guard.  The enclosing cgroup is
@@ -52,15 +52,18 @@ def configure_ray_memory_guard(config) -> dict[str, float | int]:
 
     gib = 1024**3
     total_bytes = int(get_system_memory())
-    cap_gib = _env_float("RAY_NODE_MEMORY_CAP_GIB", 220.0)
-    headroom_gib = _env_float("RAY_MEMORY_GUARD_HEADROOM_GIB", 4.0)
+    cap_setting = os.environ.get("RAY_NODE_MEMORY_CAP_GIB", "220").strip().lower()
+    cap_gib = None if cap_setting in {"null", "none"} else _env_float("RAY_NODE_MEMORY_CAP_GIB", 220.0)
+    # An uncapped node uses the percentage threshold without subtracting the
+    # headroom that belonged to the historical fixed 220 GiB budget.
+    headroom_gib = _env_float("RAY_MEMORY_GUARD_HEADROOM_GIB", 4.0) if cap_gib is not None else 0.0
     threshold_ceiling = _env_float("RAY_MEMORY_USAGE_THRESHOLD_CEILING", 0.95)
     object_store_gib = _env_float("RAY_OBJECT_STORE_GIB", 8.0)
     refresh_ms = int(_env_float("RAY_MEMORY_MONITOR_REFRESH_MS", 100.0))
 
-    if cap_gib <= 0:
+    if cap_gib is not None and cap_gib <= 0:
         raise ValueError("RAY_NODE_MEMORY_CAP_GIB must be positive")
-    if headroom_gib < 0 or headroom_gib >= cap_gib:
+    if headroom_gib < 0 or (cap_gib is not None and headroom_gib >= cap_gib):
         raise ValueError(
             "RAY_MEMORY_GUARD_HEADROOM_GIB must be non-negative and smaller than the cap"
         )
@@ -71,8 +74,8 @@ def configure_ray_memory_guard(config) -> dict[str, float | int]:
     if refresh_ms <= 0:
         raise ValueError("RAY_MEMORY_MONITOR_REFRESH_MS must be positive")
 
-    requested_cap_bytes = int(cap_gib * gib)
-    guarded_cap_bytes = min(requested_cap_bytes, total_bytes)
+    requested_cap_bytes = int(cap_gib * gib) if cap_gib is not None else None
+    guarded_cap_bytes = min(requested_cap_bytes, total_bytes) if requested_cap_bytes is not None else total_bytes
     trigger_bytes = guarded_cap_bytes - int(headroom_gib * gib)
     if trigger_bytes <= 0:
         raise ValueError("Ray memory guard trigger must be positive")
@@ -260,6 +263,7 @@ def main() -> None:
             f"rollout_token_budget={config.actor_rollout_ref.rollout.max_num_batched_tokens}",
             f"validation_batch_size={config.data.val_batch_size}",
             f"ray_total_gib={memory_guard['ray_total_bytes'] / 1024**3:.3f}",
+            f"ray_fixed_cap_enabled={memory_guard['requested_cap_bytes'] is not None}",
             f"ray_guard_gib={memory_guard['trigger_bytes'] / 1024**3:.3f}",
             f"ray_threshold={memory_guard['threshold']:.6f}",
             f"ray_object_store_gib={memory_guard['object_store_bytes'] / 1024**3:.3f}",

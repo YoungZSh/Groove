@@ -37,7 +37,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "    sys.stdin.read()\n"
             "    sys.exit(int(os.environ.get('TEST_GPU_CHECK_EXIT', '0')))\n"
             "keys = ('CUDA_VISIBLE_DEVICES', 'NCCL_SOCKET_IFNAME', 'NCCL_IB_DISABLE',\n"
-            "        'NO_PROXY', 'no_proxy', 'WANDB_MODE')\n"
+            "        'NO_PROXY', 'no_proxy', 'WANDB_MODE', 'RAY_NODE_MEMORY_CAP_GIB')\n"
             "print(json.dumps({'args': sys.argv[1:],\n"
             "                  'env': {key: os.environ.get(key) for key in keys}}))\n"
             "sys.exit(int(os.environ.get('TEST_TRAINING_EXIT', '0')))\n"
@@ -50,6 +50,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "TRAINING_MODE", "TEST_GPU_CHECK_EXIT", "TEST_TRAINING_EXIT",
             "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS", "OMP_NUM_THREADS",
             "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
+            "WANDB_MODE", "RAY_NODE_MEMORY_CAP_GIB",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -87,6 +88,7 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(config.trainer.n_gpus_per_node, 4)
                 self.assertEqual(config.trainer.nnodes, 1)
                 self.assertEqual(captured["env"]["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
+                self.assertEqual(captured["env"]["RAY_NODE_MEMORY_CAP_GIB"], "null")
                 self.assertEqual(config.groove.enabled, enabled)
                 self.assertEqual(config.data.train_batch_size, 16)
                 self.assertEqual(config.data.max_response_length, 1024)
@@ -94,7 +96,7 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertFalse(config.data.apply_chat_template_kwargs.enable_thinking)
                 self.assertEqual(config.data.train_files, [str(self.project / "data" / split / "train.parquet")])
                 self.assertEqual(config.data.val_files, [str(self.validation)])
-                self.assertEqual(config.data.val_batch_size, 16)
+                self.assertIsNone(config.data.val_batch_size)
                 self.assertEqual(config.data.val_max_samples, -1)
                 self.assertEqual(config.data.max_prompt_length, 9216)
                 actor = config.actor_rollout_ref.actor
@@ -124,7 +126,7 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(rollout.seed, config.data.seed)
                 self.assertEqual(actor.data_loader_seed, config.data.seed)
                 self.assertEqual(actor.fsdp_config.seed, config.data.seed)
-                self.assertEqual(captured["env"]["WANDB_MODE"], "offline")
+                self.assertEqual(captured["env"]["WANDB_MODE"], "offline" if enabled else "online")
                 worker_env = config.ray_kwargs.ray_init.runtime_env.env_vars
                 self.assertEqual(worker_env.NCCL_SOCKET_IFNAME, "lo")
                 self.assertEqual(worker_env.NCCL_IB_DISABLE, "1")
@@ -135,6 +137,11 @@ class FourGpuLauncherTest(unittest.TestCase):
                     self.assertEqual(config.groove.opsd_advantage_coef, 0.01)
                     self.assertIsNone(config.groove.opsd_advantage_clip)
         self.assertFalse((self.project / "outputs").exists())
+
+    def test_grpo_can_explicitly_keep_wandb_offline(self):
+        result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
 
     def test_explicit_devices_model_seed_data_and_network_reach_both_modes(self):
         data = Path(self.folder.name) / "existing split"
@@ -185,9 +192,22 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu, 98304)
                 self.assertEqual(config.actor_rollout_ref.rollout.max_num_batched_tokens, 49152)
                 self.assertEqual(config.actor_rollout_ref.rollout.agent.num_workers, 8)
-                self.assertEqual(config.data.val_batch_size, 8)
+                self.assertIsNone(config.data.val_batch_size)
                 self.assertEqual(config.reward.num_workers, 3)
                 self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS, "2")
+
+    def test_explicit_validation_batch_is_independent_of_worker_count(self):
+        for mode in ("grpo", "grpo_opsd"):
+            with self.subTest(mode=mode):
+                result = self.run_launcher(overrides={
+                    "TRAINING_MODE": mode, "ROLLOUT_AGENT_NUM_WORKERS": "8",
+                    "VAL_BATCH_SIZE": "64",
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.resolved_config(json.loads(result.stdout))
+                self.assertEqual(config.data.val_batch_size, 64)
+                self.assertEqual(config.actor_rollout_ref.rollout.agent.num_workers, 8)
+                self.assertEqual(config.data.train_batch_size, 16)
 
     def test_rejects_invalid_mode_and_gpu_topology_before_launching(self):
         cases = (

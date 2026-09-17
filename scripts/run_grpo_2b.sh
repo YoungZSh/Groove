@@ -23,10 +23,10 @@ export TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.p
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-8}"
 export SEED="${SEED:-22}"
 
-# Keep the full training history locally without requiring network access or a
-# W&B login. The offline run can be synced after training completes.
+# Stream training metrics to W&B by default while retaining the local history.
+# WANDB_MODE=offline remains available for explicitly disconnected runs.
 export TRAINER_LOGGER='["console","wandb"]'
-export WANDB_MODE=offline
+export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT=groove-visual-evidence
 export WANDB_NAME="$EXPERIMENT_NAME"
 export WANDB_DIR="$PROJECT_ROOT/outputs/wandb"

@@ -19,6 +19,9 @@ if [[ "${N_GPUS:-4}" != "4" ]]; then
 fi
 export N_GPUS=4
 export SEED="${SEED:-20260904}"
+# Use Ray's node-relative memory threshold on the large-memory four-GPU host.
+# An explicit numeric value remains available for a constrained allocation.
+export RAY_NODE_MEMORY_CAP_GIB="${RAY_NODE_MEMORY_CAP_GIB:-null}"
 
 # Increase local scheduling capacity and per-GPU packed-token budgets while
 # keeping the global prompt batch (16) and rollouts per group (8) unchanged.
@@ -26,9 +29,10 @@ export ROLLOUT_AGENT_NUM_WORKERS="${ROLLOUT_AGENT_NUM_WORKERS:-16}"
 export REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-4}"
 export ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-65536}"
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}"
-# Validation is padded to the number of agent-loop workers. Match that count
-# so full validation batches do not spend inference on duplicated examples.
-export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$ROLLOUT_AGENT_NUM_WORKERS}"
+# Submit the full validation set together so vLLM can continuously schedule
+# requests instead of waiting for every small batch to finish. Hydra null makes
+# the validation loader use the dataset length; padding is removed after rollout.
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-null}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 IFS=',' read -r -a selected_gpus <<< "$CUDA_VISIBLE_DEVICES"
