@@ -2,7 +2,7 @@
 # Original-image + crop + focus Teacher, with full-trajectory audit records.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 export PYTHON_BIN="${PYTHON_BIN:-/data/home/yangzesheng/.conda/envs/groove/bin/python}"
 export PATH="$(dirname "$PYTHON_BIN"):$PATH"
@@ -84,7 +84,7 @@ export PYTHONUNBUFFERED=1
 export GROOVE_WORKER_DEBUG_DIR="$BASELINE_RUN_DIR/worker_debug"
 
 mkdir -p "$BASELINE_RUN_DIR"
-exec bash "$PROJECT_ROOT/scripts/run_groove.sh" \
+exec bash "$PROJECT_ROOT/TMP/scripts/run_groove.sh" \
   +ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=groove.runtime_debug.setup_worker_diagnostics \
   ray_kwargs.ray_init.num_cpus=32 \
   "trainer.validation_data_dir=$BASELINE_RUN_DIR/validation" \

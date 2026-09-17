@@ -2,7 +2,7 @@
 # GRPO + OPSD Qwen3.5-2B run with ordinary reasoning and a terminal answer.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_opsd_2200_seed20260904}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-grpo-opsd-reasoning-answer-seed20260904}"
 
@@ -117,4 +117,4 @@ export OPSD_LOG_PROB_DUMP_DIR="$PROJECT_ROOT/outputs/opsd-token-dumps/$EXPERIMEN
 export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
 export PYTHONUNBUFFERED=1
 
-exec "$PROJECT_ROOT/scripts/run_groove.sh" "$@"
+exec "$PROJECT_ROOT/TMP/scripts/run_groove.sh" "$@"

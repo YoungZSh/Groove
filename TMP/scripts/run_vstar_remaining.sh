@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PYTHON="/home/yzs/miniconda3/envs/vision-opd/bin/python"
 SEED_DIR="$PROJECT_ROOT/outputs/qwen35-2b-vstar-vllm-1000q"
 OUTPUT_DIR="$PROJECT_ROOT/outputs/qwen35-2b-vstar-vllm-full"
@@ -35,7 +35,7 @@ run_shard() {
   local gpu="$1"
   local shard="$2"
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON" \
-    "$PROJECT_ROOT/scripts/probe_vstar_vllm.py" \
+    "$PROJECT_ROOT/TMP/scripts/probe_vstar_vllm.py" \
     --shard-id "$shard" \
     --num-shards 2 \
     --limit "$QUESTIONS_PER_SHARD" \
@@ -57,7 +57,7 @@ run_shard() {
 done_marker="$OUTPUT_DIR/rollout-complete.marker"
 rm -f "$done_marker"
 echo "[$(date --iso-8601=seconds)] starting streaming Qwen3.8-27B judge"
-"$PYTHON" "$PROJECT_ROOT/scripts/judge_vstar_rollouts.py" \
+"$PYTHON" "$PROJECT_ROOT/TMP/scripts/judge_vstar_rollouts.py" \
   --inputs "$OUTPUT_DIR/shard-0.jsonl" "$OUTPUT_DIR/shard-1.jsonl" \
   --output "$OUTPUT_DIR/judgements-qwen38-27b.jsonl" \
   --summary "$OUTPUT_DIR/judge-summary-qwen38-27b.json" \
@@ -100,7 +100,7 @@ judge_status=$?
 set -e
 if [[ "$judge_status" -ne 0 ]]; then
   echo "[$(date --iso-8601=seconds)] streaming judge exited with $judge_status; filling missing judgements"
-  "$PYTHON" "$PROJECT_ROOT/scripts/judge_vstar_rollouts.py" \
+  "$PYTHON" "$PROJECT_ROOT/TMP/scripts/judge_vstar_rollouts.py" \
     --inputs "$OUTPUT_DIR/shard-0.jsonl" "$OUTPUT_DIR/shard-1.jsonl" \
     --output "$OUTPUT_DIR/judgements-qwen38-27b.jsonl" \
     --summary "$OUTPUT_DIR/judge-summary-qwen38-27b.json" \

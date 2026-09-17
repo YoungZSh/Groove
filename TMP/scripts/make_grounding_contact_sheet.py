@@ -7,7 +7,7 @@ import argparse
 from PIL import Image, ImageDraw, ImageFont
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT_DIR = ROOT / "outputs" / "grounding-recheck-english"
 
 

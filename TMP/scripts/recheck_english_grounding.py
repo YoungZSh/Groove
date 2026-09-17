@@ -17,7 +17,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ROLLOUTS = ROOT / "outputs/rollouts-batch8-seq64-formal-v1"
 DEFAULT_EVIDENCE = ROOT / "outputs/evidence-batch8-seq64-formal-v1"
 DEFAULT_OUTPUT = ROOT / "outputs/grounding-recheck-english"

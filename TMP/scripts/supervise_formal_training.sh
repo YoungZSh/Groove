@@ -2,7 +2,7 @@
 # Keep the overnight Batch-8 visual-evidence run alive across a transient Ray/vLLM failure.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 EXPERIMENT_NAME="qwen35-4b-groove-visual-evidence-batch8-seq64-formal-v1"
 CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 LOG_FILE="$PROJECT_ROOT/outputs/logs/$EXPERIMENT_NAME.log"
@@ -80,7 +80,7 @@ start_training() {
   export ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts-batch8-seq64-formal-v1"
 
   set -o pipefail
-  bash "$PROJECT_ROOT/scripts/run_groove.sh" 2>&1 | tee -a "$LOG_FILE"
+  bash "$PROJECT_ROOT/TMP/scripts/run_groove.sh" 2>&1 | tee -a "$LOG_FILE"
 }
 
 write_progress_report() {

@@ -2,7 +2,7 @@
 # Serve the local FP8 Qwen3.5 35B-A3B vision model as the group Analyzer.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/yzs/miniconda3/envs/vision-opd/bin/python}"
 MODEL_PATH="${ANALYZER_MODEL_PATH:-/root/siton-tmp/yzs/ckpts/Qwen3.5-35B-A3B-FP8}"
 MODEL_NAME="${ANALYZER_MODEL_NAME:-qwen35-35b-a3b-fp8-analyzer}"
@@ -33,7 +33,7 @@ PY
 }
 
 if ! checkpoint_ready; then
-  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/download_qwen35_analyzer.py" \
+  "$PYTHON_BIN" "$PROJECT_ROOT/TMP/scripts/download_qwen35_analyzer.py" \
     --output-dir "$MODEL_PATH"
 fi
 

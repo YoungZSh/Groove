@@ -2,11 +2,11 @@
 # Single-node, four-GPU Qwen3.5-2B GRPO or GRPO + OPSD on Siton.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TRAINING_MODE="${TRAINING_MODE:-grpo}"
 case "$TRAINING_MODE" in
-  grpo) LAUNCHER="$PROJECT_ROOT/scripts/run_grpo_2b.sh" ;;
-  grpo_opsd) LAUNCHER="$PROJECT_ROOT/scripts/run_grpo_opsd_2b.sh" ;;
+  grpo) LAUNCHER="$PROJECT_ROOT/TMP/scripts/run_grpo_2b.sh" ;;
+  grpo_opsd) LAUNCHER="$PROJECT_ROOT/TMP/scripts/run_grpo_opsd_2b.sh" ;;
   *) echo "TRAINING_MODE must be grpo or grpo_opsd." >&2; exit 2 ;;
 esac
 : "${EXPERIMENT_NAME:?Set a new EXPERIMENT_NAME for each four-GPU run.}"

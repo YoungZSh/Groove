@@ -2,7 +2,7 @@
 # Run a fixed pre-update diagnostic batch through the remote evidence services.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 PYTHON_BIN="${PYTHON_BIN:-/data/home/yangzesheng/.conda/envs/groove/bin/python}"
 export PATH="$(dirname "$PYTHON_BIN"):$PATH"
@@ -31,7 +31,7 @@ if [[ $# -eq 0 ]]; then
 fi
 for stage in "$@"; do
     # An explicit stage argument supports resuming after a service interruption.
-    "$PYTHON_BIN" -u scripts/probe_vstar_advantages.py \
+    "$PYTHON_BIN" -u TMP/scripts/probe_vstar_advantages.py \
         --stage "$stage" --model "$MODEL_PATH" --output "$OUTPUT_DIR" \
         2>&1 | tee -a "$OUTPUT_DIR/$stage.log"
 done

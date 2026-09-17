@@ -2,7 +2,7 @@
 # Start the local Analyzer on GPU 0, wait for readiness, then train on GPU 1.
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG_DIR="${RUN_LOG_DIR:-$PROJECT_ROOT/outputs/logs}"
 ANALYZER_HOST="${ANALYZER_HOST:-127.0.0.1}"
 ANALYZER_PORT="${ANALYZER_PORT:-8001}"
@@ -20,7 +20,7 @@ if ! curl --fail --silent --max-time 3 "$ANALYZER_HEALTH_URL" >/dev/null; then
     ANALYZER_PORT="$ANALYZER_PORT" \
     ANALYZER_MODEL_NAME="$ANALYZER_MODEL_NAME" \
     ANALYZER_API_KEY="$ANALYZER_API_KEY" \
-    "$PROJECT_ROOT/scripts/serve_qwen35_analyzer.sh" >"$ANALYZER_LOG" 2>&1 &
+    "$PROJECT_ROOT/TMP/scripts/serve_qwen35_analyzer.sh" >"$ANALYZER_LOG" 2>&1 &
   echo $! >"$LOG_DIR/qwen35-analyzer.pid"
 fi
 
@@ -87,4 +87,4 @@ fi
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 export TEST_FREQ="${TEST_FREQ:-500}"
 export TOTAL_STEPS="${TOTAL_STEPS:-150}"
-exec "$PROJECT_ROOT/scripts/run_groove.sh" "$@"
+exec "$PROJECT_ROOT/TMP/scripts/run_groove.sh" "$@"

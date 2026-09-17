@@ -11,7 +11,7 @@ for argument in "$@"; do
   fi
 done
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_2200_seed20260904}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35-2b-grpo-reasoning-answer-seed22}"
 
@@ -115,4 +115,4 @@ export EXPERIMENT_NAME
 export CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 export ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME"
 
-exec "$PROJECT_ROOT/scripts/run_groove.sh" "$@"
+exec "$PROJECT_ROOT/TMP/scripts/run_groove.sh" "$@"

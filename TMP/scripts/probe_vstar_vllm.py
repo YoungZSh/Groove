@@ -16,7 +16,7 @@ from transformers import AutoProcessor
 from vllm import LLM, SamplingParams
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = Path("/root/siton-tmp/yzs/ckpts/Qwen3.5-2B")
 DEFAULT_DATA = ROOT / "data/visual_toolbox_47k/data_0.1.2_visual_toolbox_v2.parquet"
 

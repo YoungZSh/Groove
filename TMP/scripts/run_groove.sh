@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/yzs/miniconda3/envs/vision-opd/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/root/siton-tmp/yzs/ckpts/Qwen3.5-4B}"
 
@@ -42,7 +42,7 @@ fi
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_PREFIX}-${DATA_MAX_SOURCE_ROWS}-seed${SEED}-b${TRAIN_BATCH_SIZE}}"
 
 if [[ "${PREPARE_DATA:-true}" == "true" ]]; then
-  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/prepare_vision_opd.py" \
+  "$PYTHON_BIN" "$PROJECT_ROOT/TMP/scripts/prepare_vision_opd.py" \
     --output-dir "$DATA_OUTPUT_DIR" \
     --test-ratio "$TEST_RATIO" \
     --random-state "$SEED" \
