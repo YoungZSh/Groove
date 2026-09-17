@@ -37,7 +37,8 @@ class FourGpuLauncherTest(unittest.TestCase):
             "    sys.stdin.read()\n"
             "    sys.exit(int(os.environ.get('TEST_GPU_CHECK_EXIT', '0')))\n"
             "keys = ('CUDA_VISIBLE_DEVICES', 'NCCL_SOCKET_IFNAME', 'NCCL_IB_DISABLE',\n"
-            "        'NO_PROXY', 'no_proxy', 'WANDB_MODE', 'RAY_NODE_MEMORY_CAP_GIB')\n"
+            "        'NO_PROXY', 'no_proxy', 'WANDB_MODE', 'RAY_NODE_MEMORY_CAP_GIB',\n"
+            "        'GROOVE_REPETITION_ZERO_REWARD')\n"
             "print(json.dumps({'args': sys.argv[1:],\n"
             "                  'env': {key: os.environ.get(key) for key in keys}}))\n"
             "sys.exit(int(os.environ.get('TEST_TRAINING_EXIT', '0')))\n"
@@ -51,6 +52,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS", "OMP_NUM_THREADS",
             "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
             "WANDB_MODE", "RAY_NODE_MEMORY_CAP_GIB",
+            "GROOVE_REPETITION_ZERO_REWARD",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -119,7 +121,10 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(actor.kl_loss_coef, 0.0 if mode == "dapo" else 0.01)
                 self.assertEqual(actor.use_kl_loss, mode != "dapo")
                 self.assertEqual(actor.clip_ratio_high, 0.28 if mode == "dapo" else 0.2)
-                self.assertEqual(config.reward.reward_kwargs.overlong_buffer_cfg.enable, mode == "dapo")
+                self.assertFalse(config.reward.reward_kwargs.overlong_buffer_cfg.enable)
+                self.assertEqual(captured["env"]["GROOVE_REPETITION_ZERO_REWARD"], "true")
+                self.assertEqual(config.reward.custom_reward_function.reward_kwargs.answer_reward_weight, 1.0)
+                self.assertEqual(config.reward.custom_reward_function.reward_kwargs.format_reward_weight, 0.2)
                 self.assertEqual(rollout.n, 8)
                 self.assertEqual(rollout.max_model_len, 10240)
                 self.assertEqual(rollout.tensor_model_parallel_size, 1)
@@ -149,6 +154,19 @@ class FourGpuLauncherTest(unittest.TestCase):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
+
+    def test_no_mode_inherits_the_old_dapo_length_penalty_switch(self):
+        for mode in ("grpo", "dapo", "grpo_opsd"):
+            with self.subTest(mode=mode):
+                result = self.run_launcher(overrides={
+                    "TRAINING_MODE": mode, "DAPO_OVERLONG_ENABLED": "true",
+                    "DAPO_OVERLONG_BUFFER": "1024", "DAPO_OVERLONG_PENALTY": "99",
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.resolved_config(json.loads(result.stdout))
+                self.assertFalse(config.reward.reward_kwargs.overlong_buffer_cfg.enable)
+                self.assertEqual(config.data.max_response_length, 1024)
+                self.assertEqual(config.actor_rollout_ref.rollout.response_length, 1024)
 
     def test_parameter_arrays_preserve_quoted_paths_and_last_cli_overrides(self):
         data = Path(self.folder.name) / "custom data with spaces"

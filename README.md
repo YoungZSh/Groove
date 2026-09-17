@@ -31,7 +31,7 @@ TRAINING_MODE=grpo EXPERIMENT_NAME=my-grpo-4k-run01 \
 | 模式 | Trainer | 关键设置 |
 | --- | --- | --- |
 | GRPO | VERL V1 同步 Trainer | 16 题 × 8 回答；token-mean；reference KL 0.01 |
-| DAPO | 同一 VERL V1 同步 Trainer | 动态过滤并补采；clip 0.2 / 0.28；无 reference KL；仅训练的超长软惩罚 |
+| DAPO | 同一 VERL V1 同步 Trainer | 动态过滤并补采；clip 0.2 / 0.28；无 reference KL；关闭超长奖励惩罚 |
 | GRPO + OPSD | GrooveRayPPOTrainer | 在 GRPO 优势上叠加未中心化 OPSD token credit |
 
 原生 V1 依赖 `TransferQueue==0.1.10`，对应项目可选依赖 `native-training`。
@@ -58,7 +58,7 @@ Analyzer 或视觉工具失败时回退到 GRPO。
 - 验证：`data/vstar_bench/validation.parquet` 的全部 191 题，通过 `VALIDATION_FILE` 独立覆盖。
 - 训练使用远程语义 Judge，`score = accuracy + 0.2 * format_penalty`。
   普通推理后接一个终止的 `<answer>...</answer>`；严重重复不能得到正奖励，原始 accuracy 保留。
-- DAPO 可追加训练长度惩罚，并按最终优化奖励的组内差异过滤。
+- 所有模式均关闭超长奖励惩罚；DAPO 按最终优化奖励的组内差异过滤。
 - V*Bench 验证只计算确定性选项准确率，不应用格式、重复或长度训练惩罚。
 
 所有方法保留 1024 token 回答上限；训练 temperature 1，验证 temperature 0。

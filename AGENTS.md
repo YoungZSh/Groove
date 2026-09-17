@@ -137,8 +137,10 @@ L_actor = VERL_vanilla_PPO(A_total) + 0.01 * low_var_reference_KL
 训练采用 `token-mean`，学习率为 `1e-6`，执行一个 PPO epoch，裁剪比例为 `0.2`。
 
 纯 DAPO 使用原生 V1 动态组过滤，裁剪下限/上限为 0.2/0.28，不使用参考策略 KL。
-可选的 128-token 超长缓冲区由 `src/groove/reward_manager.py` 实现，
-仅作用于训练。按 `training_reward`（实际用于优化的最终标量奖励）进行过滤，
+两个启动脚本在所有模式下都关闭超长奖励惩罚，保留 1024 token 生成上限，
+不再读取旧的 `DAPO_OVERLONG_*` 环境变量。`src/groove/reward_manager.py`
+仍保留可选长度塑形能力，但当前启动配置不启用。
+按 `training_reward`（实际用于优化的最终标量奖励）进行过滤，
 同时保留原始 `accuracy`。V*Bench 不应用训练奖励塑形。
 不要在 GRPO + OPSD 中启用这种过滤，因为奖励完全相同的组也可能提供 OPSD 信号。
 V1 名义上的 epoch 用于确定优化器更新次数；DAPO 补充采样可能多次遍历源数据。

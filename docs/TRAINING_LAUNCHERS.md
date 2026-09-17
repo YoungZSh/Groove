@@ -19,7 +19,7 @@
 | `ACTOR` | 优化器、PPO loss、FSDP 与 KL |
 | `ROLLOUT` / `REF` | vLLM 采样、验证生成与参考模型评分 |
 | `ALGORITHM` | 优势估计与 DAPO 动态采样 |
-| `REWARD` / `OPSD` | 奖励适配、长度惩罚与 OPSD 信用分配 |
+| `REWARD` / `OPSD` | 奖励适配、关闭超长奖励惩罚与 OPSD 信用分配 |
 | `TRAINER` | 日志、检查点、训练步数和 Trainer 选择 |
 | `RAY` | 数据通道资源与 worker 环境变量 |
 | `EXTRA` | 实验专用的附加 Hydra 覆盖项 |
@@ -99,10 +99,12 @@ DINO/OCR 保持单 worker；启动脚本不会部署或重启远程服务。
 ## DAPO 的明确语义
 
 - 由原生 V1 ReplayBuffer 过滤组内 **最终训练奖励** 完全相同的题组，并补采到 16 组。
-- 过滤字段为 `training_reward`，包含语义、格式、重复和可选长度惩罚；`accuracy` 保持独立。
-- 默认最大回答 1024，长度缓冲区 128：896 token 开始线性惩罚，1024 token 时为 -1。
-  `DAPO_OVERLONG_ENABLED=false` 可用于关闭长度惩罚的单独对照。
-- `VisualQARewardManager` 仅对训练应用该惩罚；验证记录保持原始准确率。
+- 过滤字段为 `training_reward`，包含语义、格式和重复处理；`accuracy` 保持独立。
+- 两个脚本在所有模式下都设置 `reward.reward_kwargs.overlong_buffer_cfg.enable=false`。
+  最大回答仍为 1024 token，但生成长度不追加奖励惩罚。
+  旧环境变量 `DAPO_OVERLONG_ENABLED`、`DAPO_OVERLONG_BUFFER`、`DAPO_OVERLONG_PENALTY`
+  不再参与启动配置。
+- `VisualQARewardManager` 保留可选的训练长度塑形能力，当前脚本不启用；验证记录保持原始准确率。
 - `max_inflight_gen_batches=1` 限制同时生成的批量，V1 不执行旧的 `max_num_gen_batches` 总重试上限。
   后者固定写为 0，避免假设它能终止补采。
 - V1 默认按 `4000 // 16 = 250` 个**优化更新**计算一轮预算；DAPO 补采可能多次遍历数据。

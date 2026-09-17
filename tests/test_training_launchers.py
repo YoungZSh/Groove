@@ -23,7 +23,10 @@ class TrainingLauncherTest(unittest.TestCase):
     def test_both_launchers_accept_an_independent_validation_file(self):
         self._check_launchers(override_data=False, override_validation=True)
 
-    def _check_launchers(self, *, override_data, override_validation=False):
+    def test_all_modes_keep_repetition_processing_by_default(self):
+        self._check_launchers(override_data=False, repetition_override=None)
+
+    def _check_launchers(self, *, override_data, override_validation=False, repetition_override="false"):
         with TemporaryDirectory() as folder:
             project = Path(folder) / "project"
             (project / "scripts").mkdir(parents=True)
@@ -63,15 +66,17 @@ class TrainingLauncherTest(unittest.TestCase):
                         "EXPERIMENT_NAME": "unit-launcher-" + name, "TRAINING_MODE": name,
                         "GROOVE_DRY_RUN": "true", "PYTHONPATH": str(ROOT / "src"),
                         "GROOVE_JUDGE_API_KEY": "unit-judge-key",
-                        "GROOVE_REPETITION_ZERO_REWARD": "false",
                         "GROOVE_REPETITION_MIN_REPEATS": "7",
                     }
                     for key in (
                         "DATA_DIR", "VALIDATION_FILE", "MODEL_PATH", "SEED", "N_GPUS", "CUDA_VISIBLE_DEVICES",
                         "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS",
                         "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
+                        "GROOVE_REPETITION_ZERO_REWARD",
                     ):
                         env.pop(key, None)
+                    if repetition_override is not None:
+                        env["GROOVE_REPETITION_ZERO_REWARD"] = repetition_override
                     if override_data:
                         env["DATA_DIR"] = str(data_paths[name])
                     if override_validation:
@@ -90,6 +95,8 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("algorithm.filter_groups.enable=" + ("true" if name == "dapo" else "false"), args)
                     self.assertIn("actor_rollout_ref.actor.policy_loss.loss_mode=vanilla", args)
                     self.assertIn("reward.custom_reward_function.reward_kwargs.format_reward_weight=0.2", args)
+                    self.assertIn("reward.custom_reward_function.reward_kwargs.answer_reward_weight=1.0", args)
+                    self.assertIn("++reward.reward_kwargs.overlong_buffer_cfg.enable=false", args)
                     self.assertIn("data.train_batch_size=16", args)
                     self.assertIn("actor_rollout_ref.rollout.n=8", args)
                     self.assertIn("data.max_response_length=1024", args)
@@ -110,7 +117,7 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertEqual(captured["reward_env"]["GROOVE_JUDGE_MODEL"], "Qwen3.8-27B")
                     self.assertEqual(captured["reward_env"]["GROOVE_JUDGE_BASE_URL"], "http://127.0.0.1:8002/v1")
                     self.assertEqual(captured["reward_env"]["GROOVE_JUDGE_CONCURRENCY"], "128")
-                    self.assertEqual(captured["reward_env"]["GROOVE_REPETITION_ZERO_REWARD"], "false")
+                    self.assertEqual(captured["reward_env"]["GROOVE_REPETITION_ZERO_REWARD"], repetition_override or "true")
                     self.assertEqual(captured["reward_env"]["GROOVE_REPETITION_MIN_REPEATS"], "7")
 
 

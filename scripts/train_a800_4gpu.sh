@@ -31,14 +31,12 @@ case "$TRAINING_MODE" in
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
     OPSD_ENABLED=false; USE_VERL_V1=true; DYNAMIC_SAMPLING=false
     USE_REFERENCE_KL=true; REFERENCE_KL_COEF=0.01; PPO_CLIP_RATIO_HIGH=0.2
-    DAPO_OVERLONG_ENABLED=false
     export WANDB_MODE="${WANDB_MODE:-online}"
     ;;
   dapo)
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
     OPSD_ENABLED=false; USE_VERL_V1=true; DYNAMIC_SAMPLING=true
     USE_REFERENCE_KL=false; REFERENCE_KL_COEF=0.0; PPO_CLIP_RATIO_HIGH=0.28
-    DAPO_OVERLONG_ENABLED="${DAPO_OVERLONG_ENABLED:-true}"
     export WANDB_MODE="${WANDB_MODE:-online}"
     ;;
   grpo_opsd|groove)
@@ -46,7 +44,6 @@ case "$TRAINING_MODE" in
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_opsd_4000_seed20260917}"
     OPSD_ENABLED=true; USE_VERL_V1=false; DYNAMIC_SAMPLING=false
     USE_REFERENCE_KL=true; REFERENCE_KL_COEF=0.01; PPO_CLIP_RATIO_HIGH=0.2
-    DAPO_OVERLONG_ENABLED=false
     export WANDB_MODE=offline
     ;;
   *) echo "TRAINING_MODE must be grpo, dapo, or grpo_opsd (groove)." >&2; exit 2 ;;
@@ -78,8 +75,6 @@ TEST_FREQ="${TEST_FREQ:-10}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
 MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-2}"
-DAPO_OVERLONG_BUFFER="${DAPO_OVERLONG_BUFFER:-128}"
-DAPO_OVERLONG_PENALTY="${DAPO_OVERLONG_PENALTY:-1.0}"
 
 # ---- FSDP and one TP=1 vLLM rollout replica per GPU. ----
 TRAINING_FSDP_STRATEGY=fsdp
@@ -312,10 +307,8 @@ REWARD=(
   reward.reward_manager.source=importlib
   reward.reward_manager.name=VisualQARewardManager
   reward.reward_manager.module.path="$PROJECT_ROOT/src/groove/reward_manager.py"
-  ++reward.reward_kwargs.max_resp_len="$MAX_RESPONSE_LENGTH"
-  ++reward.reward_kwargs.overlong_buffer_cfg.enable="$DAPO_OVERLONG_ENABLED"
-  ++reward.reward_kwargs.overlong_buffer_cfg.len="$DAPO_OVERLONG_BUFFER"
-  ++reward.reward_kwargs.overlong_buffer_cfg.penalty_factor="$DAPO_OVERLONG_PENALTY"
+  # The generation limit does not change the reward in any training mode.
+  ++reward.reward_kwargs.overlong_buffer_cfg.enable=false
   reward.custom_reward_function.path="$CUSTOM_REWARD_FUNCTION_PATH"
   reward.custom_reward_function.name="$CUSTOM_REWARD_FUNCTION_NAME"
   reward.custom_reward_function.reward_kwargs.answer_reward_weight="$ANSWER_REWARD_WEIGHT"

@@ -77,14 +77,16 @@ The four-card profile uses 16 agent workers, 4 reward workers and 65536-token
 budgets; the two-card profile uses 8, 1 and 32768 respectively.
 See [standalone launchers](TRAINING_LAUNCHERS.md) for full machine settings.
 
-`src/groove/reward_manager.py` adds optional DAPO overlong shaping only to training.
+`src/groove/reward_manager.py` retains optional training-only overlong shaping,
+but both standalone launchers disable it in every mode and no longer read the
+legacy `DAPO_OVERLONG_*` environment variables.
 It retains raw semantic accuracy and exposes the final optimized scalar as
 `training_reward` for native group filtering. Benchmark validation is exempt.
 Native V1 diagnostics retain scalar reward components and rollout reward details;
 logged `score` is the final optimized reward, while `reward_function_score` retains
 the reward function's value before manager shaping.
-DAPO uses clip low/high 0.2/0.28, no reference KL, and a 128-token soft buffer under
-the unchanged 1024-token response limit. V1 budgets updates by dataset size / batch
+DAPO uses clip low/high 0.2/0.28 and no reference KL. The unchanged 1024-token
+response limit does not add a length reward penalty. V1 budgets updates by dataset size / batch
 size; dynamic refill can consume additional passes over the source dataset.
 The existing GRPO + OPSD credit allocation and uniform-group behavior are unchanged.
 

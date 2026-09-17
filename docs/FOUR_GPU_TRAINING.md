@@ -21,7 +21,7 @@ TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=my-opsd-4gpu-run01 \
 
 每份脚本都可以复制后固定机器和实验参数。Siton 两卡的独立模板是
 `scripts/train_siton_2gpu.sh`，不引用四卡脚本。
-算法和 Trainer 对应关系、DAPO 过滤字段及超长惩罚见 [训练入口说明](TRAINING_LAUNCHERS.md)。
+算法和 Trainer 对应关系、DAPO 过滤字段及关闭超长奖励惩罚的设置见 [训练入口说明](TRAINING_LAUNCHERS.md)。
 
 ## 本机四卡参数
 
