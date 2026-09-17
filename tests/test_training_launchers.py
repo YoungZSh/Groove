@@ -27,11 +27,12 @@ class TrainingLauncherTest(unittest.TestCase):
         with TemporaryDirectory() as folder:
             project = Path(folder) / "project"
             (project / "scripts").mkdir(parents=True)
-            for name in ["run_groove.sh", "run_grpo_2b.sh", "run_grpo_opsd_2b.sh"]:
+            for name in ["train_siton_2gpu.sh"]:
                 shutil.copy2(ROOT / "scripts" / name, project / "scripts" / name)
             data_paths = {
-                "run_grpo_2b.sh": project / "data/vstar_grpo_2200_seed20260904",
-                "run_grpo_opsd_2b.sh": project / "data/vstar_opsd_2200_seed20260904",
+                "grpo": project / "data/vstar_grpo_4000_seed20260917",
+                "dapo": project / "data/vstar_grpo_4000_seed20260917",
+                "grpo_opsd": project / "data/vstar_opsd_4000_seed20260917",
             }
             if override_data:
                 data_paths = dict.fromkeys(data_paths, Path(folder) / "existing split")
@@ -53,12 +54,13 @@ class TrainingLauncherTest(unittest.TestCase):
                 "}}))\n"
             )
             binary.chmod(0o755)
-            for name, enabled in [("run_grpo_2b.sh", "false"),
-                                  ("run_grpo_opsd_2b.sh", "true")]:
+            for name, enabled in [("grpo", "false"),
+                                  ("dapo", "false"),
+                                  ("grpo_opsd", "true")]:
                 with self.subTest(launcher=name):
                     env = {
                         **os.environ, "PYTHON_BIN": str(binary),
-                        "EXPERIMENT_NAME": "unit-launcher-" + name,
+                        "EXPERIMENT_NAME": "unit-launcher-" + name, "TRAINING_MODE": name,
                         "GROOVE_DRY_RUN": "true", "PYTHONPATH": str(ROOT / "src"),
                         "GROOVE_JUDGE_API_KEY": "unit-judge-key",
                         "GROOVE_REPETITION_ZERO_REWARD": "false",
@@ -75,7 +77,7 @@ class TrainingLauncherTest(unittest.TestCase):
                     if override_validation:
                         env["VALIDATION_FILE"] = str(validation)
                     result = subprocess.run(
-                        ["bash", str(project / "scripts" / name)], cwd=project,
+                        ["bash", str(project / "scripts/train_siton_2gpu.sh")], cwd=project,
                         env=env,
                         check=True, capture_output=True, text=True,
                     )
@@ -84,6 +86,8 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("data.response_format=reasoning_answer", args)
                     self.assertIn("data.apply_chat_template_kwargs.enable_thinking=false", args)
                     self.assertIn("groove.enabled=" + enabled, args)
+                    self.assertIn("trainer.use_v1=" + ("false" if enabled == "true" else "true"), args)
+                    self.assertIn("algorithm.filter_groups.enable=" + ("true" if name == "dapo" else "false"), args)
                     self.assertIn("actor_rollout_ref.actor.policy_loss.loss_mode=vanilla", args)
                     self.assertIn("reward.custom_reward_function.reward_kwargs.format_reward_weight=0.2", args)
                     self.assertIn("data.train_batch_size=16", args)

@@ -10,7 +10,7 @@ from groove.objective import validate_objective_config
 
 class ObjectiveConfigTest(unittest.TestCase):
     def test_joint_preset_keeps_one_shared_ppo_loss_and_reference_regularization(self):
-        config_dir = str(Path(__file__).resolve().parents[1] / "src/verl/trainer/config")
+        config_dir = str(Path(__file__).resolve().parents[1] / "configs")
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             config = compose(config_name="groove", overrides=["groove.enabled=true"])
         validate_objective_config(config)

@@ -21,9 +21,9 @@ class FourGpuLauncherTest(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.project = Path(self.folder.name) / "project"
         (self.project / "scripts").mkdir(parents=True)
-        for name in ("run_2b_4gpu.sh", "run_grpo_2b.sh", "run_grpo_opsd_2b.sh", "run_groove.sh"):
+        for name in ("train_a800_4gpu.sh",):
             shutil.copy2(ROOT / "scripts" / name, self.project / "scripts" / name)
-        for name in ("vstar_grpo_2200_seed20260904", "vstar_opsd_2200_seed20260904"):
+        for name in ("vstar_grpo_4000_seed20260917", "vstar_opsd_4000_seed20260917"):
             self.make_data(self.project / "data" / name)
         self.validation = self.project / "data/vstar_bench/validation.parquet"
         self.validation.parent.mkdir(parents=True)
@@ -64,21 +64,22 @@ class FourGpuLauncherTest(unittest.TestCase):
 
     def run_launcher(self, *, overrides=None, args=()):
         return subprocess.run(
-            ["bash", str(self.project / "scripts/run_2b_4gpu.sh"), *args],
+            ["bash", str(self.project / "scripts/train_a800_4gpu.sh"), *args],
             cwd=self.project, env={**self.env, **(overrides or {})},
             capture_output=True, text=True,
         )
 
     def resolved_config(self, captured):
         with initialize_config_dir(
-            version_base=None, config_dir=str(ROOT / "src/verl/trainer/config")
+            version_base=None, config_dir=str(ROOT / "configs")
         ):
             return compose(config_name="groove", overrides=captured["args"][2:])
 
     def test_both_modes_resolve_four_gpus_and_matching_training_settings(self):
         for mode, enabled, split in (
-            ("grpo", False, "vstar_grpo_2200_seed20260904"),
-            ("grpo_opsd", True, "vstar_opsd_2200_seed20260904"),
+            ("grpo", False, "vstar_grpo_4000_seed20260917"),
+            ("dapo", False, "vstar_grpo_4000_seed20260917"),
+            ("grpo_opsd", True, "vstar_opsd_4000_seed20260917"),
         ):
             with self.subTest(mode=mode):
                 result = self.run_launcher(overrides={"TRAINING_MODE": mode})
@@ -90,6 +91,9 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(captured["env"]["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
                 self.assertEqual(captured["env"]["RAY_NODE_MEMORY_CAP_GIB"], "null")
                 self.assertEqual(config.groove.enabled, enabled)
+                self.assertEqual(config.trainer.use_v1, not enabled)
+                self.assertEqual(config.algorithm.filter_groups.enable, mode == "dapo")
+                self.assertEqual(config.reward.reward_manager.name, "VisualQARewardManager")
                 self.assertEqual(config.data.train_batch_size, 16)
                 self.assertEqual(config.data.max_response_length, 1024)
                 self.assertEqual(config.data.response_format, "reasoning_answer")
@@ -112,13 +116,16 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(actor.policy_loss.loss_mode, "vanilla")
                 self.assertEqual(actor.loss_agg_mode, "token-mean")
                 self.assertEqual(actor.optim.lr, 1e-6)
-                self.assertEqual(actor.kl_loss_coef, 0.01)
+                self.assertEqual(actor.kl_loss_coef, 0.0 if mode == "dapo" else 0.01)
+                self.assertEqual(actor.use_kl_loss, mode != "dapo")
+                self.assertEqual(actor.clip_ratio_high, 0.28 if mode == "dapo" else 0.2)
+                self.assertEqual(config.reward.reward_kwargs.overlong_buffer_cfg.enable, mode == "dapo")
                 self.assertEqual(rollout.n, 8)
                 self.assertEqual(rollout.max_model_len, 10240)
                 self.assertEqual(rollout.tensor_model_parallel_size, 1)
                 self.assertEqual(rollout.data_parallel_size, 1)
                 self.assertEqual(rollout.pipeline_model_parallel_size, 1)
-                self.assertEqual(config.actor_rollout_ref.model.path, "/root/siton-tmp/yzs/ckpts/Qwen3.5-2B")
+                self.assertEqual(config.actor_rollout_ref.model.path, "/ssd/home/zc/yzs/models/ckpts/Qwen3.5-2B")
                 self.assertEqual(rollout.temperature, 1.0)
                 self.assertEqual(rollout.val_kwargs.temperature, 0)
                 self.assertFalse(rollout.val_kwargs.do_sample)
@@ -142,6 +149,23 @@ class FourGpuLauncherTest(unittest.TestCase):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
+
+    def test_groove_alias_selects_only_the_opsd_trainer(self):
+        result = self.run_launcher(overrides={"TRAINING_MODE": "groove"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.resolved_config(json.loads(result.stdout))
+        self.assertTrue(config.groove.enabled)
+        self.assertFalse(config.trainer.use_v1)
+        self.assertFalse(config.algorithm.filter_groups.enable)
+
+    def test_existing_checkpoint_requires_explicit_resume_or_a_new_experiment(self):
+        checkpoint = self.project / "checkpoints/unit-four-gpu"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "latest_checkpointed_iteration.txt").write_text("10")
+        result = self.run_launcher(overrides={"GROOVE_DRY_RUN": "false"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("new EXPERIMENT_NAME", result.stderr)
+        self.assertFalse((self.project / "outputs").exists())
 
     def test_explicit_devices_model_seed_data_and_network_reach_both_modes(self):
         data = Path(self.folder.name) / "existing split"

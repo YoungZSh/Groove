@@ -17,10 +17,14 @@ dependencies = [
 [project.optional-dependencies]
 grounding = ["transformers>=4.57", "torch>=2.4"]
 data = ["datasets>=3", "pandas>=2", "pyarrow>=17"]
+native-training = ["TransferQueue==0.1.10"]
 dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/groove/configs" = ["configs/groove.yaml"]
 
 # The vendored verl runtime loads Hydra YAMLs and its version marker from the
 # package at runtime.  Include them in wheels as well as source checkouts.

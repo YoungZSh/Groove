@@ -1,15 +1,15 @@
-"""Hydra entrypoint that swaps verl's trainer for :class:`GrooveRayPPOTrainer`."""
+"""Shared visual-QA configuration with native VERL or GRPO + OPSD routing."""
 
 from __future__ import annotations
 
 import os
 import socket
 import sys
+import sysconfig
 from pathlib import Path
 from pprint import pprint
 
 import ray
-import verl
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -19,9 +19,9 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
-from .verl_trainer import GrooveRayPPOTrainer
 from .objective import validate_objective_config
 from .response_prompt import configure_response_format
+from .trainer_routing import task_runner_class, trainer_backend
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -153,6 +153,8 @@ def validate_full_time_sharing(config) -> int:
 class GrooveTaskRunner(BaseTaskRunner):
     def run(self, config):
         """Run VERL 0.9's synchronous dataflow with the GROOVE trainer."""
+        from .verl_trainer import GrooveRayPPOTrainer
+
         print(f"GrooveTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
@@ -209,21 +211,26 @@ class GrooveTaskRunner(BaseTaskRunner):
         trainer.fit()
 
 
-def main() -> None:
-    # ``verl`` is vendored in this project's ``src`` tree.  Resolve the
-    # configuration relative to the imported package so the entrypoint works
-    # both from a checkout and from an installed wheel, without a sibling
-    # upstream runtime or an external patch step.
-    config_dir = Path(verl.__file__).resolve().parent / "trainer" / "config"
-    if not config_dir.is_dir():
+def load_training_config(config_name: str, overrides: list[str]):
+    # Project presets live outside the vendored runtime. Wheels install them
+    # under the Python environment's shared-data directory.
+    config_dir = Path(__file__).resolve().parents[2] / "configs"
+    if not (config_dir / "groove.yaml").is_file():
+        config_dir = Path(sysconfig.get_path("data")) / "share" / "groove" / "configs"
+    if not (config_dir / "groove.yaml").is_file():
         raise FileNotFoundError(
-            f"Bundled verl config was not found at {config_dir}"
+            f"GROOVE training config was not found at {config_dir}"
         )
-    config_name = os.environ.get("VERL_CONFIG_NAME", "groove")
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
-        config = compose(config_name=config_name, overrides=sys.argv[1:])
+        return compose(config_name=config_name, overrides=overrides)
+
+
+def main() -> None:
+    config_name = os.environ.get("VERL_CONFIG_NAME", "groove")
+    config = load_training_config(config_name, sys.argv[1:])
     configure_response_format(config)
     validate_objective_config(config)
+    backend = trainer_backend(config)
     memory_guard = configure_ray_memory_guard(config)
     sleep_level = validate_full_time_sharing(config)
     auto_set_device(config)
@@ -242,6 +249,7 @@ def main() -> None:
         opsd_enabled = bool(groove_cfg.get("enabled", False))
         print(
             "groove config valid:",
+            f"trainer_backend={backend}",
             policy_loss_mode,
             config.actor_rollout_ref.rollout.n,
             config.trainer.n_gpus_per_node,
@@ -280,9 +288,14 @@ def main() -> None:
             f"response_format={config.data.get('response_format', 'original')}",
             f"dataset_cls={config.data.custom_cls.name}",
             f"custom_chat_template={config.actor_rollout_ref.model.custom_chat_template is not None}",
+            f"clip_low={config.actor_rollout_ref.actor.clip_ratio_low}",
+            f"clip_high={config.actor_rollout_ref.actor.clip_ratio_high}",
+            f"dynamic_sampling={config.algorithm.filter_groups.enable}",
+            f"filter_metric={config.algorithm.filter_groups.metric}",
+            f"reference_kl_enabled={config.actor_rollout_ref.actor.use_kl_loss}",
         )
         return
-    runner = ray.remote(num_cpus=1)(GrooveTaskRunner)
+    runner = task_runner_class(backend)
     run_ppo(config, task_runner_class=runner)
 
 

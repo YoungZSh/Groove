@@ -61,6 +61,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
+from verl.trainer.ppo.reward_metrics import reward_columns, reward_extra_metrics
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.trainer.ppo.utils import (
@@ -1206,8 +1207,9 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            extra_fields = data.pop("extra_fields").tolist()
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
@@ -1237,7 +1239,12 @@ class PPOTrainer(ABC):
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
 
-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict = reward_columns(extra_fields, sorted_indices)
+            # Keep the logged score equal to the actual optimized reward, even
+            # when a reward manager adds shaping after the custom reward function.
+            if "score" in reward_extra_infos_dict:
+                reward_extra_infos_dict["reward_function_score"] = reward_extra_infos_dict.pop("score")
+            reward_extra_infos_dict["uid"] = [batch.keys[i] for i in sorted_indices]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1723,6 +1730,7 @@ class PPOTrainer(ABC):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "extra_fields",
         ]
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
@@ -1735,6 +1743,7 @@ class PPOTrainer(ABC):
             kv_batch_get=tq.kv_batch_get,
         )
 
+        metrics.update(reward_extra_metrics(data.pop("extra_fields").tolist(), non_padding_mask))
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()

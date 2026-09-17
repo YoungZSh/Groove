@@ -1,85 +1,91 @@
-project:
-  name: groove-visual-evidence
-  rollout_count: 8
-  mixed_groups_only: false
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
 
-dataset:
-  name: Vision-OPD-6K
-  source_rows: 6241
-  split_random_state: 42
-  train_rows: 5928
-  test_rows: 313
-  student_image_policy: unboxed_original_images_only
-  oracle_metadata_visible_to_model: false
+defaults:
+  - ppo_trainer
+  - _self_
 
-objective:
-  grpo_scope: all_rollouts
-  opsd_scope: all_rollouts_in_evidence_groups
-  reward_complement_mask: false
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    enable_activation_offload: false
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
+  actor:
+    optim:
+      lr: 1.0e-6
+      override_optimizer_config:
+        fused: true
+        foreach: false
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    calculate_entropy: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      reshard_after_forward: true
+    policy_loss:
+      loss_mode: vanilla
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+  rollout:
+    mode: async
+    n: 8
+    calculate_log_probs: true
+    log_prob_micro_batch_size_per_gpu: 1
+    gpu_memory_utilization: 0.6
+    free_cache_engine: true
+    enable_sleep_mode: true
+    layered_summon: false
+    enforce_eager: true
+    load_format: dummy
+    enable_chunked_prefill: true
+    max_num_seqs: 16
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+
+data:
+  # The 2B launchers opt into plain reasoning followed by one terminal answer.
+  response_format: original
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  image_max_pixels: null
+
+reward:
+  custom_reward_function:
+    reward_kwargs:
+      answer_reward_weight: 0.9
+      format_reward_weight: 0.1
+
+# Project-specific OPSD settings are inert during pure GRPO. They stay outside
+# VERL's typed ActorConfig and are consumed only by the GROOVE adapter.
+groove:
+  enabled: false
+  # Both contexts are scored by the pre-update actor. Targets stay detached
+  # throughout this rollout batch's PPO updates and refresh on the next batch.
   opsd_advantage_coef: 0.01
   opsd_advantage_clip: null
+  teacher_image_key: groove_teacher_images
+  max_reprompt_len: 9216
 
-terminal_reward:
-  answer_reward_weight: 0.9
-  format_reward_weight: 0.1
-  final_answer_format: "FINAL: X"
+trainer:
+  use_v1: false
+  val_before_train: false
 
-analyzer:
-  provider: openai_compatible
-  model_env: ANALYZER_MODEL
-  base_url_env: ANALYZER_BASE_URL
-  api_key_env: ANALYZER_API_KEY
-  ground_truth_visible: false
-  temperature: 0.0
-  max_completion_tokens: 2048
-  api_retries: 5
-
-evidence_aligned_training:
-  learning_rate: 1.0e-6
-  ppo_clip_ratio: 0.2
-  ppo_epochs: 1
-  entropy_coef: 0.0
-  reference_kl_coef: 0.001
-  reference_kl_type: low_var_kl
-  norm_adv_by_group_std: true
-  total_training_epochs: 1
-  full_split_steps_at_batch_2: 2964
-  pilot_training_steps: 150
-  hardware_adjusted_train_batch_size: 2
-
-grounding:
-  model: IDEA-Research/grounding-dino-base
-  max_objects: 3
-  crop_mode: per_object
-  context_margin_source: analyzer
-  min_short_side: 768
-
-teacher:
-  model_source: pre_update_actor
-  refresh: every_rollout_batch
-  targets_fixed_during_update: true
-  prefix: original_image_plus_focus_text_plus_independent_crops
-  interleaved_reasoning: false
-
-student:
-  prompt: original_image_only
-  thinking_mode: false
-
-memory_schedule:
-  hybrid_actor_rollout_colocation: true
-  vllm_sleep_level: 2
-  release_rollout_weights_and_kv_before_training: true
-  disable_cuda_graph_for_full_release: true
-  actor_param_cpu_offload: true
-  actor_optimizer_cpu_offload: true
-  actor_activation_cpu_offload: true
-  reference_param_cpu_offload: true
-  gradient_checkpointing: true
-  fused_lm_head: true
-  fused_adamw: true
-  per_gpu_micro_batch_size: 1
-  host_memory_cap_gib: 220
-  ray_guard_headroom_gib: 4
-  ray_usage_threshold_ceiling: 0.95
-  ray_object_store_gib: 8
-  ray_monitor_refresh_ms: 100
+ray_kwargs:
+  ray_init:
+    include_dashboard: false
+    object_store_memory: 8589934592
