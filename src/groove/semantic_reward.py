@@ -9,6 +9,7 @@ V*Bench validation uses the shared deterministic option scorer instead.
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
 import json
 import math
 import os
@@ -358,11 +359,14 @@ def _judge_one(
                     repetition_hit.total_characters if repetition_hit else 0
                 ),
             }
-        except (KeyError, ValueError, TimeoutError, urllib.error.URLError) as exc:
+        except (
+            KeyError, ValueError, TimeoutError, ConnectionError,
+            http.client.HTTPException, urllib.error.URLError,
+        ) as exc:
             last_error = exc
             if attempt < max_retries:
                 time.sleep(0.5 * (2**attempt))
-    raise RuntimeError(f"remote semantic judge failed after retries: {last_error}")
+    raise RuntimeError(f"remote semantic judge failed after retries: {last_error}") from last_error
 
 
 def compute_score_batched(

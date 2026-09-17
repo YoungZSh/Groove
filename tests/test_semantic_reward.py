@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from groove.semantic_reward import (
     _judge_one,
@@ -59,6 +60,55 @@ class SemanticRewardLoopTest(unittest.TestCase):
         self.assertEqual(body["max_completion_tokens"], 4)
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["format_reward"], 0.0)
+
+    def test_judge_retries_disconnects_and_resets_without_changing_reward(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "2"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", side_effect=[
+                http.client.RemoteDisconnected("closed before response"),
+                ConnectionResetError("reset"), response,
+            ]) as urlopen,
+            patch("groove.semantic_reward.json.load", return_value={"choices": [{"message": {"content": "1"}}]}),
+            patch("groove.semantic_reward.time.sleep") as sleep,
+        ):
+            result = _judge_one("What color?", "green", "<answer>green</answer>")
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(0.5), call(1.0)])
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["score"], 1.0)
+
+    def test_judge_retries_an_incomplete_http_response(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "1"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", side_effect=[
+                http.client.IncompleteRead(b'{"choices":', 30),
+                {"choices": [{"message": {"content": "0"}}]},
+            ]),
+            patch("groove.semantic_reward.time.sleep") as sleep,
+        ):
+            result = _judge_one("What color?", "green", "<answer>blue</answer>")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(result["accuracy"], 0.0)
+        self.assertEqual(result["score"], 0.0)
+
+    def test_disconnect_retries_are_bounded_and_do_not_fabricate_a_score(self):
+        error = http.client.RemoteDisconnected("closed before response")
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "2"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", side_effect=error) as urlopen,
+            patch("groove.semantic_reward.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed after retries") as caught:
+                _judge_one("What color?", "green", "<answer>green</answer>")
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(0.5), call(1.0)])
+        self.assertIs(caught.exception.__cause__, error)
 
     def test_bare_correct_answer_gets_format_penalty(self):
         response = MagicMock()
