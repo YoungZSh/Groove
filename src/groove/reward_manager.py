@@ -8,10 +8,12 @@ from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManage
 
 
 class VisualQARewardManager(NaiveRewardManager):
-    """Apply optional DAPO length shaping to training, preserving raw accuracy.
+    """Expose shared visual-QA rewards while preserving raw semantic accuracy.
 
     ``training_reward`` is the final scalar actually optimized, so native VERL's
-    group filter sees format, repetition and length shaping consistently.
+    group filter sees format and repetition handling consistently. Current
+    launchers disable length shaping in all three modes; the optional buffer
+    remains available for explicitly configured historical experiments.
     Benchmark validation always retains the custom scorer's original reward.
     """
 

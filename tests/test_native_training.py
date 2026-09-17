@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from importlib.util import find_spec
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 import unittest
 
 import numpy as np
@@ -121,6 +121,40 @@ class VisualQARewardManagerTest(unittest.IsolatedAsyncioTestCase):
         result = await self.manager(config=self.config(enabled=False)).run_single(self.batch(1024))
         self.assertEqual(result["reward_score"], 0.8)
         self.assertEqual(result["reward_extra_info"]["overlong_reward"], 0)
+
+    async def test_shared_reward_keeps_format_and_repetition_at_the_generation_limit(self):
+        manager = self.manager(config=self.config(enabled=False), scorer=compute_score)
+        repeated = "looping answer token sequence " * 10
+        cases = (
+            ("<answer>D</answer>", 1, 1.0, 0),
+            ("<answer>A</answer>", 0, 0.0, 0),
+            ("D", 1, 0.8, 0),
+            ("A", 0, -0.2, 0),
+            (repeated + "<answer>D</answer>", 1, 0.0, 1),
+            (repeated + "D", 1, -0.2, 1),
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        environment = {
+            "GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "0",
+            "GROOVE_REPETITION_ZERO_REWARD": "true", "GROOVE_REPETITION_MIN_REPEATS": "4",
+            "GROOVE_REPETITION_MIN_TOTAL_CHARACTERS": "80",
+        }
+        with patch.dict("os.environ", environment), \
+             patch("groove.semantic_reward.urllib.request.urlopen", return_value=response), \
+             patch("groove.semantic_reward.json.load") as judge:
+            for length in (128, 896, 1024):
+                for output, accuracy, expected_score, repetition in cases:
+                    with self.subTest(length=length, output=output):
+                        manager.tokenizer.decode.return_value = output
+                        judge.return_value = {"choices": [{"message": {"content": str(accuracy)}}]}
+                        result = await manager.run_single(self.batch(length))
+                        self.assertAlmostEqual(result["reward_score"], expected_score)
+                        extra = result["reward_extra_info"]
+                        self.assertEqual(extra["accuracy"], accuracy)
+                        self.assertEqual(extra["severe_repetition"], repetition)
+                        self.assertEqual(extra["overlong_reward"], 0)
+                        self.assertEqual(extra["training_reward"], result["reward_score"])
 
     async def test_invalid_length_settings_are_rejected(self):
         for config in (self.config(buffer=0), self.config(buffer=1025), self.config(penalty=-1), self.config(penalty=float("nan"))):
