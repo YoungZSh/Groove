@@ -97,12 +97,6 @@ ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
 ROLLOUT_MAX_NUM_SEQS=64
 ROLLOUT_ENFORCE_EAGER=true
 ROLLOUT_FREE_CACHE_ENGINE=true
-OPTIMIZER_OVERRIDES=(
-  actor_rollout_ref.actor.optim.optimizer_impl=torch.optim
-  actor_rollout_ref.actor.optim.optimizer=AdamW
-  actor_rollout_ref.actor.optim.override_optimizer_config.fused=true
-  actor_rollout_ref.actor.optim.override_optimizer_config.foreach=false
-)
 
 # ---- Shared training Judge and reward shaping. Validation uses the local scorer. ----
 CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/semantic_reward.py"
@@ -145,13 +139,6 @@ export OPSD_LOG_PROB_DUMP_DIR="$PROJECT_ROOT/outputs/opsd-token-dumps/$EXPERIMEN
 export GROUNDING_DINO_MODEL=IDEA-Research/grounding-dino-base
 export GROUNDING_DINO_DEVICE=cpu
 export GROUNDING_DINO_LOCAL_FILES_ONLY=true
-OPSD_OVERRIDES=(
-  actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
-  "groove.enabled=$OPSD_ENABLED"
-  groove.opsd_advantage_coef=0.01
-  groove.opsd_advantage_clip=null
-  "groove.max_reprompt_len=$MAX_MODEL_LEN"
-)
 
 # ---- Logging and process environment. These settings also reach Ray workers. ----
 TRAINER_LOGGER='["console","wandb"]'
@@ -174,10 +161,6 @@ export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_
 for address in $(hostname -I 2>/dev/null || true); do NO_PROXY+=",$address"; done
 export no_proxy="$NO_PROXY"
 unset VLLM_USE_V1 VLLM_ATTENTION_BACKEND
-RUNTIME_ENV_OVERRIDES=()
-for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS; do
-  RUNTIME_ENV_OVERRIDES+=("++ray_kwargs.ray_init.runtime_env.env_vars.$variable=\"${!variable}\"")
-done
 
 # ---- Fail before allocating GPU workers if the experiment is inconsistent. ----
 if [[ "$N_GPUS" != "$EXPECTED_GPUS" ]]; then
@@ -206,128 +189,198 @@ if [[ ! -f "$TRAIN_FILE" || ! -f "$TEST_FILE" ]]; then
   echo "Missing prepared data: $TRAIN_FILE or $TEST_FILE" >&2; exit 2
 fi
 
-# ---- Complete resolved experiment passed directly to Python, no shell wrappers. ----
-COMMAND=("$PYTHON_BIN" -m groove.verl_entrypoint \
-  "data.train_files=['$TRAIN_FILE']" \
-  "data.val_files=['$TEST_FILE']" \
-  data.val_batch_size="${VAL_BATCH_SIZE:-null}" \
-  data.train_batch_size="$TRAIN_BATCH_SIZE" \
-  data.response_format="$STUDENT_RESPONSE_FORMAT" \
-  data.max_prompt_length="$MAX_PROMPT_LENGTH" \
-  data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING" \
-  data.image_max_pixels="$STUDENT_IMAGE_MAX_PIXELS" \
-  data.image_patch_size="$STUDENT_IMAGE_PATCH_SIZE" \
-  data.max_response_length="$MAX_RESPONSE_LENGTH" \
-  data.filter_overlong_prompts=false \
-  data.truncation=error \
-  data.shuffle=true \
-  data.seed="$SEED" \
-  data.return_multi_modal_inputs=true \
-  data.dataloader_num_workers=0 \
-  actor_rollout_ref.model.path="$MODEL_PATH" \
-  actor_rollout_ref.model.trust_remote_code=true \
-  actor_rollout_ref.model.use_remove_padding="$MODEL_USE_REMOVE_PADDING" \
-  actor_rollout_ref.model.enable_gradient_checkpointing=true \
-  actor_rollout_ref.model.enable_activation_offload="$ACTOR_ACTIVATION_OFFLOAD" \
-  actor_rollout_ref.model.use_fused_kernels="$USE_FUSED_KERNELS" \
-  actor_rollout_ref.model.fused_kernel_options.impl_backend=torch \
-  actor_rollout_ref.actor.use_torch_compile="$ACTOR_USE_TORCH_COMPILE" \
-  actor_rollout_ref.ref.use_torch_compile=false \
-  actor_rollout_ref.actor.fsdp_config.use_torch_compile="$ACTOR_FSDP_USE_TORCH_COMPILE" \
-  actor_rollout_ref.ref.fsdp_config.use_torch_compile=false \
-  actor_rollout_ref.hybrid_engine=true \
-  actor_rollout_ref.rollout.n="$ROLLOUT_N" \
-  actor_rollout_ref.rollout.temperature=1.0 \
-  actor_rollout_ref.rollout.top_p=1.0 \
-  actor_rollout_ref.rollout.top_k=-1 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=false \
-  actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.seed="$SEED" \
-  actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.mode=async \
-  actor_rollout_ref.rollout.agent.num_workers="$ROLLOUT_AGENT_NUM_WORKERS" \
-  actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TENSOR_PARALLEL_SIZE" \
-  actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
-  actor_rollout_ref.rollout.free_cache_engine="$ROLLOUT_FREE_CACHE_ENGINE" \
-  actor_rollout_ref.rollout.enable_sleep_mode=true \
-  actor_rollout_ref.rollout.layered_summon=false \
-  actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
-  actor_rollout_ref.rollout.load_format=dummy \
-  actor_rollout_ref.rollout.enable_chunked_prefill=true \
-  actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
-  actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
-  actor_rollout_ref.rollout.max_num_batched_tokens="$ROLLOUT_MAX_NUM_BATCHED_TOKENS" \
-  actor_rollout_ref.rollout.response_length="$MAX_RESPONSE_LENGTH" \
-  actor_rollout_ref.rollout.calculate_log_probs=true \
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-  actor_rollout_ref.actor.optim.lr="$LEARNING_RATE" \
-  "${OPTIMIZER_OVERRIDES[@]}" \
-  actor_rollout_ref.actor.strategy="$TRAINING_FSDP_STRATEGY" \
-  actor_rollout_ref.actor.fsdp_config.strategy="$TRAINING_FSDP_STRATEGY" \
-  actor_rollout_ref.actor.fsdp_config.offload_policy="$ACTOR_FSDP_OFFLOAD_POLICY" \
-  actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-  actor_rollout_ref.actor.ppo_epochs=1 \
-  actor_rollout_ref.actor.data_loader_seed="$SEED" \
-  actor_rollout_ref.actor.fsdp_config.seed="$SEED" \
-  actor_rollout_ref.actor.clip_ratio="$PPO_CLIP_RATIO" \
-  actor_rollout_ref.actor.clip_ratio_low="$PPO_CLIP_RATIO" \
-  actor_rollout_ref.actor.clip_ratio_high="$PPO_CLIP_RATIO_HIGH" \
-  actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE" \
-  actor_rollout_ref.actor.entropy_coeff=0.0 \
-  actor_rollout_ref.actor.use_dynamic_bsz=true \
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU" \
-  actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD" \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_OPTIMIZER_OFFLOAD" \
-  actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true \
-  actor_rollout_ref.actor.use_kl_loss="$USE_REFERENCE_KL" \
-  actor_rollout_ref.actor.kl_loss_coef="$REFERENCE_KL_COEF" \
-  actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-  actor_rollout_ref.ref.fsdp_config.seed="$SEED" \
-  actor_rollout_ref.ref.fsdp_config.param_offload="$REF_PARAM_OFFLOAD" \
-  "${OPSD_OVERRIDES[@]}" \
-  algorithm.adv_estimator=grpo \
-  algorithm.norm_adv_by_std_in_grpo=true \
-  algorithm.use_kl_in_reward=false \
-  algorithm.filter_groups.enable="$DYNAMIC_SAMPLING" \
-  algorithm.filter_groups.metric=training_reward \
-  algorithm.filter_groups.max_num_gen_batches=0 \
-  algorithm.filter_groups.max_inflight_gen_batches=1 \
-  transfer_queue.backend.SimpleStorage.num_data_storage_units=2 \
-  reward.reward_model.enable=false \
-  reward.num_workers="$REWARD_NUM_WORKERS" \
-  reward.reward_manager.source=importlib \
-  reward.reward_manager.name=VisualQARewardManager \
-  reward.reward_manager.module.path="$PROJECT_ROOT/src/groove/reward_manager.py" \
-  ++reward.reward_kwargs.max_resp_len="$MAX_RESPONSE_LENGTH" \
-  ++reward.reward_kwargs.overlong_buffer_cfg.enable="$DAPO_OVERLONG_ENABLED" \
-  ++reward.reward_kwargs.overlong_buffer_cfg.len="$DAPO_OVERLONG_BUFFER" \
-  ++reward.reward_kwargs.overlong_buffer_cfg.penalty_factor="$DAPO_OVERLONG_PENALTY" \
-  reward.custom_reward_function.path="$CUSTOM_REWARD_FUNCTION_PATH" \
-  reward.custom_reward_function.name="$CUSTOM_REWARD_FUNCTION_NAME" \
-  reward.custom_reward_function.reward_kwargs.answer_reward_weight="$ANSWER_REWARD_WEIGHT" \
-  reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT" \
-  trainer.project_name=groove-visual-evidence \
-  trainer.experiment_name="$EXPERIMENT_NAME" \
-  trainer.logger="$TRAINER_LOGGER" \
-  trainer.n_gpus_per_node="$N_GPUS" \
-  trainer.nnodes=1 \
-  trainer.total_epochs="$TOTAL_EPOCHS" \
-  trainer.total_training_steps="$TOTAL_STEPS" \
-  trainer.save_freq="$SAVE_FREQ" \
-  trainer.max_actor_ckpt_to_keep="$MAX_ACTOR_CKPT_TO_KEEP" \
-  trainer.test_freq="$TEST_FREQ" \
-  trainer.val_before_train="$VAL_BEFORE_TRAIN" \
-  trainer.use_v1="$USE_VERL_V1" \
-  trainer.v1.trainer_mode=sync \
-  trainer.resume_mode="$RESUME_MODE" \
-  trainer.resume_from_path="$RESUME_FROM_PATH" \
-  trainer.default_local_dir="$CHECKPOINT_DIR" \
-  trainer.rollout_data_dir="$ROLLOUT_DATA_DIR" \
-  "${RUNTIME_ENV_OVERRIDES[@]}" \
-  "$@")
+########################### parameter arrays ###########################
+
+# Training and validation data; Student input format.
+DATA=(
+  "data.train_files=['$TRAIN_FILE']"
+  "data.val_files=['$TEST_FILE']"
+  data.val_batch_size="${VAL_BATCH_SIZE:-null}"
+  data.train_batch_size="$TRAIN_BATCH_SIZE"
+  data.response_format="$STUDENT_RESPONSE_FORMAT"
+  data.max_prompt_length="$MAX_PROMPT_LENGTH"
+  data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING"
+  data.image_max_pixels="$STUDENT_IMAGE_MAX_PIXELS"
+  data.image_patch_size="$STUDENT_IMAGE_PATCH_SIZE"
+  data.max_response_length="$MAX_RESPONSE_LENGTH"
+  data.filter_overlong_prompts=false
+  data.truncation=error
+  data.shuffle=true
+  data.seed="$SEED"
+  data.return_multi_modal_inputs=true
+  data.dataloader_num_workers=0
+)
+
+# Shared model and hybrid-engine settings.
+MODEL=(
+  actor_rollout_ref.model.path="$MODEL_PATH"
+  actor_rollout_ref.model.trust_remote_code=true
+  actor_rollout_ref.model.use_remove_padding="$MODEL_USE_REMOVE_PADDING"
+  actor_rollout_ref.model.enable_gradient_checkpointing=true
+  actor_rollout_ref.model.enable_activation_offload="$ACTOR_ACTIVATION_OFFLOAD"
+  actor_rollout_ref.model.use_fused_kernels="$USE_FUSED_KERNELS"
+  actor_rollout_ref.model.fused_kernel_options.impl_backend=torch
+  actor_rollout_ref.hybrid_engine=true
+)
+
+# Optimizer, PPO loss and FSDP updates.
+ACTOR=(
+  actor_rollout_ref.actor.use_torch_compile="$ACTOR_USE_TORCH_COMPILE"
+  actor_rollout_ref.actor.fsdp_config.use_torch_compile="$ACTOR_FSDP_USE_TORCH_COMPILE"
+  actor_rollout_ref.actor.optim.lr="$LEARNING_RATE"
+  actor_rollout_ref.actor.optim.optimizer_impl=torch.optim
+  actor_rollout_ref.actor.optim.optimizer=AdamW
+  actor_rollout_ref.actor.optim.override_optimizer_config.fused=true
+  actor_rollout_ref.actor.optim.override_optimizer_config.foreach=false
+  actor_rollout_ref.actor.strategy="$TRAINING_FSDP_STRATEGY"
+  actor_rollout_ref.actor.fsdp_config.strategy="$TRAINING_FSDP_STRATEGY"
+  actor_rollout_ref.actor.fsdp_config.offload_policy="$ACTOR_FSDP_OFFLOAD_POLICY"
+  actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE"
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+  actor_rollout_ref.actor.ppo_epochs=1
+  actor_rollout_ref.actor.data_loader_seed="$SEED"
+  actor_rollout_ref.actor.fsdp_config.seed="$SEED"
+  actor_rollout_ref.actor.clip_ratio="$PPO_CLIP_RATIO"
+  actor_rollout_ref.actor.clip_ratio_low="$PPO_CLIP_RATIO"
+  actor_rollout_ref.actor.clip_ratio_high="$PPO_CLIP_RATIO_HIGH"
+  actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE"
+  actor_rollout_ref.actor.entropy_coeff=0.0
+  actor_rollout_ref.actor.use_dynamic_bsz=true
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU"
+  actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD"
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_OPTIMIZER_OFFLOAD"
+  actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true
+  actor_rollout_ref.actor.use_kl_loss="$USE_REFERENCE_KL"
+  actor_rollout_ref.actor.kl_loss_coef="$REFERENCE_KL_COEF"
+  actor_rollout_ref.actor.kl_loss_type=low_var_kl
+  actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
+)
+
+# vLLM sampling and validation generation.
+ROLLOUT=(
+  actor_rollout_ref.rollout.n="$ROLLOUT_N"
+  actor_rollout_ref.rollout.temperature=1.0
+  actor_rollout_ref.rollout.top_p=1.0
+  actor_rollout_ref.rollout.top_k=-1
+  actor_rollout_ref.rollout.val_kwargs.temperature=0.0
+  actor_rollout_ref.rollout.val_kwargs.do_sample=false
+  actor_rollout_ref.rollout.val_kwargs.n=1
+  actor_rollout_ref.rollout.seed="$SEED"
+  actor_rollout_ref.rollout.name=vllm
+  actor_rollout_ref.rollout.mode=async
+  actor_rollout_ref.rollout.agent.num_workers="$ROLLOUT_AGENT_NUM_WORKERS"
+  actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TENSOR_PARALLEL_SIZE"
+  actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION"
+  actor_rollout_ref.rollout.free_cache_engine="$ROLLOUT_FREE_CACHE_ENGINE"
+  actor_rollout_ref.rollout.enable_sleep_mode=true
+  actor_rollout_ref.rollout.layered_summon=false
+  actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER"
+  actor_rollout_ref.rollout.load_format=dummy
+  actor_rollout_ref.rollout.enable_chunked_prefill=true
+  actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS"
+  actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN"
+  actor_rollout_ref.rollout.max_num_batched_tokens="$ROLLOUT_MAX_NUM_BATCHED_TOKENS"
+  actor_rollout_ref.rollout.response_length="$MAX_RESPONSE_LENGTH"
+  actor_rollout_ref.rollout.calculate_log_probs=true
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
+)
+
+# Frozen reference-policy scoring.
+REF=(
+  actor_rollout_ref.ref.use_torch_compile=false
+  actor_rollout_ref.ref.fsdp_config.use_torch_compile=false
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
+  actor_rollout_ref.ref.fsdp_config.seed="$SEED"
+  actor_rollout_ref.ref.fsdp_config.param_offload="$REF_PARAM_OFFLOAD"
+)
+
+# GRPO advantages and optional DAPO group filtering.
+ALGORITHM=(
+  algorithm.adv_estimator=grpo
+  algorithm.norm_adv_by_std_in_grpo=true
+  algorithm.use_kl_in_reward=false
+  algorithm.filter_groups.enable="$DYNAMIC_SAMPLING"
+  algorithm.filter_groups.metric=training_reward
+  algorithm.filter_groups.max_num_gen_batches=0
+  algorithm.filter_groups.max_inflight_gen_batches=1
+)
+
+# Semantic Judge adapter and training-only reward shaping.
+REWARD=(
+  reward.reward_model.enable=false
+  reward.num_workers="$REWARD_NUM_WORKERS"
+  reward.reward_manager.source=importlib
+  reward.reward_manager.name=VisualQARewardManager
+  reward.reward_manager.module.path="$PROJECT_ROOT/src/groove/reward_manager.py"
+  ++reward.reward_kwargs.max_resp_len="$MAX_RESPONSE_LENGTH"
+  ++reward.reward_kwargs.overlong_buffer_cfg.enable="$DAPO_OVERLONG_ENABLED"
+  ++reward.reward_kwargs.overlong_buffer_cfg.len="$DAPO_OVERLONG_BUFFER"
+  ++reward.reward_kwargs.overlong_buffer_cfg.penalty_factor="$DAPO_OVERLONG_PENALTY"
+  reward.custom_reward_function.path="$CUSTOM_REWARD_FUNCTION_PATH"
+  reward.custom_reward_function.name="$CUSTOM_REWARD_FUNCTION_NAME"
+  reward.custom_reward_function.reward_kwargs.answer_reward_weight="$ANSWER_REWARD_WEIGHT"
+  reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT"
+)
+
+# Optional current-policy Teacher credit allocation.
+OPSD=(
+  "groove.enabled=$OPSD_ENABLED"
+  groove.opsd_advantage_coef=0.01
+  groove.opsd_advantage_clip=null
+  "groove.max_reprompt_len=$MAX_MODEL_LEN"
+)
+
+# Experiment identity, logging, checkpoints and execution backend.
+TRAINER=(
+  trainer.project_name=groove-visual-evidence
+  trainer.experiment_name="$EXPERIMENT_NAME"
+  trainer.logger="$TRAINER_LOGGER"
+  trainer.n_gpus_per_node="$N_GPUS"
+  trainer.nnodes=1
+  trainer.total_epochs="$TOTAL_EPOCHS"
+  trainer.total_training_steps="$TOTAL_STEPS"
+  trainer.save_freq="$SAVE_FREQ"
+  trainer.max_actor_ckpt_to_keep="$MAX_ACTOR_CKPT_TO_KEEP"
+  trainer.test_freq="$TEST_FREQ"
+  trainer.val_before_train="$VAL_BEFORE_TRAIN"
+  trainer.use_v1="$USE_VERL_V1"
+  trainer.v1.trainer_mode=sync
+  trainer.resume_mode="$RESUME_MODE"
+  trainer.resume_from_path="$RESUME_FROM_PATH"
+  trainer.default_local_dir="$CHECKPOINT_DIR"
+  trainer.rollout_data_dir="$ROLLOUT_DATA_DIR"
+)
+
+# TransferQueue resources and environment forwarded to Ray workers.
+RAY=(
+  transfer_queue.backend.SimpleStorage.num_data_storage_units=2
+)
+
+for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS; do
+  RAY+=("++ray_kwargs.ray_init.runtime_env.env_vars.$variable=\"${!variable}\"")
+done
+
+# Optional experiment-specific Hydra overrides. CLI arguments take precedence.
+EXTRA=()
+
+############################### launch ################################
+
+LAUNCH=("$PYTHON_BIN")
+COMMAND=(
+  "${LAUNCH[@]}" -m groove.verl_entrypoint
+  "${DATA[@]}"
+  "${MODEL[@]}"
+  "${ACTOR[@]}"
+  "${ROLLOUT[@]}"
+  "${REF[@]}"
+  "${ALGORITHM[@]}"
+  "${REWARD[@]}"
+  "${OPSD[@]}"
+  "${TRAINER[@]}"
+  "${RAY[@]}"
+  "${EXTRA[@]}"
+  "$@"
+)
 
 case "${GROOVE_DRY_RUN:-false}" in
   1|true|TRUE|yes) exec "${COMMAND[@]}" ;;

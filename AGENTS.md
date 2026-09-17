@@ -26,6 +26,9 @@
    每个脚本可选择 `grpo`、`dapo` 或 `grpo_opsd`
    （`groove` 是 GRPO + OPSD 的别名）。机器设置和所有实验覆盖参数都写在所选脚本中，
    详见 `docs/TRAINING_LAUNCHERS.md`。
+   所有当前和新增训练入口均按 parameter arrays 格式组织：按 DATA、MODEL、ACTOR、
+   ROLLOUT、REF、ALGORITHM、REWARD、OPSD、TRAINER、RAY 分组，末尾统一展开。
+   保留带引号的数组展开，命令行 `"$@"` 放在最后；不要恢复成长串参数或多层 shell 调用链。
    `src/groove/trainer_routing.py` 将纯 GRPO/DAPO 路由到 VERL 原生 V1 同步训练，
    将 GRPO + OPSD 路由到项目自定义 Trainer。旧启动脚本已归档到
    `TMP/scripts/`，不作为当前执行规范。

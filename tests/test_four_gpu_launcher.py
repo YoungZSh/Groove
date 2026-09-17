@@ -150,6 +150,33 @@ class FourGpuLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
 
+    def test_parameter_arrays_preserve_quoted_paths_and_last_cli_overrides(self):
+        data = Path(self.folder.name) / "custom data with spaces"
+        self.make_data(data)
+        args = (
+            "actor_rollout_ref.actor.optim.lr=2e-6",
+            'trainer.logger=["console"]',
+            '++ray_kwargs.ray_init.runtime_env.env_vars.ARRAY_NOTE="literal $TOKEN, spaces and = signs"',
+        )
+        for mode in ("grpo", "dapo", "grpo_opsd"):
+            with self.subTest(mode=mode):
+                result = self.run_launcher(
+                    overrides={"TRAINING_MODE": mode, "DATA_DIR": str(data), "MODEL_PATH": "/models/Qwen 2B"},
+                    args=args,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                captured = json.loads(result.stdout)
+                self.assertEqual(captured["args"][-len(args):], list(args))
+                config = self.resolved_config(captured)
+                self.assertEqual(config.data.train_files, [str(data / "train.parquet")])
+                self.assertEqual(config.actor_rollout_ref.model.path, "/models/Qwen 2B")
+                self.assertEqual(config.actor_rollout_ref.actor.optim.lr, 2e-6)
+                self.assertEqual(config.trainer.logger, ["console"])
+                self.assertEqual(
+                    config.ray_kwargs.ray_init.runtime_env.env_vars.ARRAY_NOTE,
+                    "literal $TOKEN, spaces and = signs",
+                )
+
     def test_groove_alias_selects_only_the_opsd_trainer(self):
         result = self.run_launcher(overrides={"TRAINING_MODE": "groove"})
         self.assertEqual(result.returncode, 0, result.stderr)

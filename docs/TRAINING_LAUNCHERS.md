@@ -7,6 +7,28 @@
 最后直接调用 `python -m groove.verl_entrypoint`。没有中间 shell 启动器，也不读取共享机器 shell 配置。
 需要某台机器、某种方法的固定实验入口时，复制其中一份并修改顶部参数即可。
 
+### 参数数组格式
+
+采用 [VERL 示例](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3_4b_fsdp.sh)
+的 parameter arrays 组织方式，保留本项目自己的参数值与训练入口：
+
+| 数组 | 内容 |
+| --- | --- |
+| `DATA` | 数据文件、batch、提示词和长度设置 |
+| `MODEL` | 模型路径与模型执行设置 |
+| `ACTOR` | 优化器、PPO loss、FSDP 与 KL |
+| `ROLLOUT` / `REF` | vLLM 采样、验证生成与参考模型评分 |
+| `ALGORITHM` | 优势估计与 DAPO 动态采样 |
+| `REWARD` / `OPSD` | 奖励适配、长度惩罚与 OPSD 信用分配 |
+| `TRAINER` | 日志、检查点、训练步数和 Trainer 选择 |
+| `RAY` | 数据通道资源与 worker 环境变量 |
+| `EXTRA` | 实验专用的附加 Hydra 覆盖项 |
+
+`LAUNCH` 保存 Python 命令，`COMMAND` 只负责组合模块数组，供 dry-run 和正式训练共同使用。
+数组通过 `"${ARRAY[@]}"` 展开，确保含空格的路径仍然是单个参数。
+覆盖优先级为：模块数组 → `EXTRA` → 命令行 `"$@"`。
+服务相关环境变量继续在同一脚本内显式设置。
+
 旧链路 `run_2b_4gpu.sh -> run_grpo*_2b.sh -> run_groove.sh` 已完整归档到
 `TMP/scripts/`，用于追溯旧实验，不再作为当前启动路径。
 

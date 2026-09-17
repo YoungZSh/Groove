@@ -4,6 +4,11 @@
 可以复制为某台机器、某次实验专用的脚本；脚本之间不 `source`、不相互调用，
 也不依赖 `TMP/scripts/` 的历史启动器。
 
+训练参数按 VERL 示例的 **parameter arrays** 风格组织：`DATA`、`MODEL`、`ACTOR`、
+`ROLLOUT`、`REF`、`ALGORITHM`、`REWARD`、`OPSD`、`TRAINER`、`RAY`。
+每个数组元素对应一个完整的 Hydra 覆盖项；末尾统一展开数组组成启动命令。
+`EXTRA` 留给当前实验的附加参数，命令行 `"$@"` 放在最后，优先级最高。
+
 | 独立脚本 | 默认机器参数 |
 | --- | --- |
 | `train_a800_4gpu.sh` | 本机 A800，GPU 0～3，groove 环境，65536 token 预算 |
@@ -11,7 +16,7 @@
 
 两份脚本内部均可设置 `TRAINING_MODE=grpo`、`dapo` 或 `grpo_opsd`。
 `groove` 是 `grpo_opsd` 的命令行别名，方法名称统一写作 **GRPO + OPSD**。
-复制脚本后直接修改顶部参数即可，不需要维护另一层机器 wrapper。
+复制脚本后可修改顶部常用设置或对应模块的参数数组，不需要维护另一层机器 wrapper。
 
 ```bash
 TRAINING_MODE=grpo EXPERIMENT_NAME=my-grpo-4k-run01 \
