@@ -1,5 +1,6 @@
 # Temporary and archived material
 
+- `scripts/` contains one-off screening/probe utilities and archived shell launch chains; current independent entrypoints are in `scripts/` at the repository root.
 - `probe_experiments/` is the complete archive of the earlier no-training
   attention, interleaving, relative-attention, dense-OPD, and group visual-OPD
   probes, including their reports and outputs.

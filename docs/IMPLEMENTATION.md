@@ -50,30 +50,47 @@ judging, format shaping, and repetition handling live in
 `src/groove/semantic_reward.py`. The Judge environment variables use the
 `GROOVE_JUDGE_` prefix, and repetition settings use `GROOVE_REPETITION_`.
 
-The formal launchers are `scripts/run_grpo_2b.sh` and
-`scripts/run_grpo_opsd_2b.sh`. Their default prepared-data directories are
-`data/vstar_grpo_2200_seed20260904` and
-`data/vstar_opsd_2200_seed20260904`. Set `DATA_DIR` to an existing training
-split or provide a local directory symlink at the default path; each training
-directory must contain `train.parquet`. Both launchers use the independent
-`data/vstar_bench/validation.parquet` for validation, configurable through
-`VALIDATION_FILE`. Existing datasets and archived run records are preserved,
-including embedded image paths and source metadata.
-The naming change does not alter prompts, rewards, or optimizer settings.
+Judge requests retry connection resets, disconnects before an HTTP response,
+and incomplete HTTP responses using the existing bounded exponential backoff.
+The default is five retries after the initial attempt. Exhaustion still raises
+an error, preserving its cause; transport failures never become fabricated
+correctness labels or zero rewards.
 
-`scripts/run_2b_4gpu.sh` selects either 2B launcher for single-node four-GPU
-training. It preserves the global batch and objective, uses a common default
-seed of 20260904, and explicitly forwards the single-node NCCL and proxy-bypass
-settings to Ray workers. Its throughput profile uses 16 agent-loop workers,
-4 local reward workers, and 65536-token per-GPU actor/log-prob and vLLM batch
-budgets. The global batch stays 16 groups with 8 responses each; TP=1 gives four
-rollout replicas. See [four-GPU training](FOUR_GPU_TRAINING.md) for
-configuration, local reference scripts, and the distinction between dry-run
-validation and the hardware check performed before a real launch.
+The current launchers are `scripts/train_a800_4gpu.sh` and
+`scripts/train_siton_2gpu.sh`. Each is a complete independent experiment script;
+neither calls another shell launcher. Both support `grpo`, `dapo`, and `grpo_opsd`
+(`groove` is an alias for GRPO + OPSD). Historical launch chains and one-off
+probes were moved to `TMP/scripts/`.
+
+Pure GRPO and DAPO use native VERL `TaskRunnerV1` / `PPOTrainerSync` with
+TransferQueue 0.1.10. GRPO + OPSD uses `GrooveTaskRunner` / `GrooveRayPPOTrainer`.
+`src/groove/trainer_routing.py` rejects legacy dynamic filtering and the unsupported
+OPSD-plus-V1/group-filter combinations before starting Ray. The common entrypoint
+retains prompt adaptation and memory guard setup without owning a new baseline
+training loop.
+
+Defaults are the new 4000-row splits under `data/vstar_grpo_4000_seed20260917`
+and `data/vstar_opsd_4000_seed20260917`. `DATA_DIR` can select a different training
+split; `VALIDATION_FILE` remains independent. Historical datasets are preserved.
+All modes use seed 20260904, batch 16, 8 responses per group, and TP=1.
+The four-card profile uses 16 agent workers, 4 reward workers and 65536-token
+budgets; the two-card profile uses 8, 1 and 32768 respectively.
+See [standalone launchers](TRAINING_LAUNCHERS.md) for full machine settings.
+
+`src/groove/reward_manager.py` adds optional DAPO overlong shaping only to training.
+It retains raw semantic accuracy and exposes the final optimized scalar as
+`training_reward` for native group filtering. Benchmark validation is exempt.
+Native V1 diagnostics retain scalar reward components and rollout reward details;
+logged `score` is the final optimized reward, while `reward_function_score` retains
+the reward function's value before manager shaping.
+DAPO uses clip low/high 0.2/0.28, no reference KL, and a 128-token soft buffer under
+the unchanged 1024-token response limit. V1 budgets updates by dataset size / batch
+size; dynamic refill can consume additional passes over the source dataset.
+The existing GRPO + OPSD credit allocation and uniform-group behavior are unchanged.
 
 ### Full V*Bench validation
 
-The current GRPO and GRPO + OPSD launchers, including the four-GPU wrapper,
+All three modes in both standalone launchers
 validate on all 191 V*Bench questions: 115 direct-attribute and 76
 relative-position questions. `scripts/prepare_vstar_validation.py` prepares
 the independent validation parquet from the original benchmark, preserving
@@ -90,11 +107,21 @@ or remote Judge request. Training records still use the existing semantic
 Judge, format penalty, and repetition handling. V*Bench records are marked as
 validation and must not be added to training inputs.
 
+Two-option questions acquire null C/D fields when Arrow reads them using the
+same struct schema as four-option questions. The parser excludes null or blank
+options from label and text matching, and scoring rejects a missing reference
+option. Malformed answers therefore remain unparsed instead of aborting
+validation; the original parquet and its reference answers remain unchanged.
+
 High-resolution benchmark images exceed the old 2048-token prompt limit. Both
 launchers reserve 9216 prompt tokens and a 10240-token model context, retaining
 1024 response tokens and the native image processing path. Validation batches
-contain 8 questions for the two-GPU entrypoints and 16 for the four-GPU wrapper,
-matching their agent-worker counts, with no sample limit or dropped final batch; sampling
+contain 8 questions for the two-GPU entrypoints. The four-GPU standalone launcher defaults
+to `data.val_batch_size=null`, submitting all 191 questions together; padding to
+192 for 16 agent workers is removed before scoring. Each worker dispatches its
+requests concurrently, and vLLM enforces its own token and sequence limits.
+Finite validation batch overrides remain supported independently of worker
+count, with no sample limit or dropped final batch; sampling
 remains temperature 0, `do_sample=false`, and `n=1`. The global training batch,
 rollout count, learning rate, and GRPO + OPSD advantage computation are unchanged.
 
@@ -333,12 +360,19 @@ repository:
 - `src/verl/trainer/ppo/core_algos.py` retains a compatibility entrypoint;
 - `src/groove/verl_trainer.py` merges evidence credit in its post-advantage hook;
 - `src/verl/workers/utils/losses.py` runs the existing PPO and reference KL losses;
-- `src/verl/trainer/config/groove.yaml` contains the Hydra preset;
+- `configs/groove.yaml` contains the project Hydra preset and inherits VERL's
+  `ppo_trainer` through `pkg://verl.trainer.config`;
 - `src/groove/advantage_metrics.py` reports batch and outcome-group diagnostics.
 
 The existing Conda environment supplies heavyweight runtime dependencies such as
 PyTorch, Ray, vLLM, and Transformers; the source tree supplies the matching
 Python runtime implementation.
+
+The entrypoint loads `configs/groove.yaml` from the checkout independently of
+the working directory. Wheels install the same preset under
+`share/groove/configs` in the Python environment. The old descriptive
+`configs/groove.yaml` has been replaced by the executable preset; its historical
+contents remain in Git. Experiment scripts still override the shared defaults.
 
 ## Initial diagnostics to monitor
 
@@ -436,20 +470,26 @@ transition `CUDA -> CPU offload -> CUDA reload`; `step`, `exp_avg`, and
 
 ## Host RAM protection
 
-The current job cgroup already provides the hard boundary requested for this
-machine: `/sys/fs/cgroup/memory/memory.limit_in_bytes` is `236223201280`, or
-exactly 220 GiB. Ray 2.53 detects the same 220 GiB as node memory. The launcher
-adds an earlier Ray OOM-prevention guard so a worker is stopped before the
-kernel's cgroup OOM killer selects a process.
+The four-GPU standalone launcher defaults `RAY_NODE_MEMORY_CAP_GIB=null`. It does not apply
+the historical fixed 220 GiB cap or its 4 GiB headroom. Instead, Ray's monitor
+uses the configured percentage of the actual node/container memory detected by
+Ray (95% by default). On the approximately 2 TiB local host, this removes the
+216 GiB trigger. Changing the launcher affects the next Ray startup; it does
+not change an already-running raylet.
+
+The independent two-GPU profile retains a numeric cap for smaller allocations.
+An earlier deployment used a cgroup limit of exactly 220 GiB; that historical
+limit must not be assumed to describe the current machine.
 
 The effective Ray threshold is
 
 ```text
-min(threshold_ceiling, (min(requested_cap, Ray_total) - headroom) / Ray_total)
+no fixed cap: threshold_ceiling
+numeric cap: min(threshold_ceiling, (min(requested_cap, Ray_total) - headroom) / Ray_total)
 ```
 
-With the defaults on this machine this is `min(0.95, 216 / 220) = 0.95`, so
-Ray begins intervention at approximately 209 GiB. The monitor interval is 100
+On the historical 220 GiB allocation this was `min(0.95, 216 / 220) = 0.95`,
+or approximately 209 GiB. The monitor interval is 100
 ms, the dashboard is disabled, and the object store is explicitly limited to 8
 GiB instead of using Ray's automatic fraction of available memory.
 
@@ -461,11 +501,10 @@ RAY_MEMORY_GUARD_HEADROOM_GIB=4 \
 RAY_MEMORY_USAGE_THRESHOLD_CEILING=0.95 \
 RAY_OBJECT_STORE_GIB=8 \
 RAY_MEMORY_MONITOR_REFRESH_MS=100 \
-./scripts/run_groove.sh
+EXPERIMENT_NAME=check-memory-profile bash scripts/train_a800_4gpu.sh
 ```
 
 Ray's threshold is a node-wide, soft OOM-prevention trigger, not an allocation
 quota. It counts other processes in the same node/cgroup and may terminate a
-Ray worker when crossed. The cgroup is the actual hard 220 GiB boundary. If the
-launcher is moved outside this cgroup, use a scheduler/container cgroup limit as
-well; the Ray guard by itself cannot make a strict no-overshoot guarantee.
+Ray worker when crossed. Any scheduler/container limit remains a separate
+boundary; the Ray monitor is not a hard allocation quota.
