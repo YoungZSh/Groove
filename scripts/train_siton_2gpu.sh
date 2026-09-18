@@ -52,6 +52,7 @@ TRAIN_FILE="$DATA_DIR/train.parquet"
 TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}"
 CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME"
+VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-$PROJECT_ROOT/outputs/validation/$EXPERIMENT_NAME}"
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 
@@ -93,7 +94,7 @@ ROLLOUT_MAX_NUM_SEQS=64
 ROLLOUT_ENFORCE_EAGER=true
 ROLLOUT_FREE_CACHE_ENGINE=true
 
-# ---- Shared training Judge and reward shaping. Validation uses the local scorer. ----
+# ---- Shared semantic Judge. Validation keeps raw accuracy without reward shaping. ----
 CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/semantic_reward.py"
 CUSTOM_REWARD_FUNCTION_NAME=compute_score
 ANSWER_REWARD_WEIGHT=1.0
@@ -342,6 +343,7 @@ TRAINER=(
   trainer.resume_from_path="$RESUME_FROM_PATH"
   trainer.default_local_dir="$CHECKPOINT_DIR"
   trainer.rollout_data_dir="$ROLLOUT_DATA_DIR"
+  trainer.validation_data_dir="$VALIDATION_DATA_DIR"
 )
 
 # TransferQueue resources and environment forwarded to Ray workers.

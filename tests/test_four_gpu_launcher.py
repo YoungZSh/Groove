@@ -53,6 +53,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
             "WANDB_MODE", "RAY_NODE_MEMORY_CAP_GIB",
             "GROOVE_REPETITION_ZERO_REWARD",
+            "VALIDATION_DATA_DIR",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -95,6 +96,8 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(config.groove.enabled, enabled)
                 self.assertEqual(config.trainer.use_v1, not enabled)
                 self.assertEqual(config.algorithm.filter_groups.enable, mode == "dapo")
+                self.assertEqual(config.trainer.validation_data_dir,
+                                 str(self.project / "outputs/validation/unit-four-gpu"))
                 self.assertEqual(config.reward.reward_manager.name, "VisualQARewardManager")
                 self.assertEqual(config.data.train_batch_size, 16)
                 self.assertEqual(config.data.max_response_length, 1024)
@@ -154,6 +157,16 @@ class FourGpuLauncherTest(unittest.TestCase):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
+
+    def test_validation_rollout_path_preserves_spaces(self):
+        for mode in ("grpo", "dapo", "grpo_opsd"):
+            with self.subTest(mode=mode):
+                path = str(self.project / "full validation" / mode)
+                result = self.run_launcher(overrides={"TRAINING_MODE": mode, "VALIDATION_DATA_DIR": path})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.resolved_config(json.loads(result.stdout))
+                self.assertEqual(config.trainer.validation_data_dir, path)
+                self.assertNotEqual(config.trainer.validation_data_dir, config.trainer.rollout_data_dir)
 
     def test_no_mode_inherits_the_old_dapo_length_penalty_switch(self):
         for mode in ("grpo", "dapo", "grpo_opsd"):

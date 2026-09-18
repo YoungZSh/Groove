@@ -149,11 +149,27 @@ V1 名义上的 epoch 用于确定优化器更新次数；DAPO 补充采样可�
 
 `src/groove/semantic_reward.py` 明确区分语义正确性与输出格式：
 
-- 训练使用下文描述的远程语义 Judge。当前验证集包含全部 191 道 V*Bench 题目，
-  通过 `data_source=vstar_bench` 路由到 `src/groove/vstar_bench.py`。
-  基准评测的 `score` 等于确定性的选项准确率，格式有效性仅作诊断。
-  必须将这一仅用于验证的分发逻辑与训练奖励塑形分开。
+- 训练及训练期间的 V*Bench 验证使用下文描述的同一个远程语义 Judge。
+  验证包含全部 191 题，通过 `data_source=vstar_bench` 路由到
+  `src/groove/semantic_reward.py::_judge_vstar_validation()`，复用训练的 `extract_answer()`：
+  提取 answer 内容，提取不到完整标签时使用完整回答。每条验证回答都调用 Judge，
+  不是只有规则失败时才调用；Judge 接收题目、全部选项，以及标准选项字母和文本。
+  验证 `score=accuracy`，不叠加格式、重复或长度惩罚。
+  `rule_accuracy`、`rule_unparsed` 仅用于保留旧选项匹配规则的诊断，不影响语义分数。
+  独立 `scripts/evaluate_vstar.py` 仍明确使用历史纯规则协议；
+  不要将新语义验证分数与旧规则验证分数直接作为同一评分协议比较。
 - 远程 Judge 返回的语义 `accuracy` 只能是 `0` 或 `1`。
+- 后续运行的 Judge 先输出一到三句简短依据，再以唯一的 `Judgement: 0/1`
+  行结束；请求保留温度 0 和 `enable_thinking=false`，生成预算为 512 tokens，
+  不再使用二值 choice 约束解码。解析器只读取唯一的末尾判定，允许其紧接简短依据
+  出现在同一行，兼容旧版纯数字响应；
+  判定缺失、冲突或生成截断时重试，失败不能静默转为错误标签。
+  提示词明确拒绝单答案题中的未消解候选、互相矛盾的结论和未定位目标的整图枚举，
+  同时允许题目要求的多属性答案、明确区分对象及排除候选后的确定结论。
+  简短提示词只评判题目所问属性：未询问属性的不确定性、普通色差/阴影、主色的
+  次要点缀不应自动判错；先排除未消解候选，再应用这些宽容条件。
+  保持四条准则和五个简短示例，固定提示词不超过 400 英文词。
+  训练和训练期间验证共用此协议；与旧版宽松 Judge 的分数比较时必须统一重评。
 - Analyzer 的成功/失败分组使用原始 `accuracy`，绝不能使用塑形后的 `score`。
 - 标签格式错误时，语义评判可以回退到完整回答，避免输出格式在无提示的情况下
   改变语义正确性的定义。
@@ -273,6 +289,10 @@ Dry-run 可以在较小的 GPU 配额上验证四卡配置；
 保留原始图像字节和全部选项。启动脚本使用 9216 个提示词 token、
 10240 个总上下文 token。两卡启动脚本的验证 batch 为 8；
 四卡启动脚本一次提交完整验证集，让 vLLM 在 token 和序列数量限制内连续调度请求。
+两个启动脚本均通过 `trainer.validation_data_dir` 保存每个验证点的全部原始回答，
+默认路径为 `outputs/validation/<EXPERIMENT_NAME>/<step>.jsonl`（包含 step 0 验证）。
+该落盘独立于 W&B 样例展示数量及验证 batch；保留完整 input/output、标准答案、
+语义分数和规则/格式诊断。`VALIDATION_DATA_DIR` 可覆盖目录，默认与训练 rollout 分开。
 不要把基准样本追加到训练数据，不要覆盖旧的 220 行验证文件，
 也不要把新旧验证分数当作来自同一数据集直接比较。
 
@@ -323,6 +343,7 @@ Analyzer 的组级编排可以使用并发度 16。
 
 - `outputs/logs/`
 - `outputs/rollouts/`
+- `outputs/validation/`
 - `outputs/evidence/`
 - `outputs/opsd-token-dumps/`
 - `outputs/wandb/wandb/`

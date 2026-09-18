@@ -50,6 +50,31 @@ judging, format shaping, and repetition handling live in
 `src/groove/semantic_reward.py`. The Judge environment variables use the
 `GROOVE_JUDGE_` prefix, and repetition settings use `GROOVE_REPETITION_`.
 
+For subsequent runs, the Judge retains the DeepEyes question/reference/answer
+comparison and semantic-equivalence principle, but explains its decision in one
+to three sentences before ending with `Judgement: 0` or `Judgement: 1`. Requests
+use temperature 0, a 512-token completion budget, and no binary-choice constrained
+decoding. `enable_thinking=false` remains set; the requested brief explanation is
+ordinary response text. Only the unique terminal verdict is used as `accuracy`;
+numbers in the explanation are never interpreted as scores. The unique terminal
+`Judgement` label may appear on the same line as the explanation; a standalone
+legacy `0` or `1` is also accepted. Ambiguous, missing, or token-truncated verdicts retry
+and eventually raise an error rather than becoming an incorrect-answer label.
+
+The compact prompt uses four ordered criteria and five short examples. It judges the
+requested property: uncertainty about an unasked property (such as "coat or
+shirt" when the color remains blue) is not itself an error. Ordinary shade
+variations, dominant colors with minor accents, and descriptions of distinctly
+named other objects are allowed when the requested fact matches. It rejects
+unresolved candidates for that fact, lists of possible targets selected only
+by matching the reference, and contradictions anywhere in the answer, including
+option/text conflicts or a misleading concluding "yes". This is semantic judging,
+not a color-count heuristic or a format penalty. Training and training-time
+V*Bench validation share this updated protocol. Historical scores from the older
+permissive Judge are not directly comparable; re-score saved answers under a
+common protocol for comparisons. The explanation is not added to the numeric
+reward dictionary or sent to the Student or Analyzer.
+
 Judge requests retry connection resets, disconnects before an HTTP response,
 and incomplete HTTP responses using the existing bounded exponential backoff.
 The default is five retries after the initial attempt. Exhaustion still raises
@@ -102,12 +127,14 @@ hashes, and refuses to overwrite existing artifacts. The historical 220-row
 validation splits and the 1979-row training splits are preserved.
 
 `groove.vstar_bench` shares the deterministic option parser with the standalone
-checkpoint evaluator. Records marked `data_source=vstar_bench` use this scorer
-through the normal reward adapter, with `score=accuracy` in `{0, 1}`. Answer
-format is diagnostic only for benchmark validation; there is no format penalty
-or remote Judge request. Training records still use the existing semantic
-Judge, format penalty, and repetition handling. V*Bench records are marked as
-validation and must not be added to training inputs.
+checkpoint evaluator. Records marked `data_source=vstar_bench` call the same
+remote semantic Judge as training for every answer, with the question, all valid
+options, and the reference option letter and text. Validation uses
+`score=accuracy` in `{0, 1}` with no format, repetition, or length shaping. The
+deterministic option score is retained only as `rule_accuracy` / `rule_unparsed`
+diagnostics. The standalone `scripts/evaluate_vstar.py` keeps its historical
+rule-only protocol. V*Bench records are validation-only and must not be added to
+training inputs.
 
 Two-option questions acquire null C/D fields when Arrow reads them using the
 same struct schema as four-option questions. The parser excludes null or blank

@@ -74,7 +74,7 @@ def prepare_validation(source: Path, output: Path) -> dict:
         "rows": len(records),
         "categories": EXPECTED_CATEGORIES,
         "image_policy": "original embedded bytes, unchanged source order",
-        "scorer": "groove.vstar_bench.compute_validation_score",
+        "scorer": "groove.semantic_reward.compute_score (semantic Judge; rule diagnostics retained)",
         "system_prompt": REASONING_SYSTEM_PROMPT,
     }
     with manifest_path.open("x") as handle:

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import http.client
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from groove.response_prompt import REASONING_SYSTEM_PROMPT
-from groove.semantic_reward import compute_score, compute_score_batched
+from groove.semantic_reward import compute_score, compute_score_batched, extract_answer
 from groove.vstar_bench import compute_validation_score
 
 
@@ -85,23 +87,94 @@ class VStarValidationTest(unittest.TestCase):
                 preparation.prepare_validation(source, output)
             self.assertEqual(output.read_bytes(), before)
 
-    def test_benchmark_scoring_uses_no_remote_judge_and_no_format_penalty(self):
-        cases = (("<answer>D</answer>", 1, 1), ("D", 1, 0),
-                 ("<answer>leather</answer>", 1, 1), ("<answer>A</answer>", 0, 1),
-                 ("A or D", 0, 0))
-        with patch("groove.semantic_reward._judge_one") as judge:
-            for output, accuracy, format_valid in cases:
-                with self.subTest(output=output):
-                    result = compute_score("vstar_bench", output, "D", self.info(),
-                                           answer_reward_weight=0.9, format_reward_weight=0.2)
-                    self.assertEqual(result["score"], accuracy)
-                    self.assertEqual(result["accuracy"], accuracy)
-                    self.assertEqual(result["format_valid"], format_valid)
-            judge.assert_not_called()
+    def judge(self, output, verdict="1", info=None):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        environment = {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "0",
+                       "GROOVE_REPETITION_ZERO_REWARD": "true"}
+        with patch.dict("os.environ", environment), \
+                patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as request, \
+                patch("groove.semantic_reward.json.load", return_value={"choices": [{"message": {"content": verdict}}]}):
+            result = compute_score("vstar_bench", output, "D", info or self.info(),
+                                   answer_reward_weight=0.3, format_reward_weight=0.9)
+        self.assertEqual(request.call_count, 1)
+        return result, json.loads(request.call_args.args[0].data)
+
+    def test_every_benchmark_answer_uses_training_extraction_and_semantic_judge(self):
+        cases = [("<answer>D</answer>", "1"), ("D", "1"),
+                 ("Reasoning outside. <answer>The glove is made of leather.</answer>", "1"),
+                 ("<answer>A</answer>", "0"), ("A or D", "0"),
+                 ("<ANSWER>leather</ANSWER>", "1"),
+                 ("<answer>cotton</answer><answer>leather</answer>", "1")]
+        for output, verdict in cases:
+            with self.subTest(output=output):
+                result, body = self.judge(output, verdict)
+                answer, valid = extract_answer(output)
+                self.assertEqual(result["score"], float(verdict))
+                self.assertEqual(result["accuracy"], float(verdict))
+                self.assertEqual(result["format_valid"], float(valid))
+                self.assertEqual(result["format_reward_weight"], 0.0)
+                self.assertEqual(result["answer_reward_weight"], 1.0)
+                self.assertNotIn("structured_outputs", body)
+                self.assertEqual(body["max_completion_tokens"], 512)
+                prompt = body["messages"][1]["content"]
+                self.assertIn("[Standard Answer]: (D) leather\n", prompt)
+                self.assertIn(f"[Model_answer]: {answer}\n\nEvaluate this model answer.", prompt)
+                self.assertIn("(A) rubber\n(B) cotton\n(C) kevlar\n(D) leather", prompt)
+                self.assertNotIn("Reasoning outside.", prompt)
+
+    def test_rule_unparsed_natural_language_can_receive_full_semantic_accuracy(self):
+        result, _ = self.judge("<answer>The glove is made of leather.</answer>")
+        self.assertEqual(result["rule_unparsed"], 1.0)
+        self.assertEqual(result["rule_accuracy"], 0.0)
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result["semantic_judge"], 1.0)
+        self.assertNotIn("unparsed", result)
+
+    def test_validation_reads_explained_verdict_without_training_shaping(self):
+        result, _ = self.judge("D", "Reason: D selects the reference material.\nJudgement: 1")
+        self.assertEqual(result["accuracy"], 1.0)
+        self.assertEqual(result["score"], 1.0)
+        self.assertEqual(result["format_valid"], 0.0)
+        self.assertEqual(result["format_reward_weight"], 0.0)
+
+    def test_validation_repetition_is_diagnostic_and_does_not_zero_judge_accuracy(self):
+        output = "repeated reasoning phrase " * 10 + "<answer>leather</answer>"
+        result, _ = self.judge(output)
+        self.assertEqual(result["severe_repetition"], 1.0)
+        self.assertEqual(result["repetition_zeroed_reward"], 0.0)
+        self.assertEqual(result["answer_reward"], 1.0)
+        self.assertEqual(result["score"], 1.0)
+
+    def test_semantic_validation_includes_real_options_once_and_never_sends_null_options(self):
+        info = {**self.info(), "choices": {"A": "rubber", "B": None, "C": None, "D": "leather"},
+                "question": "What material?\n(A) rubber\n(D) leather\nReturn the selected option letter."}
+        before = deepcopy(info)
+        _, body = self.judge("<answer>D</answer>", info=info)
+        prompt = body["messages"][1]["content"]
+        self.assertEqual(prompt.count("(A) rubber"), 1)
+        self.assertNotIn("(B) None", prompt)
+        self.assertEqual(info, before)
+
+    def test_validation_judge_failure_is_not_silently_converted_to_rule_score(self):
+        with patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "1"}), \
+                patch("groove.semantic_reward.urllib.request.urlopen",
+                      side_effect=http.client.RemoteDisconnected("closed")) as request, \
+                patch("groove.semantic_reward.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "failed after retries"):
+                compute_score("vstar_bench", "<answer>D</answer>", "D", self.info())
+        self.assertEqual(request.call_count, 2)
 
     def test_training_reward_and_mixed_batch_order_are_preserved(self):
         expected = {"score": 0.8, "accuracy": 1.0}
-        with patch("groove.semantic_reward._judge_one", return_value=expected) as judge:
+        def score(question, reference, output, **kwargs):
+            if not kwargs.get("apply_training_shaping", True):
+                value = float(output == "<answer>D</answer>")
+                return {"score": value, "accuracy": value}
+            return dict(expected)
+
+        with patch("groove.semantic_reward._judge_one", side_effect=score) as judge:
             result = compute_score_batched(
                 ["vstar_bench", "visual_qa", "vstar_bench"],
                 ["<answer>D</answer>", "rubber", "<answer>A</answer>"],
@@ -109,8 +182,9 @@ class VStarValidationTest(unittest.TestCase):
                 [self.info(), {"question": "What material?"}, self.info()],
             )
             self.assertEqual([r["score"] for r in result], [1.0, 0.8, 0.0])
-            judge.assert_called_once_with("What material?", "rubber", "rubber",
-                                          answer_reward_weight=1.0, format_reward_weight=0.2)
+            self.assertEqual(judge.call_count, 3)
+            self.assertIn(call("What material?", "rubber", "rubber",
+                               answer_reward_weight=1.0, format_reward_weight=0.2), judge.call_args_list)
 
     def test_parquet_null_options_are_not_answer_candidates(self):
         with TemporaryDirectory() as folder:
@@ -148,6 +222,11 @@ class VStarValidationTest(unittest.TestCase):
         for missing in (None, "", " "):
             with self.subTest(reference=missing), self.assertRaises(ValueError):
                 compute_validation_score("D", "D", {**self.info(), "choices": {"A": "rubber", "D": missing}})
+        with patch("groove.semantic_reward._judge_one") as judge:
+            for info in ({**self.info(), "question": ""}, {**self.info(), "split": "train"}):
+                with self.assertRaises(ValueError):
+                    compute_score("vstar_bench", "D", "D", info)
+            judge.assert_not_called()
 
 
 if __name__ == "__main__":

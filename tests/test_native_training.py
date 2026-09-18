@@ -101,11 +101,14 @@ class VisualQARewardManagerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(extra["overlong_reward"], penalty)
                 self.assertEqual(extra["training_reward"], result["reward_score"])
 
-    async def test_benchmark_never_receives_length_penalty_or_remote_judging(self):
-        with patch("groove.semantic_reward._judge_one", side_effect=AssertionError("Judge called")):
+    async def test_benchmark_uses_semantic_judge_without_length_or_training_penalties(self):
+        with patch("groove.semantic_reward._judge_one", return_value={"score": 1.0, "accuracy": 1.0}) as judge:
             result = await self.manager(scorer=compute_score).run_single(self.batch(1024, validation=True))
         self.assertEqual(result["reward_score"], 1.0)
         self.assertEqual(result["reward_extra_info"]["overlong_reward"], 0.0)
+        self.assertEqual(result["reward_extra_info"]["semantic_judge"], 1.0)
+        self.assertFalse(judge.call_args.kwargs["apply_training_shaping"])
+        self.assertEqual(judge.call_args.kwargs["format_reward_weight"], 0.0)
 
     async def test_validation_and_training_can_share_a_manager_concurrently(self):
         manager = self.manager()

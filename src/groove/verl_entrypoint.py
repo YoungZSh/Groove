@@ -270,6 +270,8 @@ def main() -> None:
             f"actor_token_budget={config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu}",
             f"rollout_token_budget={config.actor_rollout_ref.rollout.max_num_batched_tokens}",
             f"validation_batch_size={config.data.val_batch_size}",
+            f"validation_data_dir={config.trainer.get('validation_data_dir')}",
+            "vstar_validation_scoring=semantic_judge",
             f"ray_total_gib={memory_guard['ray_total_bytes'] / 1024**3:.3f}",
             f"ray_fixed_cap_enabled={memory_guard['requested_cap_bytes'] is not None}",
             f"ray_guard_gib={memory_guard['trigger_bytes'] / 1024**3:.3f}",

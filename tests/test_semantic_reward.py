@@ -7,10 +7,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 from groove.semantic_reward import (
+    JUDGE_SYSTEM_PROMPT,
     _judge_one,
     compute_score,
     extract_answer,
     find_inner_repetition,
+    judge_prompt,
     parse_judgement,
 )
 
@@ -39,10 +41,22 @@ class SemanticRewardLoopTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compute_score("source", "answer", "ground truth", {})
 
-    def test_remote_judge_is_constrained_to_a_binary_choice(self):
+    def test_judge_prompt_stays_compact_without_truncating_the_answer(self):
+        # Bound the fixed instructions/examples, not the question or evidence.
+        self.assertLessEqual(len((JUDGE_SYSTEM_PROMPT + judge_prompt("", "", "")).split()), 400)
+        question = "What color is the coat?"
+        ground_truth = "blue"
+        answer = "The coat or shirt is blue.\nThe nearby bag is brown.\n" + "Additional context. " * 100
+        prompt = judge_prompt(question, ground_truth, answer)
+        self.assertIn(f"[Question]: {question}\n", prompt)
+        self.assertIn(f"[Standard Answer]: {ground_truth}\n", prompt)
+        self.assertIn(f"[Model_answer]: {answer}\n\nEvaluate this model answer.", prompt)
+
+    def test_remote_judge_can_explain_before_its_binary_verdict(self):
         response = MagicMock()
         response.__enter__.return_value = response
-        payload = {"choices": [{"message": {"content": "1"}}]}
+        payload = {"choices": [{"message": {"content":
+            "Reason: Both answers identify green as the color.\nJudgement: 1"}, "finish_reason": "stop"}]}
         environment = {
             "GROOVE_JUDGE_API_KEY": "test-key",
             "GROOVE_JUDGE_MAX_RETRIES": "0",
@@ -55,9 +69,9 @@ class SemanticRewardLoopTest(unittest.TestCase):
             result = _judge_one("What color?", "green", "<answer>green</answer>")
 
         body = json.loads(urlopen.call_args.args[0].data)
-        self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
-        self.assertEqual(body["structured_outputs"], {"choice": ["0", "1"]})
-        self.assertEqual(body["max_completion_tokens"], 4)
+        self.assertEqual(body["messages"][0]["content"], JUDGE_SYSTEM_PROMPT)
+        self.assertNotIn("structured_outputs", body)
+        self.assertEqual(body["max_completion_tokens"], 512)
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["format_reward"], 0.0)
 
@@ -181,7 +195,7 @@ class SemanticRewardLoopTest(unittest.TestCase):
         self.assertEqual(result["format_valid"], 1.0)
         judge_input = json.loads(urlopen.call_args.args[0].data)["messages"][1]["content"]
         self.assertNotIn(reasoning, judge_input)
-        self.assertIn("[Model_answer]: green\nJudgement:", judge_input)
+        self.assertIn("[Model_answer]: green\n\nEvaluate this model answer.", judge_input)
 
     def test_terminal_answer_rejects_nested_unbalanced_and_noncanonical_tags(self):
         invalid = [
@@ -223,6 +237,73 @@ class SemanticRewardLoopTest(unittest.TestCase):
     def test_unconstrained_explanation_is_not_guessed(self):
         with self.assertRaises(ValueError):
             parse_judgement("The answers describe different objects.")
+
+    def test_parser_uses_only_the_unique_terminal_verdict(self):
+        cases = [
+            ("0", 0), (" 1\n", 1), ("Judgement: 0", 0),
+            ("Reason: There is 1 correct candidate among 5 alternatives.\nJudgement: 0", 0),
+            ("Reason: 0 alternatives remain; the target is identified.\nJudgement: 1\n", 1),
+            ("The answer lists 1 correct candidate without selecting it. Judgement: 0", 0),
+        ]
+        for response, expected in cases:
+            with self.subTest(response=response):
+                self.assertEqual(parse_judgement(response), expected)
+
+    def test_parser_rejects_truncated_ambiguous_and_unlabelled_numbers(self):
+        invalid = [
+            "Reason: 1 of the candidates matches.", "Reason: correct.\n1",
+            "Reason: Incorrect.\nJudgement:", "Judgement: 0 or 1",
+            "Judgement: 1\nJudgement: 0", "Judgement: 0\nJudgement: 0",
+            "Judgement: 1\nActually, the answer is wrong.", "Judgement: 1.0",
+            "Judgement: 10", "Judgement: -1", "Judgement: 2",
+            "Reason: Judgement: 1 was requested.\nJudgement: 0",
+            "Reason: Judgement: 0\nJudgement: 0", "NotJudgement: 1",
+        ]
+        for response in invalid:
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                parse_judgement(response)
+
+    def test_judge_keeps_all_candidates_and_retries_invalid_verdicts(self):
+        answer = "The shirt is blue, or it is brown."
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key",
+                                      "GROOVE_JUDGE_MAX_RETRIES": "1"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", side_effect=[
+                {"choices": [{"message": {"content": "Reason: 1 candidate matches."}}]},
+                {"choices": [{"message": {"content":
+                    "Reason: The answer offers 1 correct candidate and an incompatible alternative.\nJudgement: 0"}}]},
+            ]),
+            patch("groove.semantic_reward.time.sleep"),
+        ):
+            result = _judge_one("What color is the shirt?", "brown", f"<answer>{answer}</answer>")
+        self.assertEqual(urlopen.call_count, 2)
+        for request in urlopen.call_args_list:
+            prompt = json.loads(request.args[0].data)["messages"][1]["content"]
+            self.assertIn(f"[Model_answer]: {answer}\n\nEvaluate this model answer.", prompt)
+        self.assertEqual(result["accuracy"], 0.0)
+        self.assertEqual(result["score"], 0.0)
+        self.assertEqual(result["format_valid"], 1.0)
+
+    def test_truncated_judge_output_is_retried_even_if_it_contains_a_verdict(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key",
+                                      "GROOVE_JUDGE_MAX_RETRIES": "1"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", side_effect=[
+                {"choices": [{"message": {"content": "Judgement: 1"}, "finish_reason": "length"}]},
+                {"choices": [{"message": {"content": "Reason: Different colors.\nJudgement: 0"},
+                              "finish_reason": "stop"}]},
+            ]),
+            patch("groove.semantic_reward.time.sleep"),
+        ):
+            result = _judge_one("What color?", "green", "<answer>blue</answer>")
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(result["accuracy"], 0.0)
 
     def test_reward_module_supports_verl_external_object_loader(self):
         from verl.utils.import_utils import load_extern_object

@@ -1,4 +1,9 @@
-"""Shared V*Bench question formatting and deterministic answer scoring."""
+"""V*Bench question formatting and legacy option-scoring diagnostics.
+
+Training-time validation uses groove.semantic_reward's shared answer extraction
+and semantic Judge. The deterministic scorer remains available for diagnostics
+and the explicitly rule-based standalone evaluator.
+"""
 
 from __future__ import annotations
 
@@ -70,7 +75,7 @@ def parse_prediction(output: str, choices: dict[str, str | None]) -> dict:
 
 
 def compute_validation_score(output: str, ground_truth: str, extra_info: dict) -> dict[str, float]:
-    """Report benchmark accuracy separately from answer-format diagnostics."""
+    """Return the legacy rule-only score, not the current semantic validation score."""
     if extra_info.get("split") != "validation":
         raise ValueError("V*Bench is reserved for validation")
     choices = extra_info.get("choices") or {}

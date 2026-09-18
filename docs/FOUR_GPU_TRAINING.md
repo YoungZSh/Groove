@@ -55,6 +55,9 @@ Actor 采用四卡 FSDP；vLLM 在训练阶段休眠，更新后同步权重。
 四卡验证整集提交，再按 worker 数补齐；评分时去除补齐行，保留原始 191 题。
 可显式覆盖 `VAL_BATCH_SIZE`，该值独立于训练 batch 与 agent worker 数量。
 验证集始终独立于训练目录；`DATA_DIR` 默认新 4K 数据，`VALIDATION_FILE` 默认 V*Bench。
+验证与训练共用答案提取和语义 Judge，但验证仅报告原始语义准确率。
+每个验证点的全部回答保存为 `outputs/validation/<EXPERIMENT_NAME>/<step>.jsonl`，
+独立于训练 rollout 和 W&B 展示样例数量；旧选项规则结果只作为诊断保留。
 
 ## 网络与服务
 

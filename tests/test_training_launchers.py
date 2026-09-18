@@ -26,7 +26,11 @@ class TrainingLauncherTest(unittest.TestCase):
     def test_all_modes_keep_repetition_processing_by_default(self):
         self._check_launchers(override_data=False, repetition_override=None)
 
-    def _check_launchers(self, *, override_data, override_validation=False, repetition_override="false"):
+    def test_all_modes_accept_a_separate_validation_rollout_directory(self):
+        self._check_launchers(override_data=False, override_validation_dump=True)
+
+    def _check_launchers(self, *, override_data, override_validation=False, repetition_override="false",
+                         override_validation_dump=False):
         with TemporaryDirectory() as folder:
             project = Path(folder) / "project"
             (project / "scripts").mkdir(parents=True)
@@ -73,6 +77,7 @@ class TrainingLauncherTest(unittest.TestCase):
                         "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS",
                         "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
                         "GROOVE_REPETITION_ZERO_REWARD",
+                        "VALIDATION_DATA_DIR",
                     ):
                         env.pop(key, None)
                     if repetition_override is not None:
@@ -81,6 +86,10 @@ class TrainingLauncherTest(unittest.TestCase):
                         env["DATA_DIR"] = str(data_paths[name])
                     if override_validation:
                         env["VALIDATION_FILE"] = str(validation)
+                    validation_dump = project / "outputs/validation" / ("unit-launcher-" + name)
+                    if override_validation_dump:
+                        validation_dump = Path(folder) / "all validation responses" / name
+                        env["VALIDATION_DATA_DIR"] = str(validation_dump)
                     result = subprocess.run(
                         ["bash", str(project / "scripts/train_siton_2gpu.sh")], cwd=project,
                         env=env,
@@ -93,6 +102,7 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("groove.enabled=" + enabled, args)
                     self.assertIn("trainer.use_v1=" + ("false" if enabled == "true" else "true"), args)
                     self.assertIn("algorithm.filter_groups.enable=" + ("true" if name == "dapo" else "false"), args)
+                    self.assertIn(f"trainer.validation_data_dir={validation_dump}", args)
                     self.assertIn("actor_rollout_ref.actor.policy_loss.loss_mode=vanilla", args)
                     self.assertIn("reward.custom_reward_function.reward_kwargs.format_reward_weight=0.2", args)
                     self.assertIn("reward.custom_reward_function.reward_kwargs.answer_reward_weight=1.0", args)

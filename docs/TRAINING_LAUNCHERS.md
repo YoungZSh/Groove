@@ -90,9 +90,31 @@ GRPO + OPSD 默认 `data/vstar_opsd_4000_seed20260917/train.parquet`。
 另一台机器需要先准备或传输相应数据；OPSD 的 `extra_info.image_path` 必须指向该机器的本地图片。
 
 三种模式均使用独立的 `data/vstar_bench/validation.parquet`，完整 191 题；
-可通过 `VALIDATION_FILE` 覆盖。Benchmark 按选项准确率判分，不经过远程 Judge，也不应用训练惩罚。
+可通过 `VALIDATION_FILE` 覆盖。训练期间的验证与训练共用 `extract_answer()` 和远程 Judge：
+先提取 `<answer>` 内容，无法提取完整标签时使用完整回答；每条回答均进行语义判分。
+Judge 接收题目、全部有效选项以及标准答案的字母和文本，因此既能评判选项字母，
+也能评判含义相同的自然语言答案。验证 `score=accuracy`，不应用格式、重复或长度惩罚。
+格式和重复仍记录为诊断；旧规则的结果另存为 `rule_accuracy`、`rule_unparsed`，不再决定得分。
+Judge 使用与训练相同的“简短依据 + 最终二值判定”协议、超时与重试。
+后续运行取消仅允许输出 `0/1` 的 choice 约束，生成预算为 512 tokens，温度仍为 0；
+`enable_thinking=false` 下的依据是普通响应文本。解析器只读取唯一的末尾
+`Judgement: 0/1` 判定（允许紧接依据出现在同行，兼容旧版纯数字响应），
+缺失、冲突或生成截断时重试。
+提示词拒绝单答案题中未消解的候选枚举和矛盾结论，同时允许真正的多属性答案。
+校准后的简短提示词以所问属性为准，允许普通色差、次要点缀和明确区分对象的附加描述，
+不因未询问属性的不确定性而自动判错；固定说明与示例总量控制在 400 英文词以内。
+重试耗尽会报错，不静默回退成规则分数。与旧版宽松 Judge 比较时须统一协议重评。
 
-训练语义 Judge 为 `127.0.0.1:8002/v1` 的 Qwen3.8-27B。
+两份脚本的所有模式默认保存每次验证的全部 rollout（默认 191 条），包括训练前 step 0：
+`outputs/validation/<EXPERIMENT_NAME>/<step>.jsonl`。文件包含完整 input/output、标准答案、
+语义得分和格式/规则诊断。该保存不受 `log_val_generations` 的 W&B 展示数量限制，
+两卡的分批验证也会汇总全部回答。可用 `VALIDATION_DATA_DIR` 覆盖输出目录。
+训练 rollout 继续保存在独立的 `outputs/rollouts/<EXPERIMENT_NAME>/`。
+
+上述语义评分是新的验证协议，不能直接替代历史纯规则成绩。历史 parquet、日志和分数不回改；
+`scripts/evaluate_vstar.py` 及其比较工具继续保留明确的纯规则独立评测协议。
+
+训练和训练期间验证的语义 Judge 为 `127.0.0.1:8002/v1` 的 Qwen3.8-27B。
 GRPO + OPSD 额外使用同一服务的 Analyzer，以及 8011 DINO、8012 OCR。
 DINO/OCR 保持单 worker；启动脚本不会部署或重启远程服务。
 
