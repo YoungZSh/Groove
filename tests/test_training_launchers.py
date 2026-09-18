@@ -77,6 +77,7 @@ class TrainingLauncherTest(unittest.TestCase):
                         "VAL_BATCH_SIZE", "ROLLOUT_AGENT_NUM_WORKERS", "REWARD_NUM_WORKERS",
                         "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
                         "GROOVE_REPETITION_ZERO_REWARD",
+                        "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
                         "VALIDATION_DATA_DIR",
                     ):
                         env.pop(key, None)
@@ -102,6 +103,9 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("groove.enabled=" + enabled, args)
                     self.assertIn("trainer.use_v1=" + ("false" if enabled == "true" else "true"), args)
                     self.assertIn("algorithm.filter_groups.enable=" + ("true" if name == "dapo" else "false"), args)
+                    self.assertIn("trainer.best_checkpoint.enabled=true", args)
+                    self.assertIn("trainer.best_checkpoint.metric=val-core/vstar_bench/reward/mean@1", args)
+                    self.assertIn("trainer.best_checkpoint.mode=max", args)
                     self.assertIn(f"trainer.validation_data_dir={validation_dump}", args)
                     self.assertIn("actor_rollout_ref.actor.policy_loss.loss_mode=vanilla", args)
                     self.assertIn("reward.custom_reward_function.reward_kwargs.format_reward_weight=0.2", args)

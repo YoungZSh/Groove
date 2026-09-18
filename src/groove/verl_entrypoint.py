@@ -226,10 +226,13 @@ def load_training_config(config_name: str, overrides: list[str]):
 
 
 def main() -> None:
+    from verl.utils.checkpoint.best_checkpoint import validate_best_checkpoint_config
+
     config_name = os.environ.get("VERL_CONFIG_NAME", "groove")
     config = load_training_config(config_name, sys.argv[1:])
     configure_response_format(config)
     validate_objective_config(config)
+    validate_best_checkpoint_config(config)
     backend = trainer_backend(config)
     memory_guard = configure_ray_memory_guard(config)
     sleep_level = validate_full_time_sharing(config)
@@ -295,6 +298,8 @@ def main() -> None:
             f"dynamic_sampling={config.algorithm.filter_groups.enable}",
             f"filter_metric={config.algorithm.filter_groups.metric}",
             f"reference_kl_enabled={config.actor_rollout_ref.actor.use_kl_loss}",
+            f"best_checkpoint_enabled={config.trainer.get('best_checkpoint', {}).get('enabled', False)}",
+            f"best_checkpoint_metric={config.trainer.get('best_checkpoint', {}).get('metric')}",
         )
         return
     runner = task_runner_class(backend)

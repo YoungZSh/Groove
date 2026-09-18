@@ -75,6 +75,7 @@ from verl.trainer.ppo.utils import (
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import tensordict_utils as tu
+from verl.utils.checkpoint.best_checkpoint import maybe_save_best_checkpoint
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
@@ -417,6 +418,8 @@ class PPOTrainer(ABC):
             val_metrics = self._validate()
             self.on_validate_end()
             assert val_metrics, f"{val_metrics=}"
+            if not self.config.trainer.get("val_only", False):
+                val_metrics.update(maybe_save_best_checkpoint(self, val_metrics))
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -474,6 +477,8 @@ class PPOTrainer(ABC):
                     self.on_validate_end()
                     if is_last_step:
                         last_val_metrics = val_metrics
+                with marked_timer("save_best_checkpoint", self.timing_raw, color="green"):
+                    val_metrics.update(maybe_save_best_checkpoint(self, val_metrics))
                 metrics.update(val_metrics)
 
             # 5. record metrics
@@ -956,6 +961,7 @@ class PPOTrainer(ABC):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+        self._last_saved_checkpoint_step = self.global_steps
 
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table

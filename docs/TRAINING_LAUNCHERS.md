@@ -65,9 +65,35 @@ rollout 的 `score` 保存实际优化的最终奖励，奖励函数原始返回
 - prompt / response / 总上下文上限：9216 / 1024 / 10240。
 - 普通推理文字 + 末尾 `<answer>`；保留原生空 think prefill，`enable_thinking=false`。
 - 训练 temperature 1.0；验证 temperature 0、每题 1 个回答、不采样。
-- 验证、保存间隔均为 10 updates；保留最近两份 actor 检查点。
+- 验证、保存间隔均为 10 updates；保留最近两份 actor 检查点，并独立保留一份最佳检查点。
 - GRPO/DAPO 默认 W&B online，可显式设置 offline；GRPO + OPSD 默认 offline。
 - 默认 `RESUME_MODE=disable`，每次要求新的实验名称；显式续训参数在脚本顶部。
+
+### 最佳检查点
+
+两份启动脚本的所有模式默认设置 `SAVE_BEST_CHECKPOINT=true`，按
+`BEST_CHECKPOINT_METRIC=val-core/vstar_bench/reward/mean@1` 最大化选择最佳模型。
+该指标是完整 V*Bench 的 Judge 语义准确率，不应用训练奖励塑形。只有严格提高才替换，同分保留较早的模型。
+训练前验证（step 0）也参与选择；`val_only` 不保存检查点。
+
+最佳快照写入 `checkpoints/<EXPERIMENT_NAME>/best_checkpoint/global_step_<N>/`，
+其中包含当次保存的 actor 权重、优化器、额外状态和 `data.pt`；如有 critic 也一并复制。
+`best_checkpoint/metadata.json` 记录指标名、分数、步数和快照相对路径。
+它是独立文件副本，原始 `global_step_*` 的最近两份轮换不会删除最佳模型。
+同一步已有同步保存时直接复制；如果验证和保存周期不同，则为新的最佳步额外保存一次。
+额外保存会计入普通检查点的最近两份轮换，因此最近两份也可能包含非周期保存的验证步。
+复制成功并原子更新 metadata 后才删除上一份最佳副本；复制失败保留原最佳副本。
+稳定状态下额外占用一份完整检查点空间，替换过程中短暂保留新旧两份最佳副本。
+
+续训时从 metadata 恢复最佳分数，避免较差的后续模型覆盖旧最佳。需要从最佳模型显式续训时，
+将 `RESUME_FROM_PATH` 指向 metadata 对应的 `best_checkpoint/global_step_<N>`，并设置
+`RESUME_MODE=resume_path`。普通自动续训仍跟随外层 `latest_checkpointed_iteration.txt`。
+W&B/控制台在验证点记录 `checkpoint/best_step` 和 `checkpoint/best_score`。
+
+可通过 `SAVE_BEST_CHECKPOINT=false` 关闭，或覆盖指标；比较方向可通过最后的 CLI 参数
+`trainer.best_checkpoint.mode=min` 改为最小化。开启时要求有验证且使用同步保存，
+不支持 `checkpoint.async_save=true` 或 V1 异步训练。最佳副本保存在本地实验目录。
+这些设置只影响新启动的进程，无法恢复旧运行已清理的模型权重。
 
 | 机器配置 | 本机 A800 四卡 | Siton 两卡 |
 | --- | --- | --- |

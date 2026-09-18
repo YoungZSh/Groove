@@ -40,7 +40,7 @@ TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=my-opsd-4gpu-run01 \
 | Seed / learning rate | 20260904 / 1e-6 |
 | 训练 / 验证 temperature | 1.0 / 0，验证不采样 |
 | 验证 / 保存间隔 | 10 / 10 updates |
-| 保留 actor 检查点数量 | 2 |
+| 保留 actor 检查点数量 | 最近 2 份 + 独立最佳 1 份 |
 | Validation batch | null，完整 191 题 |
 | Ray 固定内存上限 | null，节点内存 95% |
 | OMP_NUM_THREADS | 4，传递到 Ray workers |

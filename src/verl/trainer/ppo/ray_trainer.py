@@ -60,6 +60,7 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.utils import tensordict_utils as tu
+from verl.utils.checkpoint.best_checkpoint import maybe_save_best_checkpoint
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -1048,6 +1049,7 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+        self._last_saved_checkpoint_step = self.global_steps
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1422,6 +1424,8 @@ class RayPPOTrainer:
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
+            if not self.config.trainer.get("val_only", False):
+                val_metrics.update(maybe_save_best_checkpoint(self, val_metrics))
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -1721,6 +1725,8 @@ class RayPPOTrainer:
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
+                    with marked_timer("save_best_checkpoint", timing_raw, color="green"):
+                        val_metrics.update(maybe_save_best_checkpoint(self, val_metrics))
                     metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):

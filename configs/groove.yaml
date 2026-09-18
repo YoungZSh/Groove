@@ -84,6 +84,10 @@ groove:
 trainer:
   use_v1: false
   val_before_train: false
+  best_checkpoint:
+    enabled: false
+    metric: val-core/vstar_bench/reward/mean@1
+    mode: max
 
 ray_kwargs:
   ray_init:

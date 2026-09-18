@@ -53,6 +53,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU", "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
             "WANDB_MODE", "RAY_NODE_MEMORY_CAP_GIB",
             "GROOVE_REPETITION_ZERO_REWARD",
+            "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
             "VALIDATION_DATA_DIR",
         ):
             self.env.pop(key, None)
@@ -96,6 +97,9 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(config.groove.enabled, enabled)
                 self.assertEqual(config.trainer.use_v1, not enabled)
                 self.assertEqual(config.algorithm.filter_groups.enable, mode == "dapo")
+                self.assertTrue(config.trainer.best_checkpoint.enabled)
+                self.assertEqual(config.trainer.best_checkpoint.metric, "val-core/vstar_bench/reward/mean@1")
+                self.assertEqual(config.trainer.best_checkpoint.mode, "max")
                 self.assertEqual(config.trainer.validation_data_dir,
                                  str(self.project / "outputs/validation/unit-four-gpu"))
                 self.assertEqual(config.reward.reward_manager.name, "VisualQARewardManager")
@@ -157,6 +161,17 @@ class FourGpuLauncherTest(unittest.TestCase):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
+
+    def test_best_checkpoint_can_be_disabled_and_cli_can_override_metric(self):
+        result = self.run_launcher(
+            overrides={"SAVE_BEST_CHECKPOINT": "false", "BEST_CHECKPOINT_METRIC": "custom_accuracy"},
+            args=("trainer.best_checkpoint.metric=custom_loss", "trainer.best_checkpoint.mode=min"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.resolved_config(json.loads(result.stdout))
+        self.assertFalse(config.trainer.best_checkpoint.enabled)
+        self.assertEqual(config.trainer.best_checkpoint.metric, "custom_loss")
+        self.assertEqual(config.trainer.best_checkpoint.mode, "min")
 
     def test_validation_rollout_path_preserves_spaces(self):
         for mode in ("grpo", "dapo", "grpo_opsd"):

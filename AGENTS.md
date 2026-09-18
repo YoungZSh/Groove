@@ -256,7 +256,12 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 - 训练采样温度：`1.0`。
 - 验证温度：`0`，不采样。
 - 验证和检查点保存频率：每 10 步。
-- 保留的 actor 检查点数：2。
+- 保留的 actor 检查点数：最近 2 份，另在 `best_checkpoint/` 独立保留验证最优的完整快照。
+  两个启动脚本默认开启 `SAVE_BEST_CHECKPOINT=true`，按
+  `val-core/vstar_bench/reward/mean@1` 严格提高更新，同分保留较早模型；训练前验证也参与。
+  `best_checkpoint/metadata.json` 记录分数、步数和路径，续训恢复该阈值。
+  最佳副本不受普通检查点轮换清理影响；保存逻辑位于
+  `src/verl/utils/checkpoint/best_checkpoint.py`，同时接入原生 V1 与 OPSD Trainer。
 - Thinking 模式：关闭。
 - 训练期间的 W&B 模式：GRPO/DAPO 默认在线，支持显式切换为离线；
   GRPO + OPSD 保持离线。
