@@ -79,6 +79,7 @@ class TrainingLauncherTest(unittest.TestCase):
                         "GROOVE_REPETITION_ZERO_REWARD",
                         "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
                         "VALIDATION_DATA_DIR",
+                        "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
                     ):
                         env.pop(key, None)
                     if repetition_override is not None:
@@ -119,6 +120,8 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("data.val_batch_size=8", args)
                     self.assertIn("actor_rollout_ref.rollout.agent.num_workers=8", args)
                     self.assertIn("reward.num_workers=1", args)
+                    self.assertIn("algorithm.filter_groups.max_inflight_gen_batches=1", args)
+                    self.assertIn("actor_rollout_ref.rollout.enforce_eager=true", args)
                     self.assertIn("actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768", args)
                     self.assertIn("actor_rollout_ref.rollout.max_num_batched_tokens=32768", args)
                     self.assertIn(f"data.train_files=['{data_paths[name] / 'train.parquet'}']", args)

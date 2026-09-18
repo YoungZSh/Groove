@@ -98,8 +98,9 @@ Defaults are the new 4000-row splits under `data/vstar_grpo_4000_seed20260917`
 and `data/vstar_opsd_4000_seed20260917`. `DATA_DIR` can select a different training
 split; `VALIDATION_FILE` remains independent. Historical datasets are preserved.
 All modes use seed 20260904, batch 16, 8 responses per group, and TP=1.
-The four-card profile uses 16 agent workers, 4 reward workers and 65536-token
-budgets; the two-card profile uses 8, 1 and 32768 respectively.
+The four-card profile uses 16 agent workers, 8 reward workers for DAPO
+(4 for other modes) and 65536-token budgets; the two-card profile uses
+8, 1 and 32768 respectively.
 See [standalone launchers](TRAINING_LAUNCHERS.md) for full machine settings.
 
 `src/groove/reward_manager.py` retains optional training-only overlong shaping,
@@ -470,6 +471,16 @@ CUDA Graph because captured graphs cannot be offloaded at the phase boundary.
 `layered_summon=false` is required because that option would force sleep level 1.
 The entrypoint checks all of these conditions and aborts instead of silently
 running a partial-sharing configuration.
+
+These checks describe the full-offload profile guarded by
+`GROOVE_REQUIRE_SLEEP_LEVEL_2=true`. The current standalone 2B launchers set
+that guard to false and retain actor parameters and optimizer state on GPU.
+The four-A800 DAPO profile uses eight reward workers and a two-batch refill
+window. A four-arm, five-update-per-arm smoke benchmark found CUDA Graph faster,
+but did not establish training-quality equivalence. The user chose to retain
+eager rollout (`enforce_eager=true`) for formal training; both launchers default
+to eager in every mode. See `TRAINING_LAUNCHERS.md` for measurements
+and their limits; the phase table above is not the current standalone memory layout.
 
 Within the training phase, the actor uses parameter, optimizer, and activation
 CPU offload, gradient checkpointing, remove-padding, dynamic batches, fused

@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -74,6 +75,7 @@ from verl.trainer.ppo.utils import (
 )
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
+from verl.trainer.ppo.v1.timing import agent_loop_timing_metrics, append_step_timing
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.best_checkpoint import maybe_save_best_checkpoint
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -445,6 +447,7 @@ class PPOTrainer(ABC):
         self.on_train_begin()
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
+            iteration_started = time.perf_counter()
             is_last_step = self.global_steps >= self.total_training_steps
             metrics = {}
             self.timing_raw = {}
@@ -481,23 +484,7 @@ class PPOTrainer(ABC):
                     val_metrics.update(maybe_save_best_checkpoint(self, val_metrics))
                 metrics.update(val_metrics)
 
-            # 5. record metrics
-            self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
-
-            # 6. dump rollout generations if enabled
-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
-                self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
-
-            # 7. cleanup transfer queue
-            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-
-            dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
-            self.logger.log(data=metrics, step=self.global_steps)
-            if dapo_filtered_reward_counts:
-                self.dapo_filtered_reward_logger.log(
-                    self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
-                )
+            self._finish_step_logging(batch, metrics, current_epoch, iteration_started)
             progress_bar.update(1)
             self.global_steps += 1
             SkipManager.set_step(self.global_steps)
@@ -511,6 +498,30 @@ class PPOTrainer(ABC):
         self.on_train_end()
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+
+    def _finish_step_logging(self, batch, metrics, epoch, iteration_started):
+        """Account for work outside the historical step timer without a second W&B log call."""
+        with marked_timer("compute_metrics", self.timing_raw):
+            self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=epoch)
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
+        with marked_timer("clear_transfer_queue", self.timing_raw):
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+        # _compute_metrics ran before dump/cleanup. Refresh the raw timers now.
+        metrics.update({f"timing_s/{key}": value for key, value in self.timing_raw.items()})
+        filtered_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
+        with marked_timer("log_metrics", self.timing_raw):
+            self.logger.log(data=metrics, step=self.global_steps)
+        with marked_timer("log_filtered_reward_table", self.timing_raw):
+            if filtered_counts:
+                self.dapo_filtered_reward_logger.log(self.config.trainer.logger, filtered_counts, self.global_steps)
+        self.timing_raw["iteration"] = time.perf_counter() - iteration_started
+        # Logging cannot report its own elapsed time in that same call. The local
+        # sidecar includes it, including the final step, without shifting W&B steps.
+        append_step_timing(self.config.trainer.get("step_timing_dir"), self.global_steps, self.timing_raw)
+        print(f"Completed step timing ({self.global_steps}): {json.dumps(self.timing_raw)}", flush=True)
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size
@@ -1737,6 +1748,7 @@ class PPOTrainer(ABC):
             "token_level_rewards",
             "num_turns",
             "extra_fields",
+            "metrics",
         ]
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
@@ -1749,6 +1761,7 @@ class PPOTrainer(ABC):
             kv_batch_get=tq.kv_batch_get,
         )
 
+        metrics.update(agent_loop_timing_metrics(data.pop("metrics").tolist(), non_padding_mask))
         metrics.update(reward_extra_metrics(data.pop("extra_fields").tolist(), non_padding_mask))
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()

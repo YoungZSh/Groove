@@ -100,7 +100,7 @@ W&B/控制台在验证点记录 `checkpoint/best_step` 和 `checkpoint/best_scor
 | Python | `/ssd/home/zc/miniconda3/envs/groove/bin/python` | `/home/yzs/miniconda3/envs/vision-opd/bin/python` |
 | 模型 | `/ssd/home/zc/yzs/models/ckpts/Qwen3.5-2B` | `/root/siton-tmp/yzs/ckpts/Qwen3.5-2B` |
 | CUDA devices | 0,1,2,3 | 0,1 |
-| Agent / reward workers | 16 / 4 | 8 / 1 |
+| Agent / reward workers | 16 / 8（DAPO），16 / 4（其余模式） | 8 / 1 |
 | Actor/log-prob、vLLM token 预算 | 65536 | 32768 |
 | Validation batch | null，完整 191 题 | 8 |
 | Ray 固定内存上限 | null，节点内存 95% | 220 GiB，保留 4 GiB headroom |
@@ -153,10 +153,44 @@ DINO/OCR 保持单 worker；启动脚本不会部署或重启远程服务。
   旧环境变量 `DAPO_OVERLONG_ENABLED`、`DAPO_OVERLONG_BUFFER`、`DAPO_OVERLONG_PENALTY`
   不再参与启动配置。
 - `VisualQARewardManager` 保留可选的训练长度塑形能力，当前脚本不启用；验证记录保持原始准确率。
-- `max_inflight_gen_batches=1` 限制同时生成的批量，V1 不执行旧的 `max_num_gen_batches` 总重试上限。
+- 四卡脚本默认 `max_inflight_gen_batches=2`，两卡仍为 1；可用
+  `DAPO_MAX_INFLIGHT_GEN_BATCHES` 覆盖。该值乘以全局 16 组，得到同时处于生成/评分阶段
+  的提示词组上限，不改变最终更新的 16 组。V1 不执行旧的 `max_num_gen_batches` 总重试上限。
   后者固定写为 0，避免假设它能终止补采。
 - V1 默认按 `4000 // 16 = 250` 个**优化更新**计算一轮预算；DAPO 补采可能多次遍历数据。
   250 次更新不等于只生成过 4000 道题。比较成本时需看过滤计数、rollout/token 数和墙钟时间。
+
+## DAPO 吞吐短测与计时
+
+`REWARD_NUM_WORKERS` 控制原生 GRPO/DAPO 的评分 worker 数；同步 `compute_score`
+通过各 worker 的默认线程池调用远程 Judge。`GROOVE_JUDGE_CONCURRENCY` 仅用于
+`compute_score_batched`，不控制原生逐条评分路径。四卡 DAPO 默认 8 个 reward worker，
+其他模式仍为 4。`ROLLOUT_ENFORCE_EAGER` 可覆盖，两份脚本的所有模式均默认 true
+（关闭 CUDA Graph）。CUDA Graph 已通过四卡 DAPO 连续参数更新短测，但尚未验证
+长期训练效果，按用户决定正式运行先关闭；吞吐短测不能替代数值和固定验证集对照。
+
+逐项比较配置为 `(DAPO_MAX_INFLIGHT_GEN_BATCHES, REWARD_NUM_WORKERS, ROLLOUT_ENFORCE_EAGER)`：
+`(1, 4, true)` → `(2, 4, true)` → `(2, 8, true)` → `(2, 8, false)`。
+每个短测使用新的实验名、同一模型/数据/种子，保持 16×8 和 1024 token 上限。
+窗口变大会改变补采样量和可能选中的题组，不能视为逐样本完全相同的对照。
+
+2026-09-18 四卡各 5 步短测，排除首步后平均完整迭代耗时依次为
+49.7、42.6、45.2、34.7 秒。最后一组吞吐最好，但用户决定正式运行先关闭 CUDA Graph；
+当前四卡 DAPO 默认采用第三组 `(2, 8, true)`。
+单独从 4 增至 8 个 reward worker 没有显示收益，4-worker＋CUDA Graph 的组合尚未实测。
+这些结果来自基础模型的短测，样本长度和过滤量存在差异，不能直接预测后期高过滤率时的加速幅度。
+短测关闭验证和保存，未改变奖励协议；正式运行仍保留原验证和保存频率。
+原始报告位于 `outputs/diagnostics/dapo-speed-20260918-004655/`（本地生成状态，不纳入 Git）。
+
+原生 V1 新增 `timing_s/retained_agent/{generate_sequences,compute_score}/{mean,max,p95}`，
+仅统计实际保留的非 padding 轨迹，含请求等待时间；并发请求的耗时不能相加当作墙钟时间。
+另记录指标计算、rollout 导出、队列清理、标量日志和 DAPO 表格日志的耗时。
+前几项进入正常指标；两类日志调用本身的耗时在它们返回后写入
+`outputs/timing/<EXPERIMENT_NAME>/steps.jsonl`，`STEP_TIMING_DIR` 可覆盖目录。
+每行 `timing_s.iteration` 从本步开始计至两类日志调用结束，包含验证及保存，
+不包含该计时文件写入、进度条和训练结束后的清理。它与历史 `timing_s.step` 保持分开。
+这些本地记录也包含最后一步，无需额外 W&B 调用或将指标挪到下一步；续训时追加写入。
+OPSD Trainer 暂不生成这组 V1 专用计时。
 
 ## 检查与使用
 

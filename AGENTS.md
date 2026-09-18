@@ -271,8 +271,17 @@ shuffle 设置、batch size、rollout 数、Judge 协议、奖励权重和验证
 
 独立四卡启动脚本使用全局 16 组提示词、每组 8 条 rollout，
 所有模式默认种子均为 20260904，并要求显式指定新的 `EXPERIMENT_NAME`。
-其吞吐配置使用 16 个 agent-loop worker、4 个本地 reward worker，
+其吞吐配置使用 16 个 agent-loop worker；DAPO 使用 8 个本地 reward worker，
+其余模式使用 4 个本地 reward worker，
 以及每 GPU 65536-token 的 actor/对数概率计算和 vLLM 批次预算。
+四卡 DAPO 的补采样并发窗口默认 2（最多 32 个待完成题组），可用
+`DAPO_MAX_INFLIGHT_GEN_BATCHES` 覆盖；两卡默认仍为 1。最终更新仍只用 16 组。
+`ROLLOUT_ENFORCE_EAGER` 可覆盖，两份脚本所有模式默认 true（关闭 CUDA Graph）。
+四卡已完成各 5 步的吞吐短测，但未验证 CUDA Graph 的长期训练效果，
+按用户决定正式运行先关闭；保留补采样窗口 2、8 个 reward worker 和新增计时。
+8 个 reward worker 单独没有加速证据，不推断其他组合的收益。
+原生 V1 在 `outputs/timing/<EXPERIMENT_NAME>/steps.jsonl` 追加完整分段计时，
+包括正常指标生成之后的导出、队列清理和日志调用；该文件保留最后一步的日志耗时。
 保持 TP=1（每 GPU 一个 Qwen3.5-2B rollout 副本），回答长度保持 1024。
 调节这些预算时，全局 batch 必须保持 16；提高 token 上限不意味着增大 batch。
 验证 batch 默认为 null（完整验证集），与 16 个 agent worker 无关；

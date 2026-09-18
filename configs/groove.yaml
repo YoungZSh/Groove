@@ -84,6 +84,8 @@ groove:
 trainer:
   use_v1: false
   val_before_train: false
+  # Native V1 writes completed per-step timings, including logger calls, here.
+  step_timing_dir: null
   best_checkpoint:
     enabled: false
     metric: val-core/vstar_bench/reward/mean@1

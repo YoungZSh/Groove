@@ -17,6 +17,7 @@ EXPECTED_GPUS=2
 export RAY_NODE_MEMORY_CAP_GIB="${RAY_NODE_MEMORY_CAP_GIB:-220}"
 ROLLOUT_AGENT_NUM_WORKERS="${ROLLOUT_AGENT_NUM_WORKERS:-8}"
 REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-1}"
+DAPO_MAX_INFLIGHT_GEN_BATCHES="${DAPO_MAX_INFLIGHT_GEN_BATCHES:-1}"
 ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-32768}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-32768}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-8}"
@@ -53,6 +54,7 @@ TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}
 CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME"
 VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-$PROJECT_ROOT/outputs/validation/$EXPERIMENT_NAME}"
+STEP_TIMING_DIR="${STEP_TIMING_DIR:-$PROJECT_ROOT/outputs/timing/$EXPERIMENT_NAME}"
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 
@@ -93,7 +95,7 @@ MODEL_USE_REMOVE_PADDING=true
 ROLLOUT_TENSOR_PARALLEL_SIZE=1
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
 ROLLOUT_MAX_NUM_SEQS=64
-ROLLOUT_ENFORCE_EAGER=true
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-true}"
 ROLLOUT_FREE_CACHE_ENGINE=true
 
 # ---- Shared semantic Judge. Validation keeps raw accuracy without reward shaping. ----
@@ -300,7 +302,7 @@ ALGORITHM=(
   algorithm.filter_groups.enable="$DYNAMIC_SAMPLING"
   algorithm.filter_groups.metric=training_reward
   algorithm.filter_groups.max_num_gen_batches=0
-  algorithm.filter_groups.max_inflight_gen_batches=1
+  algorithm.filter_groups.max_inflight_gen_batches="$DAPO_MAX_INFLIGHT_GEN_BATCHES"
 )
 
 # Semantic Judge adapter and training-only reward shaping.
@@ -331,6 +333,7 @@ TRAINER=(
   trainer.project_name=groove-visual-evidence
   trainer.experiment_name="$EXPERIMENT_NAME"
   trainer.logger="$TRAINER_LOGGER"
+  trainer.step_timing_dir="$STEP_TIMING_DIR"
   trainer.n_gpus_per_node="$N_GPUS"
   trainer.nnodes=1
   trainer.total_epochs="$TOTAL_EPOCHS"

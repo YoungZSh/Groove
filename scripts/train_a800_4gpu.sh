@@ -16,7 +16,9 @@ export N_GPUS="${N_GPUS:-4}"
 EXPECTED_GPUS=4
 export RAY_NODE_MEMORY_CAP_GIB="${RAY_NODE_MEMORY_CAP_GIB:-null}"
 ROLLOUT_AGENT_NUM_WORKERS="${ROLLOUT_AGENT_NUM_WORKERS:-16}"
-REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-4}"
+DEFAULT_REWARD_NUM_WORKERS=4
+DEFAULT_ROLLOUT_ENFORCE_EAGER=true
+DAPO_MAX_INFLIGHT_GEN_BATCHES="${DAPO_MAX_INFLIGHT_GEN_BATCHES:-2}"
 ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-65536}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-null}"
@@ -37,6 +39,8 @@ case "$TRAINING_MODE" in
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
     OPSD_ENABLED=false; USE_VERL_V1=true; DYNAMIC_SAMPLING=true
     USE_REFERENCE_KL=false; REFERENCE_KL_COEF=0.0; PPO_CLIP_RATIO_HIGH=0.28
+    # Keep concurrency tuning; CUDA Graph stays opt-in until quality is validated.
+    DEFAULT_REWARD_NUM_WORKERS=8
     export WANDB_MODE="${WANDB_MODE:-online}"
     ;;
   grpo_opsd|groove)
@@ -48,11 +52,13 @@ case "$TRAINING_MODE" in
     ;;
   *) echo "TRAINING_MODE must be grpo, dapo, or grpo_opsd (groove)." >&2; exit 2 ;;
 esac
+REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-$DEFAULT_REWARD_NUM_WORKERS}"
 TRAIN_FILE="$DATA_DIR/train.parquet"
 TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}"
 CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/$EXPERIMENT_NAME"
 ROLLOUT_DATA_DIR="$PROJECT_ROOT/outputs/rollouts/$EXPERIMENT_NAME"
 VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-$PROJECT_ROOT/outputs/validation/$EXPERIMENT_NAME}"
+STEP_TIMING_DIR="${STEP_TIMING_DIR:-$PROJECT_ROOT/outputs/timing/$EXPERIMENT_NAME}"
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 
@@ -93,7 +99,7 @@ MODEL_USE_REMOVE_PADDING=true
 ROLLOUT_TENSOR_PARALLEL_SIZE=1
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
 ROLLOUT_MAX_NUM_SEQS=64
-ROLLOUT_ENFORCE_EAGER=true
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-$DEFAULT_ROLLOUT_ENFORCE_EAGER}"
 ROLLOUT_FREE_CACHE_ENGINE=true
 
 # ---- Shared semantic Judge. Validation keeps raw accuracy without reward shaping. ----
@@ -300,7 +306,7 @@ ALGORITHM=(
   algorithm.filter_groups.enable="$DYNAMIC_SAMPLING"
   algorithm.filter_groups.metric=training_reward
   algorithm.filter_groups.max_num_gen_batches=0
-  algorithm.filter_groups.max_inflight_gen_batches=1
+  algorithm.filter_groups.max_inflight_gen_batches="$DAPO_MAX_INFLIGHT_GEN_BATCHES"
 )
 
 # Semantic Judge adapter and training-only reward shaping.
@@ -331,6 +337,7 @@ TRAINER=(
   trainer.project_name=groove-visual-evidence
   trainer.experiment_name="$EXPERIMENT_NAME"
   trainer.logger="$TRAINER_LOGGER"
+  trainer.step_timing_dir="$STEP_TIMING_DIR"
   trainer.n_gpus_per_node="$N_GPUS"
   trainer.nnodes=1
   trainer.total_epochs="$TOTAL_EPOCHS"

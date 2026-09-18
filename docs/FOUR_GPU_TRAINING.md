@@ -34,7 +34,9 @@ TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=my-opsd-4gpu-run01 \
 | 每题 rollout 数量 | 8 |
 | rollout TP | 1，每卡一个副本 |
 | prompt / response / 总上下文 | 9216 / 1024 / 10240 |
-| Agent / reward workers | 16 / 4 |
+| Agent / reward workers | DAPO 为 16 / 8；其他模式为 16 / 4 |
+| DAPO 补采样并发窗口 | 2，最多 32 个待完成题组；更新仍为 16 组 |
+| rollout enforce_eager | 所有模式均为 true，关闭 CUDA Graph |
 | 每卡 actor、log-prob 与 vLLM token 预算 | 65536 |
 | vLLM max_num_seqs / memory utilization | 64 / 0.45 |
 | Seed / learning rate | 20260904 / 1e-6 |
@@ -48,6 +50,10 @@ TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=my-opsd-4gpu-run01 \
 Agent 和 reward workers 是 CPU 调度/评分进程，不是 GPU 推理副本。
 全局 batch 为 16 时，每步生成 128 条回答，平均每卡 32 条。
 DAPO 会过滤并补采，实际生成量可能超过 128 条，但更新时仍为 16 个有效题组。
+`DAPO_MAX_INFLIGHT_GEN_BATCHES`、`REWARD_NUM_WORKERS`、`ROLLOUT_ENFORCE_EAGER`
+可分别覆盖。2026-09-18 完成四卡各 5 步吞吐短测后，按用户决定正式训练仍关闭
+CUDA Graph，保留其余吞吐配置；结果和范围见
+[训练入口说明](TRAINING_LAUNCHERS.md#dapo-吞吐短测与计时)。
 
 Token 预算控制每卡动态批处理容量，不会放大 prompt batch，也不会强制填满显存。
 Actor 采用四卡 FSDP；vLLM 在训练阶段休眠，更新后同步权重。

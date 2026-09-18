@@ -55,6 +55,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "GROOVE_REPETITION_ZERO_REWARD",
             "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
             "VALIDATION_DATA_DIR",
+            "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -97,6 +98,9 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(config.groove.enabled, enabled)
                 self.assertEqual(config.trainer.use_v1, not enabled)
                 self.assertEqual(config.algorithm.filter_groups.enable, mode == "dapo")
+                self.assertEqual(config.algorithm.filter_groups.max_inflight_gen_batches, 2)
+                self.assertTrue(config.actor_rollout_ref.rollout.enforce_eager)
+                self.assertEqual(config.trainer.step_timing_dir, str(self.project / "outputs/timing/unit-four-gpu"))
                 self.assertTrue(config.trainer.best_checkpoint.enabled)
                 self.assertEqual(config.trainer.best_checkpoint.metric, "val-core/vstar_bench/reward/mean@1")
                 self.assertEqual(config.trainer.best_checkpoint.mode, "max")
@@ -121,7 +125,7 @@ class FourGpuLauncherTest(unittest.TestCase):
                 self.assertEqual(rollout.log_prob_max_token_len_per_gpu, 65536)
                 self.assertEqual(rollout.max_num_batched_tokens, 65536)
                 self.assertEqual(rollout.agent.num_workers, 16)
-                self.assertEqual(config.reward.num_workers, 4)
+                self.assertEqual(config.reward.num_workers, 8 if mode == "dapo" else 4)
                 self.assertEqual(actor.policy_loss.loss_mode, "vanilla")
                 self.assertEqual(actor.loss_agg_mode, "token-mean")
                 self.assertEqual(actor.optim.lr, 1e-6)
@@ -161,6 +165,31 @@ class FourGpuLauncherTest(unittest.TestCase):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["env"]["WANDB_MODE"], "offline")
+
+    def test_dapo_speed_ablation_overrides_preserve_the_objective_and_cli_priority(self):
+        for window, workers, eager in ((1, 4, "true"), (2, 4, "true"), (2, 8, "true"), (2, 8, "false")):
+            with self.subTest(window=window, workers=workers, eager=eager):
+                result = self.run_launcher(overrides={
+                    "TRAINING_MODE": "dapo", "DAPO_MAX_INFLIGHT_GEN_BATCHES": str(window),
+                    "REWARD_NUM_WORKERS": str(workers), "ROLLOUT_ENFORCE_EAGER": eager,
+                    "STEP_TIMING_DIR": str(self.project / "timing with spaces"),
+                })
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.resolved_config(json.loads(result.stdout))
+                self.assertEqual(config.algorithm.filter_groups.max_inflight_gen_batches, window)
+                self.assertEqual(config.reward.num_workers, workers)
+                self.assertEqual(config.actor_rollout_ref.rollout.enforce_eager, eager == "true")
+                self.assertEqual(config.trainer.step_timing_dir, str(self.project / "timing with spaces"))
+                self.assertEqual(config.data.train_batch_size, 16)
+                self.assertEqual(config.actor_rollout_ref.rollout.n, 8)
+                self.assertEqual(config.actor_rollout_ref.actor.clip_ratio_high, 0.28)
+                self.assertFalse(config.actor_rollout_ref.actor.use_kl_loss)
+        result = self.run_launcher(
+            overrides={"TRAINING_MODE": "dapo", "DAPO_MAX_INFLIGHT_GEN_BATCHES": "2"},
+            args=("algorithm.filter_groups.max_inflight_gen_batches=1",),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.resolved_config(json.loads(result.stdout)).algorithm.filter_groups.max_inflight_gen_batches, 1)
 
     def test_best_checkpoint_can_be_disabled_and_cli_can_override_metric(self):
         result = self.run_launcher(
