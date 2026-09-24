@@ -15,14 +15,37 @@ DATA_SOURCE = "vstar_bench"
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 TAG_RE = re.compile(r"</?\s*answer\b[^>]*>", re.IGNORECASE)
 CHOICE_RE = re.compile(r"^\(([A-D])\)\s*(.+)$", re.MULTILINE)
+LETTER_ANSWER_INSTRUCTION = "Return the selected option letter inside <answer>...</answer>."
+SEMANTIC_ANSWER_INSTRUCTION = "Return the selected option letter or answer text inside <answer>...</answer>."
+RESPONSE_FORMAT_SUFFIX_RE = re.compile(
+    r"(?:^|\n)(?:"
+    r"Return the selected option letter(?: or answer text)?"
+    r"(?: inside <answer>\.\.\.</answer>)?\.?"
+    r"|Answer with the option(?:'s)? letter[^\n]*"
+    r")\s*\Z",
+    re.IGNORECASE,
+)
 
 
-def question_text(text: str) -> str:
-    # Replace only the source's output-format instruction; retain question/options.
-    question = re.sub(
-        r"\nAnswer with the option(?:'s)? letter.*$", "", text.strip(), flags=re.I
-    )
-    return question + "\nReturn the selected option letter inside <answer>...</answer>."
+def question_without_response_format(text: str) -> str:
+    """Remove only known terminal benchmark format instructions, preserving facts/options.
+
+    Older parquet files put the Student's letter-only instruction in question
+    metadata too. That instruction must never become a semantic grading rule.
+    """
+    question = text.strip()
+    while True:
+        cleaned = RESPONSE_FORMAT_SUFFIX_RE.sub("", question).strip()
+        if cleaned == question:
+            return question
+        question = cleaned
+
+
+def question_text(text: str, *, allow_answer_text: bool = False) -> str:
+    # Keep the standalone rule-only evaluator's historical letter-only default.
+    question = question_without_response_format(text)
+    instruction = SEMANTIC_ANSWER_INSTRUCTION if allow_answer_text else LETTER_ANSWER_INSTRUCTION
+    return question + "\n" + instruction
 
 
 def normalized(text: str) -> str:

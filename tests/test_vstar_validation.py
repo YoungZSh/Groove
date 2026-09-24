@@ -15,7 +15,13 @@ import pyarrow.parquet as pq
 
 from groove.response_prompt import REASONING_SYSTEM_PROMPT
 from groove.semantic_reward import compute_score, compute_score_batched, extract_answer
-from groove.vstar_bench import compute_validation_score
+from groove.vstar_bench import (
+    LETTER_ANSWER_INSTRUCTION,
+    SEMANTIC_ANSWER_INSTRUCTION,
+    compute_validation_score,
+    question_text,
+    question_without_response_format,
+)
 
 
 spec = spec_from_file_location("prepare_validation", Path(__file__).parents[1] / "scripts/prepare_vstar_validation.py")
@@ -55,6 +61,9 @@ class VStarValidationTest(unittest.TestCase):
             self.assertNotIn("FINAL:", user_message)
             self.assertNotIn("directly.", user_message)
             self.assertIn("<answer>...</answer>", user_message)
+            self.assertIn(SEMANTIC_ANSWER_INSTRUCTION, user_message)
+            self.assertEqual(row["extra_info"]["question"],
+                             "What material?\n(A) rubber\n(B) cotton\n(C) kevlar\n(D) leather")
             self.assertEqual(row["extra_info"]["choices"], self.choices)
             self.assertEqual(row["extra_info"]["split"], "validation")
 
@@ -132,6 +141,56 @@ class VStarValidationTest(unittest.TestCase):
         self.assertEqual(result["semantic_judge"], 1.0)
         self.assertNotIn("unparsed", result)
 
+    def test_question_formatting_preserves_options_and_the_legacy_evaluator_protocol(self):
+        # An instruction-like option is answer content, not a suffix to remove.
+        question = "What does the sign say?\n(A) Return the selected option letter.\n(B) Stop."
+        for suffix in (LETTER_ANSWER_INSTRUCTION, SEMANTIC_ANSWER_INSTRUCTION,
+                       "Answer with the option's letter from the given choices directly.",
+                       "Answer with the option letter directly.", "Return the selected option letter."):
+            with self.subTest(suffix=suffix):
+                source = question + "\n" + suffix + "\n \t"
+                self.assertEqual(question_without_response_format(source), question)
+                self.assertEqual(question_text(source), question + "\n" + LETTER_ANSWER_INSTRUCTION)
+                adapted = question_text(source, allow_answer_text=True)
+                self.assertEqual(adapted, question + "\n" + SEMANTIC_ANSWER_INSTRUCTION)
+                self.assertEqual(question_text(adapted, allow_answer_text=True), adapted)
+        self.assertEqual(question_without_response_format(question), question)
+
+    def test_validation_removes_student_format_instructions_from_real_judge_requests(self):
+        question = "What material?\n(A) rubber\n(B) cotton\n(C) kevlar\n(D) leather"
+        for suffix in (LETTER_ANSWER_INSTRUCTION, SEMANTIC_ANSWER_INSTRUCTION,
+                       "Answer with the option's letter from the given choices directly."):
+            info = {**self.info(), "question": question + "\n" + suffix}
+            original = deepcopy(info)
+            for answer in ("D", "d", "leather", "The glove is made of leather.", "A leather glove."):
+                with self.subTest(suffix=suffix, answer=answer):
+                    result, body = self.judge(f"<answer>{answer}</answer>", info=info)
+                    prompt = body["messages"][1]["content"]
+                    self.assertIn(f"[Question]: {question}\n[Standard Answer]: (D) leather\n", prompt)
+                    self.assertIn(f"[Model_answer]: {answer}\n", prompt)
+                    self.assertNotIn(suffix, prompt)
+                    self.assertEqual(result["score"], 1.0)
+                    self.assertEqual(info, original)
+
+    def test_historical_purple_case_sends_both_reference_letter_and_answer_text(self):
+        question = "What is the color of the comb?\n(A) brown\n(B) red\n(C) purple\n(D) black"
+        info = {"question": question + "\n" + LETTER_ANSWER_INSTRUCTION, "split": "validation",
+                "choices": {"A": "brown", "B": "red", "C": "purple", "D": "black"}}
+        with patch("groove.semantic_reward._judge_one", return_value={"score": 1.0, "accuracy": 1.0}) as judge:
+            result = compute_score("vstar_bench", "<answer>purple</answer>", "C", info)
+        judge.assert_called_once_with(question, "(C) purple", "<answer>purple</answer>",
+                                      answer_reward_weight=1.0, format_reward_weight=0.0,
+                                      apply_training_shaping=False)
+        self.assertEqual(result["score"], 1.0)
+
+    def test_validation_preserves_conflicting_letter_text_and_unresolved_candidates(self):
+        # Never normalize a contradictory answer into its matching word/letter.
+        for answer in ("(D) rubber", "Option A: leather", "D or A"):
+            with self.subTest(answer=answer):
+                result, body = self.judge(f"<answer>{answer}</answer>", verdict="0")
+                self.assertIn(f"[Model_answer]: {answer}\n", body["messages"][1]["content"])
+                self.assertEqual(result["accuracy"], 0.0)
+
     def test_validation_reads_explained_verdict_without_training_shaping(self):
         result, _ = self.judge("D", "Reason: D selects the reference material.\nJudgement: 1")
         self.assertEqual(result["accuracy"], 1.0)
@@ -155,6 +214,7 @@ class VStarValidationTest(unittest.TestCase):
         prompt = body["messages"][1]["content"]
         self.assertEqual(prompt.count("(A) rubber"), 1)
         self.assertNotIn("(B) None", prompt)
+        self.assertNotIn("Return the selected option letter.", prompt)
         self.assertEqual(info, before)
 
     def test_validation_judge_failure_is_not_silently_converted_to_rule_score(self):
@@ -223,7 +283,8 @@ class VStarValidationTest(unittest.TestCase):
             with self.subTest(reference=missing), self.assertRaises(ValueError):
                 compute_validation_score("D", "D", {**self.info(), "choices": {"A": "rubber", "D": missing}})
         with patch("groove.semantic_reward._judge_one") as judge:
-            for info in ({**self.info(), "question": ""}, {**self.info(), "split": "train"}):
+            for info in ({**self.info(), "question": ""}, {**self.info(), "split": "train"},
+                         {**self.info(), "question": LETTER_ANSWER_INSTRUCTION}):
                 with self.assertRaises(ValueError):
                     compute_score("vstar_bench", "D", "D", info)
             judge.assert_not_called()

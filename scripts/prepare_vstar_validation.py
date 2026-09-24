@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from groove.response_prompt import REASONING_SYSTEM_PROMPT
-from groove.vstar_bench import CHOICE_RE, DATA_SOURCE, question_text
+from groove.vstar_bench import CHOICE_RE, DATA_SOURCE, question_text, question_without_response_format
 
 
 DEFAULT_SOURCE = Path("/root/siton-tmp/yzs/datasets/vstar-bench/data/test-00000-of-00001.parquet")
@@ -37,12 +37,12 @@ def build_records(rows: list[dict]) -> list[dict]:
         answer = str(row["label"]).strip().upper()
         if answer not in choices:
             raise ValueError("V*Bench reference label must occur in the answer choices")
-        question = question_text(row["text"])
+        question = question_without_response_format(row["text"])
         records.append({
             "data_source": DATA_SOURCE,
             "prompt": [
                 {"role": "system", "content": REASONING_SYSTEM_PROMPT},
-                {"role": "user", "content": "<image>\n" + question},
+                {"role": "user", "content": "<image>\n" + question_text(question, allow_answer_text=True)},
             ],
             "images": [{"bytes": payload}],
             "ability": "visual_question_answering",

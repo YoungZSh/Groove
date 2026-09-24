@@ -20,7 +20,12 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from groove.vstar_bench import CHOICE_RE, DATA_SOURCE as VSTAR_DATA_SOURCE, compute_validation_score
+from groove.vstar_bench import (
+    CHOICE_RE,
+    DATA_SOURCE as VSTAR_DATA_SOURCE,
+    compute_validation_score,
+    question_without_response_format,
+)
 
 
 # Retain DeepEyes' question/reference/model-answer comparison and semantic
@@ -32,7 +37,7 @@ JUDGE_SYSTEM_PROMPT = (
     "criteria or your verdict."
 )
 
-JUDGE_INSTRUCTION = """Compare [Model_answer] with the correct [Standard Answer] for [Question]. Evaluate the requested fact, not exact wording or tags.
+JUDGE_INSTRUCTION = """Compare [Model_answer] with [Standard Answer] for [Question]. Judge meaning, ignoring format instructions and tags. For multiple-choice questions, accept correct letters (either case), answer text, or equivalent wording.
 
 Apply these checks in order:
 1. Resolve the target and requested fact without the reference, treating synonyms and ordinary shade differences as equivalent. Reject incompatible candidates or conflicting answers across possible targets. A scene-wide list does not answer the question merely because the reference is included, dominant, or most frequent.
@@ -389,7 +394,7 @@ def _judge_vstar_validation(output: str, ground_truth: str, extra_info: dict) ->
     """Judge every benchmark answer semantically; option matching is diagnostic only."""
     # This also validates the split and reference option, before making any request.
     rule = compute_validation_score(output, ground_truth, extra_info)
-    question = str(extra_info.get("question", "")).strip()
+    question = question_without_response_format(str(extra_info.get("question", "")))
     if not question:
         raise ValueError("V*Bench semantic validation requires extra_info.question")
     choices = {key: value for key, value in extra_info["choices"].items()

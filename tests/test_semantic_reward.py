@@ -48,6 +48,8 @@ class SemanticRewardLoopTest(unittest.TestCase):
         ground_truth = "blue"
         answer = "The coat or shirt is blue.\nThe nearby bag is brown.\n" + "Additional context. " * 100
         prompt = judge_prompt(question, ground_truth, answer)
+        self.assertIn("ignoring format instructions and tags", prompt)
+        self.assertIn("accept correct letters (either case), answer text, or equivalent wording", prompt)
         self.assertIn(f"[Question]: {question}\n", prompt)
         self.assertIn(f"[Standard Answer]: {ground_truth}\n", prompt)
         self.assertIn(f"[Model_answer]: {answer}\n\nEvaluate this model answer.", prompt)

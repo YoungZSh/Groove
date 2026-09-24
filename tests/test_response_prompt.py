@@ -14,6 +14,7 @@ from groove.response_prompt import (
     configure_response_format,
 )
 from groove.semantic_reward import extract_answer
+from groove.vstar_bench import LETTER_ANSWER_INSTRUCTION, SEMANTIC_ANSWER_INSTRUCTION
 from groove.evidence import build_teacher_prompt_from_student, student_prompt_template
 
 
@@ -62,6 +63,33 @@ class ResponsePromptTest(unittest.TestCase):
         self.assertEqual(messages[0]["content"], REASONING_SYSTEM_PROMPT)
         self.assertEqual(messages[1]["content"], "What color?")
         self.assertEqual(len(example["prompt"]), 1)
+
+    def test_vstar_allows_letters_or_text_without_rewriting_rows_or_leaking_references(self):
+        question = "What color?\n(A) red\n(B) blue"
+        for instruction in (LETTER_ANSWER_INSTRUCTION, SEMANTIC_ANSWER_INSTRUCTION):
+            with self.subTest(instruction=instruction):
+                example = {
+                    "data_source": "vstar_bench",
+                    "prompt": [{"role": "user", "content": "<image>" + question + "\n" + instruction}],
+                    "images": [{"path": "/tmp/original.jpg"}],
+                    "reward_model": {"ground_truth": "PRIVATE_REFERENCE_SENTINEL"},
+                    "extra_info": {"question": question + "\n" + instruction,
+                                   "answer": "PRIVATE_REFERENCE_SENTINEL"},
+                }
+                original = deepcopy(example)
+                messages = self.make_dataset()._build_messages(example)
+                self.assertEqual(example, original)
+                self.assertEqual(messages[-1]["content"], [
+                    {"type": "image", "path": "/tmp/original.jpg", "image": "/tmp/original.jpg"},
+                    {"type": "text", "text": question + "\n" + SEMANTIC_ANSWER_INSTRUCTION},
+                ])
+                self.assertNotIn("PRIVATE_REFERENCE_SENTINEL", str(messages))
+
+    def test_vstar_question_adaptation_does_not_change_training_questions(self):
+        text = "What color?\n(A) red\n(B) blue\n" + LETTER_ANSWER_INSTRUCTION
+        example = {"data_source": "vstar_grpo", "prompt": [{"role": "user", "content": text}], "images": []}
+        messages = self.make_dataset()._build_messages(example)
+        self.assertEqual(messages[-1]["content"], text)
 
     def test_student_and_teacher_preserve_native_non_thinking_prefill(self):
         with TemporaryDirectory() as folder:

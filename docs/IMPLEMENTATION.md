@@ -137,6 +137,22 @@ diagnostics. The standalone `scripts/evaluate_vstar.py` keeps its historical
 rule-only protocol. V*Bench records are validation-only and must not be added to
 training inputs.
 
+The semantic adapter removes known trailing Student response-format instructions
+from the question before calling the Judge, including those embedded in historical
+parquet metadata. The Judge accepts correct option letters in either case, option
+text, and semantic equivalents; a conflicting letter/text pair still fails. The
+stored `reward_model.ground_truth` remains the reference letter, while the actual
+Judge request contains both letter and text, for example `(C) purple`. It never
+receives a letter-only reference for V*Bench. Every answer still calls the Judge.
+
+New validation files store the question/options separately from the Student's
+format instruction. The reasoning dataset also adapts old V*Bench prompts in
+memory to allow a letter or answer text inside the final answer tags, without
+changing images, choices, labels, or existing parquet files. The standalone
+rule-only evaluator retains its letter-only instruction. The correction changes
+the protocol for future runs; comparisons with historical semantic scores require
+re-scoring the saved answers under the same corrected protocol.
+
 Two-option questions acquire null C/D fields when Arrow reads them using the
 same struct schema as four-option questions. The parser excludes null or blank
 options from label and text matching, and scoring rejects a missing reference

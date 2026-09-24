@@ -7,6 +7,7 @@ from copy import deepcopy
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from groove.response_prompt import REASONING_SYSTEM_PROMPT
+from groove.vstar_bench import DATA_SOURCE as VSTAR_DATA_SOURCE, question_text
 
 
 class ReasoningAnswerDataset(RLHFDataset):
@@ -19,6 +20,9 @@ class ReasoningAnswerDataset(RLHFDataset):
             messages[0]["content"] = REASONING_SYSTEM_PROMPT
         else:
             messages.insert(0, {"role": "system", "content": REASONING_SYSTEM_PROMPT})
+        if example.get("data_source") == VSTAR_DATA_SOURCE:
+            # Adapt historical parquet prompts in memory; never expose the reference.
+            messages[-1]["content"] = question_text(messages[-1]["content"], allow_answer_text=True)
         updated = dict(example)
         updated[prompt_key] = messages
         # RLHFDataset normalizes image dictionaries in place. Keep the source

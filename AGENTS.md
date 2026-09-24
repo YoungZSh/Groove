@@ -154,6 +154,11 @@ V1 名义上的 epoch 用于确定优化器更新次数；DAPO 补充采样可�
   `src/groove/semantic_reward.py::_judge_vstar_validation()`，复用训练的 `extract_answer()`：
   提取 answer 内容，提取不到完整标签时使用完整回答。每条验证回答都调用 Judge，
   不是只有规则失败时才调用；Judge 接收题目、全部选项，以及标准选项字母和文本。
+  传入 Judge 的参考答案必须是 `(C) purple` 这样的字母加完整选项文本，不能只传字母。
+  Judge 题目须移除历史或当前的 Student 回复格式指令；接受正确的选项字母（大小写均可）、
+  答案文本和语义等价表达，不得因没有返回选项字母而降低 `accuracy`。
+  新验证文件将纯题目/选项与 Student 格式指令分开保存；历史 parquet 保持原样，
+  `ReasoningAnswerDataset` 仅在内存中把 V*Bench 指令改为允许字母或答案文本。
   验证 `score=accuracy`，不叠加格式、重复或长度惩罚。
   `rule_accuracy`、`rule_unparsed` 仅用于保留旧选项匹配规则的诊断，不影响语义分数。
   独立 `scripts/evaluate_vstar.py` 仍明确使用历史纯规则协议；

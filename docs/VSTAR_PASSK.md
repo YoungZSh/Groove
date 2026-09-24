@@ -27,6 +27,12 @@ scores every answer through `groove.semantic_reward.compute_score` with
 repetition and historical rule matching are diagnostics. Judge failure does
 not silently count as an incorrect answer or reduce the denominator.
 
+The current dataset adapter permits either an option letter or answer text in
+the final answer tags. Before grading, the semantic adapter removes Student
+format instructions from the question and supplies the reference as both letter
+and text (for example `(C) purple`). Existing parquet files and evaluation logs
+are preserved; comparisons across this correction require a common scoring protocol.
+
 `src/groove/passk.py` requires exactly n distinct sample indices for each
 question, full question coverage and matching model inputs. With n=8,
 pass@8 is the fraction of questions with at least one correct answer. For
