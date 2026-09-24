@@ -247,6 +247,13 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 
 ## 当前 2B 实验设置
 
+本机另有明确的无 KL 两卡实验入口 `scripts/train_a800_2gpu_nokl.sh`：
+默认 GPU `1,2`，纯 GRPO，损失/奖励 KL 都关闭且系数为 0；全局 batch 为
+32 组 × 8 条回答，PPO mini-batch 32，单卡 token 预算 32768。
+4,000 条数据的一轮为 125 步，每 5 步验证并保存，保持每 160 道题的验证间隔。
+GPU 3 推理独立接管原进程；训练结束只恢复 GPU 1–2，检查点 world size 为 2。
+这是用户指定的无 KL 实验，不改变下面四卡与 Siton 基线入口的默认 KL。
+
 独立实验脚本使用以下设置：
 
 - 模型：本机使用 `/ssd/home/zc/yzs/models/ckpts/Qwen3.5-2B`；

@@ -7,6 +7,29 @@
 最后直接调用 `python -m groove.verl_entrypoint`。没有中间 shell 启动器，也不读取共享机器 shell 配置。
 需要某台机器、某种方法的固定实验入口时，复制其中一份并修改顶部参数即可。
 
+### 本机两卡无 KL 的 GRPO
+
+`scripts/train_a800_2gpu_nokl.sh` 是完整独立的本机实验脚本，默认只选择 GPU `1,2`。
+它使用全局 prompt batch 和 PPO mini-batch 均为 `32`，每题 `8` 条 rollout，
+学习率 `1e-6`、回答上限 `1024`、一个 PPO epoch；4,000 条训练数据的一轮为 125 步。
+每 5 步验证和保存一次，对应处理 160 道训练题，保持与原 batch 16、每 10 步验证相同的题数间隔。
+只支持纯 GRPO：损失 KL 和奖励 KL 都关闭，两个系数均为 0，因此不加载参考策略。
+现有四卡及 Siton 脚本的默认 KL 设置保持原样。
+
+两卡的 actor/log-prob 和 vLLM 单卡 token 预算均为 `32768`，通过动态 micro-batch
+控制峰值显存，不改变全局优化 batch。仍使用 16 个 agent worker、4 个 reward worker，
+验证一次提交全部 191 题，验证温度为 0。完整验证回答、最佳检查点及 W&B 日志照常保存。
+
+```bash
+EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
+  bash scripts/train_a800_2gpu_nokl.sh
+```
+
+当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
+GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练前只停止 GPU 1–2
+服务；训练结束后只恢复这两张卡，其恢复配置使用 `training_world_size=2`。
+不要正常终止仍管理 GPU 3 的共享监督器：它的清理逻辑会停止所有受管服务。
+
 ### 参数数组格式
 
 采用 [VERL 示例](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3_4b_fsdp.sh)
