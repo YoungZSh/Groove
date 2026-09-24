@@ -2,7 +2,9 @@ from contextlib import redirect_stdout
 from importlib.util import module_from_spec, spec_from_file_location
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -87,6 +89,88 @@ class AfterTrainingVllmTest(unittest.TestCase):
         self.assertEqual(command[command.index("--max-num-seqs") + 1], "16")
         self.assertEqual(command[command.index("--max-num-batched-tokens") + 1], "8192")
         self.assertEqual(int(command[command.index("--kv-cache-memory-bytes") + 1]), 69 * 1024**3)
+
+    def test_subset_keeps_original_checkpoint_world_size(self):
+        self.completion_files()
+        self.config.update(gpus=[1, 2, 3], ports=[8101, 8102, 8103], training_world_size=4)
+        controller.validate_config(self.config)
+        with patch.object(controller, "process_identity", return_value=None):
+            self.assertTrue(controller.training_status(self.config)["ready_to_launch"])
+            (Path(self.config["checkpoint_root"]) / "global_step_123/actor/model_world_size_4_rank_0.pt").unlink()
+            self.assertFalse(controller.training_status(self.config)["ready_to_launch"])
+
+    def test_rejects_adopting_gpu_outside_configured_subset(self):
+        self.config.update(gpus=[1, 2, 3], ports=[8101, 8102, 8103], existing_services={"0": {}})
+        with self.assertRaises(ValueError):
+            controller.validate_config(self.config)
+        with self.assertRaises(ValueError):
+            controller.adopt_services(self.config)
+
+    def test_adoption_checks_identity_command_and_device_selectors(self):
+        command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="1", CUDA_DEVICE_ORDER="PCI_BUS_ID")
+        child = subprocess.Popen(command, env=env, start_new_session=True)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.terminate)
+        identity = controller.process_identity(child.pid)
+        record = {"pid": child.pid, "start_ticks": identity, "log": "existing.log"}
+        self.config.update(gpus=[1], ports=[8101], existing_services={"1": record})
+        with patch.object(controller, "service_command", return_value=command):
+            adopted = controller.adopt_services(self.config)
+            self.assertIsNone(adopted[1]["process"].poll())
+            record["start_ticks"] = "reused-pid"
+            with self.assertRaises(ValueError):
+                controller.adopt_services(self.config)
+            record["start_ticks"] = identity
+            self.config.update(gpus=[2], existing_services={"2": record})
+            with self.assertRaises(ValueError):
+                controller.adopt_services(self.config)
+        self.config.update(gpus=[1], existing_services={"1": record})
+        with self.assertRaises(ValueError):
+            controller.adopt_services(self.config)
+        child.terminate()
+        child.wait(timeout=5)
+        self.assertIsNotNone(adopted[1]["process"].poll())
+
+    def test_reused_adopted_pid_is_never_signalled(self):
+        process = controller.ExistingProcess(900001, "original")
+        with patch.object(controller, "process_identity", return_value="replacement"), \
+                patch.object(controller.os, "killpg") as kill:
+            self.assertIsNotNone(process.poll())
+            controller.stop_service({"process": process, "start_ticks": "original"})
+            kill.assert_not_called()
+
+    def test_adopted_subset_is_ready_and_restarts_only_failed_configured_gpu(self):
+        for failed_gpu in (None, 2):
+            with self.subTest(failed_gpu=failed_gpu):
+                self.config.update(gpus=[1, 2, 3], ports=[8101, 8102, 8103],
+                                   output_dir=str(self.root / f"adopt-{failed_gpu}"))
+                children = {gpu: {"process": SimpleNamespace(pid=900000 + gpu,
+                                              poll=lambda gpu=gpu: 0 if gpu == failed_gpu else None),
+                                  "start_ticks": "owned", "started": 0, "log": "existing.log",
+                                  "probe": None, "ready": False} for gpu in (1, 2, 3)}
+                cards = {gpu: {"pids": [] if gpu == failed_gpu else [900000 + gpu],
+                               "used_mib": 73 * 1024} for gpu in (1, 2, 3)}
+                output = io.StringIO()
+                with patch.object(controller, "adopt_services", return_value=children), \
+                        patch.object(controller, "training_status") as training, \
+                        patch.object(controller, "gpu_state", return_value=cards) as gpu_state, \
+                        patch.object(controller, "port_available", return_value=True), \
+                        patch.object(controller, "probe_service", return_value="OK"), \
+                        patch.object(controller, "process_identity", return_value="owned"), \
+                        patch.object(controller, "stop_service"), \
+                        patch.object(controller.subprocess, "Popen", return_value=SimpleNamespace(pid=910002)) as launch, \
+                        patch.object(controller.time, "sleep", side_effect=KeyboardInterrupt), redirect_stdout(output):
+                    with self.assertRaises(KeyboardInterrupt):
+                        controller.supervise(self.config)
+                training.assert_not_called()
+                gpu_state.assert_called_once_with([1, 2, 3])
+                self.assertEqual('"stage": "READY"' in output.getvalue(), failed_gpu is None)
+                self.assertEqual(launch.call_count, int(failed_gpu is not None))
+                if failed_gpu is not None:
+                    self.assertEqual(launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "2")
+                    command = launch.call_args.args[0]
+                    self.assertEqual(command[command.index("--port") + 1], "8102")
 
     def test_supervisor_does_not_start_anything_while_training_is_running(self):
         with patch.object(controller, "training_status", return_value={"ready_to_launch": False, "training_process_alive": True}), \

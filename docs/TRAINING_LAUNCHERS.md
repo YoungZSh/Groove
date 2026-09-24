@@ -212,3 +212,13 @@ GROOVE_DRY_RUN=true TRAINING_MODE=dapo EXPERIMENT_NAME=check-dapo-config \
 
 训练结束后的独立 vLLM 监督器仍是 `scripts/serve_2b_after_training.py`，与训练入口分开运行。
 已知限制：它等待训练进程退出，W&B 收尾网络重试可能延后 GPU 释放和推理启动。
+
+监督器的 `gpus` 和 `ports` 可以配置为等长的子集，例如 `[1, 2, 3]` 与
+`[8101, 8102, 8103]`；未配置的 GPU 不参与监控或启动。训练与推理卡数不同时，
+用 `training_world_size` 保留原训练的检查点分片数，例如四卡训练设置为 `4`。
+接管仍在运行的服务时，可显式配置 `existing_services`，以 GPU 编号字符串为键，
+记录 `pid`、`start_ticks`（`/proc/<pid>/stat` 的启动 tick）和原 `log` 路径。
+接管前会核对进程身份、所有者、进程组、完整启动命令和 CUDA 设备选择；
+全部匹配后直接恢复健康检查及自动重启，无需重新等待训练或重载现有模型。
+`status.json` 会输出当前进程的 `start_ticks`；再次接管应使用当前身份，旧 PID
+记录失效时会拒绝启动。正常终止监督器会停止它启动或接管的全部已配置服务。

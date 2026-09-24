@@ -32,6 +32,56 @@ def process_identity(pid: int) -> str | None:
         return None
 
 
+class ExistingProcess:
+    """Track an explicitly adopted service without requiring it to be our child."""
+
+    def __init__(self, pid: int, start_ticks: str):
+        self.pid = pid
+        self.start_ticks = start_ticks
+
+    def poll(self):
+        return None if process_identity(self.pid) == self.start_ticks else 0
+
+    def wait(self, timeout: float):
+        deadline = time.monotonic() + timeout
+        while self.poll() is None:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.1)
+        return 0
+
+
+def adopt_services(config: dict) -> dict[int, dict]:
+    """Validate every recorded identity before taking ownership of any service."""
+    children = {}
+    for gpu_key, record in config.get("existing_services", {}).items():
+        gpu = int(gpu_key)
+        if gpu not in config["gpus"]:
+            raise ValueError(f"Cannot adopt unconfigured GPU {gpu}")
+        slot = config["gpus"].index(gpu)
+        pid, start_ticks = record["pid"], record["start_ticks"]
+        proc = Path(f"/proc/{pid}")
+        if not start_ticks or process_identity(pid) != start_ticks:
+            raise ValueError(f"GPU {gpu} service identity changed: {pid}")
+        if proc.stat().st_uid != os.getuid() or os.getpgid(pid) != pid:
+            raise ValueError(f"GPU {gpu} service must be an owned process-group leader")
+        command = [os.fsdecode(arg) for arg in proc.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+        expected = [service_command(config, slot, attempt, config["kv_cache_gib"]) for attempt in (1, 2)]
+        if command not in expected:
+            raise ValueError(f"GPU {gpu} service command does not match its configuration")
+        # Inspect only device selectors; never emit the process environment.
+        selectors = {entry.split(b"=", 1)[0]: entry.split(b"=", 1)[1]
+                     for entry in proc.joinpath("environ").read_bytes().split(b"\0")
+                     if entry.startswith((b"CUDA_VISIBLE_DEVICES=", b"CUDA_DEVICE_ORDER="))}
+        if selectors.get(b"CUDA_VISIBLE_DEVICES") != str(gpu).encode() or selectors.get(b"CUDA_DEVICE_ORDER") != b"PCI_BUS_ID":
+            raise ValueError(f"GPU {gpu} service device selectors do not match")
+        if process_identity(pid) != start_ticks:
+            raise ValueError(f"GPU {gpu} service exited during validation")
+        children[gpu] = {"process": ExistingProcess(pid, start_ticks), "start_ticks": start_ticks,
+                         "started": time.monotonic(), "log": record["log"], "probe": None, "ready": False}
+    return children
+
+
 def training_status(config: dict) -> dict:
     log = Path(config["training_log"])
     text = log.read_text(errors="replace") if log.exists() else ""
@@ -39,9 +89,10 @@ def training_status(config: dict) -> dict:
     final_step = config["final_step"]
     checkpoint = Path(config["checkpoint_root"]) / f"global_step_{final_step}"
     expected = [checkpoint / "data.pt"]
-    for rank in range(len(config["gpus"])):
+    world_size = config.get("training_world_size", len(config["gpus"]))
+    for rank in range(world_size):
         for prefix in ("model", "optim", "extra_state"):
-            expected.append(checkpoint / "actor" / f"{prefix}_world_size_{len(config['gpus'])}_rank_{rank}.pt")
+            expected.append(checkpoint / "actor" / f"{prefix}_world_size_{world_size}_rank_{rank}.pt")
     checkpoint_ready = all(path.is_file() and path.stat().st_size > 0 for path in expected)
     tracker = Path(config["checkpoint_root"]) / "latest_checkpointed_iteration.txt"
     try:
@@ -63,10 +114,16 @@ def training_status(config: dict) -> dict:
 
 
 def validate_config(config: dict) -> None:
-    if len(config["gpus"]) != 4 or len(set(config["gpus"])) != 4:
-        raise ValueError("Configure exactly four distinct GPUs")
-    if len(config["ports"]) != 4 or len(set(config["ports"])) != 4:
-        raise ValueError("Configure four distinct service ports")
+    if not config["gpus"] or len(set(config["gpus"])) != len(config["gpus"]):
+        raise ValueError("Configure one or more distinct GPUs")
+    if any(type(gpu) is not int or gpu < 0 for gpu in config["gpus"]):
+        raise ValueError("GPU indices must be nonnegative integers")
+    if len(config["ports"]) != len(config["gpus"]) or len(set(config["ports"])) != len(config["ports"]):
+        raise ValueError("Configure one distinct service port per GPU")
+    if config.get("training_world_size", len(config["gpus"])) < 1:
+        raise ValueError("Training world size must be positive")
+    if any(int(gpu) not in config["gpus"] for gpu in config.get("existing_services", {})):
+        raise ValueError("Existing services must belong to configured GPUs")
     if config["minimum_memory_mib"] < 72 * 1024:
         raise ValueError("The requested GPU memory floor is 72 GiB")
     if not 68 <= config["kv_cache_gib"] <= 70:
@@ -153,7 +210,7 @@ def probe_service(config: dict, slot: int, smoke: bool = False) -> str | None:
 
 
 def stop_service(service: dict) -> None:
-    """Only terminate the process group created by this supervisor."""
+    """Only terminate a process group created or explicitly adopted here."""
     process = service["process"]
     identity = process_identity(process.pid)
     if identity is not None and identity != service["start_ticks"]:
@@ -181,10 +238,14 @@ def supervise(config: dict) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     lock = (folder / "supervisor.lock").open("a+")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    children: dict[int, dict] = {}
-    attempts = {gpu: 0 for gpu in config["gpus"]}
+    try:
+        children = adopt_services(config)
+    except BaseException:
+        lock.close()
+        raise
+    attempts = {gpu: int(gpu in children) for gpu in config["gpus"]}
     caches = {gpu: config["kv_cache_gib"] for gpu in config["gpus"]}
-    activated = False
+    activated = bool(children)
     last_stage = None
 
     def status(stage: str, **details):
@@ -218,7 +279,7 @@ def supervise(config: dict) -> None:
                         time.sleep(2)
                         continue
                     activated = True
-                    print("Training exit condition satisfied; starting four TP=1 vLLM services", flush=True)
+                    print(f"Training exit condition satisfied; starting {len(config['gpus'])} TP=1 vLLM services", flush=True)
 
                 cards = gpu_state(config["gpus"])
                 for slot, gpu in enumerate(config["gpus"]):
@@ -264,9 +325,10 @@ def supervise(config: dict) -> None:
                         stop_service(service)
                         children.pop(gpu)
 
-                ready = len(children) == 4 and all(service["ready"] for service in children.values())
+                ready = len(children) == len(config["gpus"]) and all(service["ready"] for service in children.values())
                 details = {str(gpu): {"pid": service["process"].pid, "port": config["ports"][config["gpus"].index(gpu)],
                                       "memory_mib": cards[gpu]["used_mib"], "required_memory_mib": config["minimum_memory_mib"],
+                                      "start_ticks": service["start_ticks"],
                                       "ready": service["ready"], "inference_probe": service["probe"], "log": service["log"]}
                            for gpu, service in children.items()}
                 status("READY" if ready else "STARTING_OR_RECOVERING", services=details)
@@ -290,7 +352,7 @@ def main() -> None:
     validate_config(config)
     if args.check:
         print(json.dumps({"training": training_status(config),
-                          "commands": [service_command(config, slot, 1, config["kv_cache_gib"]) for slot in range(4)]}, indent=2))
+                          "commands": [service_command(config, slot, 1, config["kv_cache_gib"]) for slot in range(len(config["gpus"]))]}, indent=2))
         return
     def interrupted(*_):
         raise KeyboardInterrupt
