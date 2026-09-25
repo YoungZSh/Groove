@@ -2,7 +2,12 @@
 
 ## What comes from each reference
 
-This project uses a sampled-token teacher/student log-probability gap as an
+The standalone launchers on this experimental branch default to positive-only
+RLSD reweighting in `grpo_opsd` mode. See the section below; pure GRPO/DAPO are
+unchanged. The original additive mode remains available with
+`OPSD_ADVANTAGE_MODE=opsd`.
+
+The original additive mode uses a sampled-token teacher/student log-probability gap as an
 uncentered signed reverse-KL advantage.  It adds that token credit to the GRPO
 advantage before one shared PPO/dual-clip objective is evaluated.  The retained
 skill is a multimodal Crop/Zoom prefix generated from group-level rollout contrasts.
@@ -11,6 +16,46 @@ The project vendors the required Qwen3.5/verl integration under `src/verl` so
 the training runtime is part of this repository.  The original full-logit VOPD
 KL/JSD path remains available for compatibility, while the `groove` mode
 avoids full-vocabulary logits and uses only sampled-token log probabilities.
+
+## Positive-only RLSD experiment
+
+`groove.advantage_mode=rlsd_positive` replaces the additive correction with
+`A_total = A_GRPO * (1 + evidence_mask * 1[A_GRPO > 0] * lambda * (clip(exp(delta), 0.8, 1.2) - 1))`.
+The gap is the frozen Teacher log probability minus the pre-update Student log
+probability on exactly the same sampled tokens. Weights are detached, unnormalized,
+and fixed before the shared PPO update. There is no additional distillation loss
+and no additive `0.01 * delta` in this mode. Negative and zero advantages remain
+unchanged. Eligibility follows the shaped GRPO advantage, not semantic accuracy;
+Analyzer success/failure grouping still uses raw accuracy.
+
+`src/groove/rlsd.py` computes bounded weights in log space to avoid exponential
+overflow. Lambda is `0.5 * max(1 - global_step / decay_steps, 0)`. The local
+two-GPU trial uses 40 decay steps (step 1: 0.4875; step 40: zero); the four-GPU
+and Siton profiles retain 50 (step 1: 0.49; step 50: zero).
+After decay the trainer skips Analyzer and Teacher
+work. A batch with no positive advantages also skips evidence work. While lambda
+is nonzero, Teacher synchronization still happens independently of eligibility.
+
+`rlsd_teacher.py` stores a detached CPU sharded snapshot using PyTorch's model
+state-dict API. `rlsd_workers.py` temporarily loads that snapshot for no-grad
+scoring and restores Student parameters/buffers in a `finally` block, leaving
+optimizer and reference-policy state untouched. Teacher starts at Student step 0
+and refreshes after every 10 completed outer updates (before steps 11, 21, ...).
+Rank-local snapshots and their steps are saved alongside actor checkpoints,
+including best checkpoints. Resuming within an interval without its Teacher
+snapshot fails instead of silently refreshing the Teacher. Initial support is
+FSDP/FSDP2 with synchronous checkpoints on local/shared storage.
+
+The four-GPU/Siton defaults follow the paper's 10-step synchronization and 50-step decay;
+the local two-GPU trial explicitly shortens decay to 40 steps.
+The cited upstream script at `aca313b9` uses 20 and 60 instead. The project
+continues to use privileged visual crops, not ground-truth answer hints, and
+retains the 2B baseline optimization/sampling settings. This is a positive-only
+visual-evidence variant, not an exact reproduction of upstream RLSD.
+
+Audits record `advantage_mode`, effective `rlsd_weights`, lambda, Teacher snapshot
+step, and actual `rlsd_correction`. Generic OPSD diagnostic fields in this mode
+represent the actual correction with coefficient 1, not the old raw log gap.
 
 ## Information boundaries
 
@@ -103,6 +148,16 @@ The four-card profile uses 16 agent workers, 8 reward workers for DAPO
 8, 1 and 32768 respectively.
 See [standalone launchers](TRAINING_LAUNCHERS.md) for full machine settings.
 
+The additional local `scripts/train_a800_2gpu_nokl.sh` profile uses GPUs 1,2,
+global prompt/PPO mini-batch 32, 8 rollouts, 32768-token per-GPU budgets,
+16 agent workers, 4 reward workers and full-set validation. Both loss and reward
+KL are disabled. It defaults to native-V1 GRPO and also supports `grpo_opsd`
+(`groove` alias), which selects the project Trainer and positive-only RLSD with
+offline W&B. Its 4000-row epoch is 125 steps, with validation and checkpoints
+every 5 steps. RLSD retains 10-step Teacher synchronization and uses the requested
+40-step linear decay (32% of this epoch), then ordinary GRPO updates. The batch
+change does not automatically rescale the schedule.
+
 `src/groove/reward_manager.py` retains optional training-only overlong shaping,
 but both standalone launchers disable it in every mode and no longer read the
 legacy `DAPO_OVERLONG_*` environment variables.
@@ -114,7 +169,8 @@ the reward function's value before manager shaping.
 DAPO uses clip low/high 0.2/0.28 and no reference KL. The unchanged 1024-token
 response limit does not add a length reward penalty. V1 budgets updates by dataset size / batch
 size; dynamic refill can consume additional passes over the source dataset.
-The existing GRPO + OPSD credit allocation and uniform-group behavior are unchanged.
+The additive OPSD mode retains its uniform-group behavior; RLSD leaves zero
+advantages at zero and therefore does not learn from uniform-reward groups.
 
 ### Full V*Bench validation
 
@@ -326,6 +382,10 @@ changing or restarting the deployed services.
 
 ## Mask semantics
 
+This section describes `groove.advantage_mode=opsd`. RLSD keeps the same binary
+evidence-availability boundary but also requires positive GRPO advantage and
+nonzero lambda; see the positive-only RLSD section above.
+
 The following mask semantics apply when the joint objective is enabled with
 `OPSD_ENABLED=true`. The default GRPO-only ablation selects vanilla policy loss,
 does not construct a self-distillation batch, and therefore has no evidence mask
@@ -347,7 +407,10 @@ Mixed, all-correct, and all-wrong groups can all receive OPD. This keeps auxilia
 alive on tied-reward groups where the GRPO advantage is zero. The compatibility
 switch `GROOVE_MIXED_GROUPS_ONLY=true` restores the earlier mixed-only probe.
 
-## Reference recipe alignment
+## Historical reference recipe alignment
+
+The recipe comparisons below document earlier additive experiments. Current
+2B machine, batch, KL and context defaults are in `TRAINING_LAUNCHERS.md`.
 
 The following settings define the reference sampled-token visual-evidence recipe:
 
@@ -388,6 +451,9 @@ coefficient uses verl's `0.001` default instead of the reference `0.01`, because
 this is a short single-turn VQA task rather than a long-horizon exploration environment.
 
 ## Teacher scoring and refresh behavior
+
+For `rlsd_positive`, the Teacher is periodically frozen as described above.
+The following behavior applies only to the retained additive `opsd` mode.
 
 Both scoring passes use the pre-update actor under `no_grad`. Their signed gap
 is cached in the combined advantage before any actor optimizer step and stays

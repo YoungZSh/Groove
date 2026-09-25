@@ -151,6 +151,17 @@ def validate_full_time_sharing(config) -> int:
 
 
 class GrooveTaskRunner(BaseTaskRunner):
+    def add_actor_rollout_worker(self, config):
+        actor_cls, group_cls = super().add_actor_rollout_worker(config)
+        if config.groove.get("advantage_mode", "opsd") == "rlsd_positive":
+            from verl.trainer.ppo.utils import Role
+            from .rlsd_workers import RLSDActorRolloutRefWorker
+
+            actor_cls = RLSDActorRolloutRefWorker
+            role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+            self.role_worker_mapping[role] = ray.remote(actor_cls)
+        return actor_cls, group_cls
+
     def run(self, config):
         """Run VERL 0.9's synchronous dataflow with the GROOVE trainer."""
         from .verl_trainer import GrooveRayPPOTrainer
@@ -257,6 +268,11 @@ def main() -> None:
             config.actor_rollout_ref.rollout.n,
             config.trainer.n_gpus_per_node,
             f"opsd_enabled={opsd_enabled}",
+            f"advantage_mode={groove_cfg.get('advantage_mode', 'opsd')}",
+            f"rlsd_lambda_initial={groove_cfg.get('rlsd_lambda_initial')}",
+            f"rlsd_lambda_decay_steps={groove_cfg.get('rlsd_lambda_decay_steps')}",
+            f"rlsd_clip_range={groove_cfg.get('rlsd_clip_range')}",
+            f"rlsd_teacher_sync_interval={groove_cfg.get('rlsd_teacher_sync_interval')}",
             f"opsd_advantage_coef={groove_cfg.get('opsd_advantage_coef')}",
             f"opsd_advantage_clip={groove_cfg.get('opsd_advantage_clip')}",
             f"vllm_sleep_level={sleep_level}",

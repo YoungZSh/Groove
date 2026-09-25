@@ -74,6 +74,13 @@ reward:
 # VERL's typed ActorConfig and are consumed only by the GROOVE adapter.
 groove:
   enabled: false
+  # Standalone launchers select rlsd_positive on this experimental branch.
+  # Keep the additive objective selectable for matched comparisons.
+  advantage_mode: opsd
+  rlsd_lambda_initial: 0.5
+  rlsd_lambda_decay_steps: 50
+  rlsd_clip_range: 0.2
+  rlsd_teacher_sync_interval: 10
   # Both contexts are scored by the pre-update actor. Targets stay detached
   # throughout this rollout batch's PPO updates and refresh on the next batch.
   opsd_advantage_coef: 0.01

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Standalone Qwen3.5-2B GRPO without reference KL on two local A800 GPUs.
+# Standalone Qwen3.5-2B GRPO or GRPO + OPSD without KL on two local A800 GPUs.
 # This file is complete: it never sources or calls another launcher.
 # Global prompt batch is 32 with 8 rollouts; GPU 3 is reserved for inference.
+# Select TRAINING_MODE=grpo (default) or grpo_opsd (groove is an alias).
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,13 +29,22 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 TRAINING_MODE="${TRAINING_MODE:-grpo}"
 : "${EXPERIMENT_NAME:?Set a new EXPERIMENT_NAME for each experiment.}"
 SEED="${SEED:-20260904}"
-if [[ "$TRAINING_MODE" != "grpo" ]]; then
-  echo "This experiment is pure GRPO without KL; TRAINING_MODE must be grpo." >&2; exit 2
-fi
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
-OPSD_ENABLED=false; USE_VERL_V1=true; DYNAMIC_SAMPLING=false
+case "$TRAINING_MODE" in
+  grpo)
+    DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
+    OPSD_ENABLED=false; USE_VERL_V1=true
+    export WANDB_MODE="${WANDB_MODE:-online}"
+    ;;
+  grpo_opsd|groove)
+    TRAINING_MODE=grpo_opsd
+    DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_opsd_4000_seed20260917}"
+    OPSD_ENABLED=true; USE_VERL_V1=false
+    export WANDB_MODE=offline
+    ;;
+  *) echo "TRAINING_MODE must be grpo or grpo_opsd (groove) for this two-GPU no-KL experiment." >&2; exit 2 ;;
+esac
+DYNAMIC_SAMPLING=false
 USE_REFERENCE_KL=false; REFERENCE_KL_COEF=0.0; PPO_CLIP_RATIO_HIGH=0.2
-export WANDB_MODE="${WANDB_MODE:-online}"
 REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-$DEFAULT_REWARD_NUM_WORKERS}"
 TRAIN_FILE="$DATA_DIR/train.parquet"
 TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}"
@@ -105,7 +115,12 @@ export GROOVE_REPETITION_MAX_PERIOD="${GROOVE_REPETITION_MAX_PERIOD:-1024}"
 export GROOVE_REPETITION_SAMPLE_LENGTH="${GROOVE_REPETITION_SAMPLE_LENGTH:-16}"
 export GROOVE_REPETITION_SAMPLE_INTERVAL="${GROOVE_REPETITION_SAMPLE_INTERVAL:-32}"
 
-# ---- GRPO + OPSD only: current-policy Teacher and training-only visual evidence. ----
+# ---- GRPO + OPSD only: training-only visual evidence and credit allocation. ----
+OPSD_ADVANTAGE_MODE="${OPSD_ADVANTAGE_MODE:-rlsd_positive}"
+RLSD_LAMBDA_INITIAL="${RLSD_LAMBDA_INITIAL:-0.5}"
+RLSD_LAMBDA_DECAY_STEPS="${RLSD_LAMBDA_DECAY_STEPS:-40}"
+RLSD_CLIP_RANGE="${RLSD_CLIP_RANGE:-0.2}"
+RLSD_TEACHER_SYNC_INTERVAL="${RLSD_TEACHER_SYNC_INTERVAL:-10}"
 export ANALYZER_BASE_URL="${ANALYZER_BASE_URL:-http://127.0.0.1:8002/v1}"
 export ANALYZER_API_KEY="${ANALYZER_API_KEY:-unused}"
 export ANALYZER_MODEL=Qwen3.8-27B
@@ -309,9 +324,14 @@ REWARD=(
   reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT"
 )
 
-# Optional current-policy Teacher credit allocation.
+# Optional visual Teacher credit allocation (legacy additive OPSD remains selectable).
 OPSD=(
   "groove.enabled=$OPSD_ENABLED"
+  "groove.advantage_mode=$OPSD_ADVANTAGE_MODE"
+  "groove.rlsd_lambda_initial=$RLSD_LAMBDA_INITIAL"
+  "groove.rlsd_lambda_decay_steps=$RLSD_LAMBDA_DECAY_STEPS"
+  "groove.rlsd_clip_range=$RLSD_CLIP_RANGE"
+  "groove.rlsd_teacher_sync_interval=$RLSD_TEACHER_SYNC_INTERVAL"
   groove.opsd_advantage_coef=0.01
   groove.opsd_advantage_clip=null
   "groove.max_reprompt_len=$MAX_MODEL_LEN"

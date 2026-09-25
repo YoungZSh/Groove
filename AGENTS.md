@@ -5,14 +5,14 @@
 本文件适用于仓库根目录及其所有子目录；如果某个子目录存在更具体的
 `AGENTS.md`，则以该文件为准。
 
-本项目实现 GROOVE：在常规 GRPO 的基础上，利用特权视觉证据，为采样出的 token
-增加未中心化的 OPSD 优势信用分配。方法名称统一使用 `GRPO + OPSD`。
+本项目实现 GROOVE：在常规 GRPO 的基础上，利用特权视觉证据进行 token 信用分配。
+本实验分支新增仅正优势 RLSD 重加权，原加法 OPSD 保留为对照。方法名称统一使用 `GRPO + OPSD`。
 不要把旧实验名称、内部标识或论文中的限定词添加到对外方法名称中。
 
 必须遵守以下部署边界：
 
 - Student 只能看到原始图像和问题。
-- 使用当前策略的 Teacher，在包含 Analyzer 所选视觉证据的特权前缀下，
+- Teacher（加法 OPSD 使用当前策略，RLSD 使用周期冻结快照）在包含 Analyzer 所选视觉证据的特权前缀下，
   对 Student rollout 中完全相同的 token 进行评分。
 - Analyzer、GroundingDINO、OCR、裁剪图像和 Teacher 专用文本都是训练阶段的特权信息，
   绝不能进入 Student 的推理输入。
@@ -36,9 +36,11 @@
    它在线构建 Teacher 证据，计算参数更新前的 Teacher 对数概率，构造 OPSD token 优势，
    与已经计算好的 GRPO 优势合并，并在 actor 更新前写回
    `batch.batch["advantages"]`。
-3. `src/groove/losses.py::groove_opsd_advantages()` 定义未中心化的 OPSD
+3. `src/groove/rlsd.py` 定义仅正优势 RLSD 重加权和衰减；
+   `src/groove/rlsd_teacher.py` / `rlsd_workers.py` 定义冻结 Teacher 与检查点恢复。
+   `src/groove/losses.py::groove_opsd_advantages()` 定义原未中心化的 OPSD
    逐 token 信用分配。`combine_grpo_opsd_advantages()` 定义优化时唯一使用的
-   GRPO + OPSD 优势合并方式。
+   加法 OPSD 优势合并方式。
 4. `src/groove/objective.py::validate_objective_config()` 定义允许的目标配置：
    使用 GRPO 优势估计、单一 vanilla PPO 策略损失，在损失中加入参考策略 KL，
    不设置独立的蒸馏目标。
@@ -108,9 +110,39 @@ Siton 使用 `/home/yzs/miniconda3/envs/vision-opd/bin/python`。原生 V1 需�
 使用 `GROOVE_DRY_RUN=true` 可以验证完整解析后的配置，而不启动 Ray worker
 或加载模型权重。检查正式启动脚本时，必须提供唯一的 `EXPERIMENT_NAME`。
 
-## 当前 GRPO + OPSD 优势信用分配
+## 本分支的仅正优势 RLSD 实验
 
-当前实现采用未中心化的 OPSD 优势。OPSD 在优势层面进行逐 token 信用分配，
+本机四卡、本机两卡无 KL 和 Siton 启动脚本在 `TRAINING_MODE=grpo_opsd` 下默认使用
+`OPSD_ADVANTAGE_MODE=rlsd_positive`；`opsd` 可选回原加法目标。
+纯 GRPO/DAPO 不启用此机制。本机两卡无 KL 入口默认仍是纯 GRPO，显式选择
+`TRAINING_MODE=grpo_opsd`（别名 `groove`）启用 RLSD，batch 保持 32。
+
+```text
+decay_steps = 40  # 本机两卡试验；四卡和 Siton 默认 50
+lambda_s = 0.5 * max(1 - global_step / decay_steps, 0)
+w_t = 1 + evidence_mask * 1[A_GRPO > 0] * lambda_s * (clip(exp(delta_t), 0.8, 1.2) - 1)
+A_total,t = A_GRPO * w_t
+```
+
+- 正优势按已有塑形奖励计算，不附加 `accuracy=1` 条件。负优势和零优势不重加权。
+- 不再叠加旧的 `0.01 * delta`；不添加独立蒸馏损失或序列归一化。
+- Teacher 初始化为 Student，完成每 10 次外循环更新后完整复制一次参数，期间冻结。
+  默认第 1–10 步使用初始 Teacher，第 11–20 步使用第 10 步 Student，依此类推。
+- 评分使用同一批采样 token，在 actor 更新前固定权重；Student 从不读取特权输入。
+- 快照保存为每 rank 的 CPU 分片，临时装入 actor 评分后在 finally 中恢复 Student；
+  不更新 optimizer 和 reference policy。检查点保存 Teacher 分片及对应步数。
+- `global_step` 使用日志中的外循环步数：本机两卡第 1 步 lambda=0.4875，
+  第 40 步起为零，跳过 Analyzer/Teacher 并释放教师快照；四卡和 Siton 默认仍为
+  50 步衰减。衰减步数通过 `RLSD_LAMBDA_DECAY_STEPS` 覆盖，不按总步数自动缩放。
+- 整批无正优势时跳过 Analyzer/Teacher 评分，但仍维护 Teacher 同步周期。
+  有正优势时 Analyzer 仍读取完整组的成功/失败列表，保持原始 accuracy 分组。
+- 证据缺失回退普通 GRPO。原加法模式的同奖励组学习行为不变；RLSD 零优势组没有额外信号。
+- 保留模型、数据、Judge、格式奖励、1024 长度、PPO clip 和参考 KL 基线配置。
+  参数、启动示例和限制见 `docs/TRAINING_LAUNCHERS.md`。
+
+## 原加法 GRPO + OPSD 优势信用分配（advantage_mode=opsd）
+
+原加法模式采用未中心化的 OPSD 优势。OPSD 在优势层面进行逐 token 信用分配，
 不作为独立损失添加。实际执行的计算为：
 
 ```text
@@ -248,9 +280,13 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 ## 当前 2B 实验设置
 
 本机另有明确的无 KL 两卡实验入口 `scripts/train_a800_2gpu_nokl.sh`：
-默认 GPU `1,2`，纯 GRPO，损失/奖励 KL 都关闭且系数为 0；全局 batch 为
+默认 GPU `1,2`，默认纯 GRPO，也支持 `TRAINING_MODE=grpo_opsd`（别名 `groove`）；
+两种模式的损失/奖励 KL 都关闭且系数为 0，全局 batch 为
 32 组 × 8 条回答，PPO mini-batch 32，单卡 token 预算 32768。
 4,000 条数据的一轮为 125 步，每 5 步验证并保存，保持每 160 道题的验证间隔。
+GRPO + OPSD 默认采用仅正优势 RLSD，Teacher 每 10 步同步、第 40 步衰减到零
+（占一轮 125 步的 32%），此后普通 GRPO 更新；`OPSD_ADVANTAGE_MODE=opsd` 可选原加法对照。
+GRPO 使用原生 V1 和默认在线 W&B；GRPO + OPSD 使用项目 Trainer 和离线 W&B。
 GPU 3 推理独立接管原进程；训练结束只恢复 GPU 1–2，检查点 world size 为 2。
 这是用户指定的无 KL 实验，不改变下面四卡与 Siton 基线入口的默认 KL。
 

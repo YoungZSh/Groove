@@ -32,6 +32,7 @@ from .evidence import (
 from .grounding import GroundingDinoConfig, GroundingDinoGrounder
 from .losses import combine_grpo_opsd_advantages, groove_opsd_advantages
 from .objective import validate_objective_config
+from .rlsd import positive_rlsd_advantages, rlsd_lambda
 from .reward import extract_option
 from .schemas import GroupRollout, Rollout
 from .trajectory_audit import write_trajectory_audit
@@ -631,6 +632,8 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         if not bool(groove_config.get("enabled", False)):
             return batch, metrics
         validate_objective_config(self.config)
+        if groove_config.get("advantage_mode", "opsd") == "rlsd_positive":
+            return self._postprocess_rlsd_advantages(batch, reward_tensor, reward_extra_infos_dict, metrics)
 
         judge_accuracies = (
             reward_extra_infos_dict.get("accuracy")
@@ -716,5 +719,95 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
                 sequence_rewards=reward_tensor.sum(-1),
                 opsd_coef=opsd_coef,
                 advantage_clip=groove_config.get("opsd_advantage_clip"),
+            )
+        return batch, metrics
+
+    @torch.no_grad()
+    def _postprocess_rlsd_advantages(self, batch, reward_tensor, reward_extra_infos_dict, metrics):
+        config = self.config.get("groove", {})
+        lam = rlsd_lambda(
+            self.global_steps,
+            initial=float(config.get("rlsd_lambda_initial", 0.5)),
+            decay_steps=config.get("rlsd_lambda_decay_steps", 50),
+        )
+        interval = config.get("rlsd_teacher_sync_interval", 10)
+        completed_steps = max(self.global_steps - 1, 0)
+        metrics["rlsd/teacher_snapshot_step"] = float(completed_steps // interval * interval) if lam > 0 else -1.0
+        metrics["timing_s/rlsd/teacher_sync"] = 0.0
+        # Synchronize even if this batch has no positive advantages. Otherwise
+        # the next eligible batch could silently use the wrong Teacher version.
+        if lam > 0:
+            started = time.perf_counter()
+            self.actor_rollout_wg.sync_rlsd_teacher(completed_steps, interval)
+            metrics["timing_s/rlsd/teacher_sync"] = time.perf_counter() - started
+        elif not getattr(self, "_rlsd_teacher_released", False):
+            self.actor_rollout_wg.release_rlsd_teacher()
+            self._rlsd_teacher_released = True
+
+        grpo = batch.batch["advantages"].detach()
+        student = batch.batch["old_log_probs"].detach()
+        valid = batch.batch["response_mask"].bool()
+        positive = ((grpo > 0) & valid).any(-1)
+        groups = defaultdict(list)
+        for index, uid in enumerate(batch.non_tensor_batch.get("uid", np.arange(len(batch)))):
+            groups[str(uid)].append(index)
+        metrics["rlsd/zero_advantage_group_fraction"] = sum(
+            not bool(((grpo[indices] != 0) & valid[indices]).any()) for indices in groups.values()
+        ) / max(len(groups), 1)
+        teacher = student
+        evidence_mask = torch.zeros(len(batch), device=student.device)
+        metrics.update({
+            "rlsd/decay_complete": float(lam == 0),
+            "rlsd/no_positive_batch": float(not positive.any()),
+            "groove/analyzer_skipped": 1.0,
+            "groove/teacher_forward_skipped": 1.0,
+            "timing_s/groove/teacher_log_prob": 0.0,
+        })
+        if lam > 0 and positive.any():
+            reward_info = reward_extra_infos_dict or {}
+            # Analyzer still sees all successful/failed reasoning in the batch;
+            # only the eventual advantage modulation is positive-only.
+            metrics.update(self._build_online_teacher_columns(
+                batch, reward_info.get("accuracy"), reward_info.get("repetition_start_character")
+            ))
+            metrics["groove/analyzer_skipped"] = 0.0
+            teacher_batch, evidence_mask, teacher_metrics = self._build_groove_teacher_batch(batch)
+            metrics.update(teacher_metrics)
+            evidence_mask = evidence_mask.to(student.device)
+            if (evidence_mask.bool() & positive.to(student.device)).any():
+                teacher_batch.meta_info["rlsd_teacher"] = True
+                started = time.perf_counter()
+                output, _ = self._compute_old_log_prob(teacher_batch)
+                teacher = output.batch["old_log_probs"].detach().to(student.device)
+                metrics["timing_s/groove/teacher_log_prob"] = time.perf_counter() - started
+                metrics["groove/teacher_forward_skipped"] = 0.0
+
+        total, weights, credit_metrics = positive_rlsd_advantages(
+            grpo, student, teacher, batch.batch["response_mask"], evidence_mask,
+            lam=lam, clip_range=float(config.get("rlsd_clip_range", 0.2)),
+        )
+        batch.batch["advantages"] = total
+        metrics.update(credit_metrics)
+        # Generic credit diagnostics consume the actual correction, without
+        # applying the additive OPSD coefficient to this multiplicative mode.
+        correction = total - grpo.float()
+        metrics.update(compute_advantage_metrics(
+            grpo_advantages=grpo, opsd_advantages=correction, total_advantages=total,
+            student_log_probs=student, teacher_log_probs=teacher,
+            response_mask=batch.batch["response_mask"], evidence_mask=evidence_mask, opsd_coef=1.0,
+            sequence_rewards=reward_tensor.sum(-1),
+            group_ids=batch.non_tensor_batch.get("uid", np.arange(len(batch))),
+        ))
+        audit_dir = os.environ.get("OPSD_LOG_PROB_DUMP_DIR", "").strip()
+        if audit_dir:
+            metrics["groove/audit_token_count"] = write_trajectory_audit(
+                audit_dir, step=self.global_steps, batch=batch, tokenizer=self.tokenizer,
+                student_log_probs=student, teacher_log_probs=teacher, grpo_advantages=grpo,
+                opsd_advantages=correction, total_advantages=total, evidence_mask=evidence_mask,
+                sequence_rewards=reward_tensor.sum(-1), opsd_coef=1.0,
+                advantage_mode="rlsd_positive", token_weights=weights,
+                rlsd_metadata={"lambda": lam, "clip_range": float(config.get("rlsd_clip_range", 0.2)),
+                               "teacher_snapshot_step": int(metrics["rlsd/teacher_snapshot_step"]),
+                               "teacher_scored": not bool(metrics["groove/teacher_forward_skipped"])},
             )
         return batch, metrics

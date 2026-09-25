@@ -11,6 +11,8 @@ import unittest
 
 from hydra import compose, initialize_config_dir
 from verl.trainer.ppo.utils import need_reference_policy
+from groove.objective import validate_objective_config
+from groove.trainer_routing import trainer_backend
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +27,7 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         self.launcher = self.project / 'scripts/train_a800_2gpu_nokl.sh'
         shutil.copy2(ROOT / 'scripts/train_a800_2gpu_nokl.sh', self.launcher)
         for filename in ('data/vstar_grpo_4000_seed20260917/train.parquet',
+                         'data/vstar_opsd_4000_seed20260917/train.parquet',
                          'data/vstar_bench/validation.parquet'):
             path = self.project / filename
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,8 +94,72 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertNotEqual(self.launch(overrides).returncode, 0)
 
-    def test_rejects_non_grpo_modes(self):
-        for mode in ('dapo', 'grpo_opsd'):
+    def test_rlsd_and_alias_use_two_gpu_batch_32_without_reference_kl(self):
+        for mode in ('grpo_opsd', 'groove'):
+            with self.subTest(mode=mode):
+                captured, config = self.config(self.launch({'TRAINING_MODE': mode}))
+                validate_objective_config(config)
+                self.assertEqual(trainer_backend(config), 'groove_opsd')
+                actor, rollout = config.actor_rollout_ref.actor, config.actor_rollout_ref.rollout
+                self.assertEqual(captured['gpus'], '1,2')
+                self.assertEqual(config.trainer.n_gpus_per_node, 2)
+                self.assertEqual(config.data.train_batch_size, 32)
+                self.assertEqual(actor.ppo_mini_batch_size, 32)
+                self.assertEqual(rollout.n, 8)
+                self.assertEqual(config.data.train_batch_size * rollout.n, 256)
+                self.assertEqual(actor.optim.lr, 1e-6)
+                self.assertEqual(actor.ppo_epochs, 1)
+                self.assertEqual(actor.clip_ratio_low, .2)
+                self.assertEqual(actor.clip_ratio_high, .2)
+                self.assertFalse(actor.use_kl_loss)
+                self.assertEqual(actor.kl_loss_coef, 0)
+                self.assertFalse(config.algorithm.use_kl_in_reward)
+                self.assertEqual(config.algorithm.kl_ctrl.kl_coef, 0)
+                self.assertFalse(need_reference_policy(config))
+                self.assertTrue(config.groove.enabled)
+                self.assertEqual(config.groove.advantage_mode, 'rlsd_positive')
+                self.assertEqual(config.groove.rlsd_lambda_initial, .5)
+                self.assertEqual(config.groove.rlsd_lambda_decay_steps, 40)
+                self.assertEqual(config.groove.rlsd_clip_range, .2)
+                self.assertEqual(config.groove.rlsd_teacher_sync_interval, 10)
+                self.assertFalse(config.trainer.use_v1)
+                self.assertFalse(config.algorithm.filter_groups.enable)
+                self.assertEqual(captured['wandb'], 'offline')
+                self.assertEqual(config.data.train_files,
+                                 [str(self.project / 'data/vstar_opsd_4000_seed20260917/train.parquet')])
+                self.assertEqual(config.data.val_files,
+                                 [str(self.project / 'data/vstar_bench/validation.parquet')])
+                self.assertEqual(actor.ppo_max_token_len_per_gpu, 32768)
+                self.assertTrue(rollout.log_prob_use_dynamic_bsz)
+                self.assertEqual(rollout.log_prob_max_token_len_per_gpu, 32768)
+                self.assertEqual(rollout.max_num_batched_tokens, 32768)
+                self.assertEqual(rollout.agent.num_workers, 16)
+                self.assertEqual(config.reward.num_workers, 4)
+                self.assertEqual(config.data.max_response_length, 1024)
+                self.assertIsNone(config.data.val_batch_size)
+                self.assertEqual(config.trainer.test_freq, 5)
+                self.assertEqual(config.trainer.save_freq, 5)
+                self.assertTrue(config.trainer.best_checkpoint.enabled)
+
+    def test_rlsd_overrides_and_additive_comparison_keep_no_kl_profile(self):
+        for advantage_mode in ('rlsd_positive', 'opsd'):
+            with self.subTest(advantage_mode=advantage_mode):
+                _, config = self.config(self.launch({
+                    'TRAINING_MODE': 'grpo_opsd', 'OPSD_ADVANTAGE_MODE': advantage_mode,
+                    'RLSD_LAMBDA_INITIAL': '0.3', 'RLSD_LAMBDA_DECAY_STEPS': '60',
+                    'RLSD_CLIP_RANGE': '0.1', 'RLSD_TEACHER_SYNC_INTERVAL': '20',
+                }, ('groove.rlsd_teacher_sync_interval=5',)))
+                validate_objective_config(config)
+                self.assertEqual(config.groove.advantage_mode, advantage_mode)
+                self.assertEqual(config.groove.rlsd_lambda_initial, .3)
+                self.assertEqual(config.groove.rlsd_lambda_decay_steps, 60)
+                self.assertEqual(config.groove.rlsd_clip_range, .1)
+                self.assertEqual(config.groove.rlsd_teacher_sync_interval, 5)
+                self.assertEqual(config.data.train_batch_size, 32)
+                self.assertFalse(need_reference_policy(config))
+
+    def test_rejects_unsupported_modes(self):
+        for mode in ('dapo', 'unknown'):
             with self.subTest(mode=mode):
                 self.assertNotEqual(self.launch({'TRAINING_MODE': mode}).returncode, 0)
 

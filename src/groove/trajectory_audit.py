@@ -24,6 +24,9 @@ def write_trajectory_audit(
     sequence_rewards,
     opsd_coef,
     advantage_clip=None,
+    advantage_mode="opsd",
+    token_weights=None,
+    rlsd_metadata=None,
 ):
     """Save every valid response token, including weak credit and EOS.
 
@@ -48,6 +51,7 @@ def write_trajectory_audit(
     rewards = sequence_rewards.detach().cpu()
     payload = {
         "schema_version": 1,
+        "advantage_mode": advantage_mode,
         "step": int(step),
         "scoring_phase": "pre_update_actor",
         "opsd_advantage_coef": float(opsd_coef),
@@ -67,6 +71,11 @@ def write_trajectory_audit(
         "evidence_mask": evidence[sample_ids],
         "outcomes": rewards[sample_ids],
     }
+    if rlsd_metadata is not None:
+        payload["scoring_phase"] = "pre_update_frozen_teacher"
+        payload["rlsd"] = dict(rlsd_metadata)
+        payload["rlsd_weights"] = flatten(token_weights)
+        payload["rlsd_correction"] = flatten(total_advantages - grpo_advantages)
     for source_key, target_key in (
         ("rollout_log_probs", "rollout_log_probs"),
         ("ref_log_prob", "ref_log_probs"),

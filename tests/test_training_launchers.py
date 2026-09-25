@@ -80,6 +80,8 @@ class TrainingLauncherTest(unittest.TestCase):
                         "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
                         "VALIDATION_DATA_DIR",
                         "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
+                        "OPSD_ADVANTAGE_MODE", "RLSD_LAMBDA_INITIAL", "RLSD_LAMBDA_DECAY_STEPS",
+                        "RLSD_CLIP_RANGE", "RLSD_TEACHER_SYNC_INTERVAL",
                     ):
                         env.pop(key, None)
                     if repetition_override is not None:
@@ -102,6 +104,11 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("data.response_format=reasoning_answer", args)
                     self.assertIn("data.apply_chat_template_kwargs.enable_thinking=false", args)
                     self.assertIn("groove.enabled=" + enabled, args)
+                    self.assertIn("groove.advantage_mode=rlsd_positive", args)
+                    self.assertIn("groove.rlsd_lambda_initial=0.5", args)
+                    self.assertIn("groove.rlsd_lambda_decay_steps=50", args)
+                    self.assertIn("groove.rlsd_clip_range=0.2", args)
+                    self.assertIn("groove.rlsd_teacher_sync_interval=10", args)
                     self.assertIn("trainer.use_v1=" + ("false" if enabled == "true" else "true"), args)
                     self.assertIn("algorithm.filter_groups.enable=" + ("true" if name == "dapo" else "false"), args)
                     self.assertIn("trainer.best_checkpoint.enabled=true", args)

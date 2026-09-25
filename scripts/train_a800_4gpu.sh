@@ -121,7 +121,12 @@ export GROOVE_REPETITION_MAX_PERIOD="${GROOVE_REPETITION_MAX_PERIOD:-1024}"
 export GROOVE_REPETITION_SAMPLE_LENGTH="${GROOVE_REPETITION_SAMPLE_LENGTH:-16}"
 export GROOVE_REPETITION_SAMPLE_INTERVAL="${GROOVE_REPETITION_SAMPLE_INTERVAL:-32}"
 
-# ---- GRPO + OPSD only: current-policy Teacher and training-only visual evidence. ----
+# ---- GRPO + OPSD only: training-only visual evidence and credit allocation. ----
+OPSD_ADVANTAGE_MODE="${OPSD_ADVANTAGE_MODE:-rlsd_positive}"
+RLSD_LAMBDA_INITIAL="${RLSD_LAMBDA_INITIAL:-0.5}"
+RLSD_LAMBDA_DECAY_STEPS="${RLSD_LAMBDA_DECAY_STEPS:-50}"
+RLSD_CLIP_RANGE="${RLSD_CLIP_RANGE:-0.2}"
+RLSD_TEACHER_SYNC_INTERVAL="${RLSD_TEACHER_SYNC_INTERVAL:-10}"
 export ANALYZER_BASE_URL="${ANALYZER_BASE_URL:-http://127.0.0.1:8002/v1}"
 export ANALYZER_API_KEY="${ANALYZER_API_KEY:-unused}"
 export ANALYZER_MODEL=Qwen3.8-27B
@@ -324,9 +329,14 @@ REWARD=(
   reward.custom_reward_function.reward_kwargs.format_reward_weight="$FORMAT_REWARD_WEIGHT"
 )
 
-# Optional current-policy Teacher credit allocation.
+# Optional visual Teacher credit allocation (legacy additive OPSD remains selectable).
 OPSD=(
   "groove.enabled=$OPSD_ENABLED"
+  "groove.advantage_mode=$OPSD_ADVANTAGE_MODE"
+  "groove.rlsd_lambda_initial=$RLSD_LAMBDA_INITIAL"
+  "groove.rlsd_lambda_decay_steps=$RLSD_LAMBDA_DECAY_STEPS"
+  "groove.rlsd_clip_range=$RLSD_CLIP_RANGE"
+  "groove.rlsd_teacher_sync_interval=$RLSD_TEACHER_SYNC_INTERVAL"
   groove.opsd_advantage_coef=0.01
   groove.opsd_advantage_clip=null
   "groove.max_reprompt_len=$MAX_MODEL_LEN"

@@ -56,6 +56,8 @@ class FourGpuLauncherTest(unittest.TestCase):
             "SAVE_BEST_CHECKPOINT", "BEST_CHECKPOINT_METRIC",
             "VALIDATION_DATA_DIR",
             "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
+            "OPSD_ADVANTAGE_MODE", "RLSD_LAMBDA_INITIAL", "RLSD_LAMBDA_DECAY_STEPS",
+            "RLSD_CLIP_RANGE", "RLSD_TEACHER_SYNC_INTERVAL",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -157,9 +159,30 @@ class FourGpuLauncherTest(unittest.TestCase):
                 for key in ("NO_PROXY", "no_proxy"):
                     self.assertTrue({"127.0.0.1", "localhost", "::1"}.issubset(set(worker_env[key].split(","))))
                 if enabled:
+                    self.assertEqual(config.groove.advantage_mode, "rlsd_positive")
+                    self.assertEqual(config.groove.rlsd_lambda_initial, 0.5)
+                    self.assertEqual(config.groove.rlsd_lambda_decay_steps, 50)
+                    self.assertEqual(config.groove.rlsd_clip_range, 0.2)
+                    self.assertEqual(config.groove.rlsd_teacher_sync_interval, 10)
                     self.assertEqual(config.groove.opsd_advantage_coef, 0.01)
                     self.assertIsNone(config.groove.opsd_advantage_clip)
         self.assertFalse((self.project / "outputs").exists())
+
+    def test_rlsd_settings_and_legacy_mode_can_be_overridden(self):
+        result = self.run_launcher(overrides={
+            "TRAINING_MODE": "grpo_opsd", "RLSD_LAMBDA_INITIAL": "0.3",
+            "RLSD_LAMBDA_DECAY_STEPS": "60", "RLSD_CLIP_RANGE": "0.1",
+            "RLSD_TEACHER_SYNC_INTERVAL": "20",
+        }, args=("groove.rlsd_teacher_sync_interval=5",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.resolved_config(json.loads(result.stdout))
+        self.assertEqual(config.groove.rlsd_lambda_initial, .3)
+        self.assertEqual(config.groove.rlsd_lambda_decay_steps, 60)
+        self.assertEqual(config.groove.rlsd_clip_range, .1)
+        self.assertEqual(config.groove.rlsd_teacher_sync_interval, 5)
+        result = self.run_launcher(overrides={"TRAINING_MODE": "grpo_opsd", "OPSD_ADVANTAGE_MODE": "opsd"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.resolved_config(json.loads(result.stdout)).groove.advantage_mode, "opsd")
 
     def test_grpo_can_explicitly_keep_wandb_offline(self):
         result = self.run_launcher(overrides={"TRAINING_MODE": "grpo", "WANDB_MODE": "offline"})

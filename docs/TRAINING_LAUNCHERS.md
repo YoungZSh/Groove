@@ -7,13 +7,14 @@
 最后直接调用 `python -m groove.verl_entrypoint`。没有中间 shell 启动器，也不读取共享机器 shell 配置。
 需要某台机器、某种方法的固定实验入口时，复制其中一份并修改顶部参数即可。
 
-### 本机两卡无 KL 的 GRPO
+### 本机两卡、batch 32、无 KL
 
 `scripts/train_a800_2gpu_nokl.sh` 是完整独立的本机实验脚本，默认只选择 GPU `1,2`。
 它使用全局 prompt batch 和 PPO mini-batch 均为 `32`，每题 `8` 条 rollout，
 学习率 `1e-6`、回答上限 `1024`、一个 PPO epoch；4,000 条训练数据的一轮为 125 步。
 每 5 步验证和保存一次，对应处理 160 道训练题，保持与原 batch 16、每 10 步验证相同的题数间隔。
-只支持纯 GRPO：损失 KL 和奖励 KL 都关闭，两个系数均为 0，因此不加载参考策略。
+默认运行纯 GRPO，也支持 `TRAINING_MODE=grpo_opsd`（别名 `groove`）运行仅正优势 RLSD。
+两种模式的损失 KL 和奖励 KL 都关闭，两个系数均为 0，因此不加载参考策略。
 现有四卡及 Siton 脚本的默认 KL 设置保持原样。
 
 两卡的 actor/log-prob 和 vLLM 单卡 token 预算均为 `32768`，通过动态 micro-batch
@@ -23,7 +24,20 @@
 ```bash
 EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
   bash scripts/train_a800_2gpu_nokl.sh
+
+TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=qwen35-2b-rlsd-positive-nokl-2gpu-unique-run \
+  bash scripts/train_a800_2gpu_nokl.sh
 ```
+
+纯 GRPO 使用原生 V1 Trainer，默认在线 W&B；GRPO + OPSD 使用项目 Trainer，W&B 离线。
+训练集分别默认选择 `vstar_grpo_4000_seed20260917` / `vstar_opsd_4000_seed20260917`，
+均支持 `DATA_DIR` 覆盖，验证文件仍独立使用全部 191 题。
+本机两卡试验采用 **40 步线性衰减**，Teacher 每 10 步同步：
+`lambda_s = 0.5 * max(1 - global_step / 40, 0)`。
+第 40 步起权重归一，跳过 Analyzer/Teacher 评分，使用普通 GRPO 更新。
+在这一轮 125 步训练中，40 步占 32%。可用 `RLSD_LAMBDA_DECAY_STEPS` 独立调整；
+四卡和 Siton 默认仍为 50 步，衰减设置不按 batch 或总训练步数自动缩放。
+设置 `OPSD_ADVANTAGE_MODE=opsd` 可以运行相同两卡、batch 32、无 KL 的原加法对照。
 
 当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
 GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练前只停止 GPU 1–2
@@ -57,7 +71,8 @@ GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练�
 
 ## Trainer 分流
 
-共同入口只负责提示词适配、配置验证、Ray 内存设置和选择 TaskRunner：
+共同入口只负责提示词适配、配置验证、Ray 内存设置和选择 TaskRunner。
+下表为四卡与 Siton 的默认配置；本机两卡脚本的 GRPO 和 GRPO + OPSD 均不使用 KL。
 
 | 模式 | 训练器 | 组过滤 | 裁剪下限 / 上限 | Reference KL |
 | --- | --- | --- | --- | --- |
@@ -66,9 +81,57 @@ GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练�
 | `grpo_opsd`（别名 `groove`） | `GrooveTaskRunner` / `GrooveRayPPOTrainer` | 关闭 | 0.2 / 0.2 | 0.01 |
 
 所有模式均使用 GRPO 优势估计和 vanilla PPO policy loss，聚合方式是 `token-mean`。
-GRPO + OPSD 保持未中心化 token credit、系数 0.01、不裁剪；同奖励题组仍进入 Analyzer。
+本分支 GRPO + OPSD 默认使用下文的仅正优势 RLSD 重加权。
+`OPSD_ADVANTAGE_MODE=opsd` 恢复未中心化 token credit、系数 0.01、不裁剪的原模式；
+该原模式中同奖励题组仍进入 Analyzer。
 `trainer_routing.py` 拒绝“旧训练器开启组过滤”及“OPSD 同时开启 V1/组过滤”的无效组合，
 避免配置通过但算法未执行。
+
+### 本分支：仅正优势 RLSD
+
+`TRAINING_MODE=grpo_opsd` 默认选择 `OPSD_ADVANTAGE_MODE=rlsd_positive`。
+它复用现有视觉证据和 PPO 路径，只对 `A_GRPO > 0` 的有效回答 token
+使用 Teacher/Student 概率比；负优势和零优势保持普通 GRPO。
+证据缺失时权重为 1，不额外使用准确率或连续置信度门控。
+不叠加原来的 `0.01 * OPSD` 信号，也不增加独立蒸馏损失。
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `OPSD_ADVANTAGE_MODE` | `rlsd_positive` | 可设为 `opsd` 回到原加法模式 |
+| `RLSD_LAMBDA_INITIAL` | `0.5` | 混合系数的 step 0 值 |
+| `RLSD_LAMBDA_DECAY_STEPS` | 本机两卡 `40`；四卡/Siton `50` | 按日志 global step 线性衰减至零的步数 |
+| `RLSD_CLIP_RANGE` | `0.2` | 原始概率比限制在 `[0.8, 1.2]` |
+| `RLSD_TEACHER_SYNC_INTERVAL` | `10` | 每完成多少次外循环更新复制一次 Student 参数 |
+
+本机两卡第 1 步 lambda 为 0.4875，第 40 步起为零；
+四卡/Siton 第 1 步 lambda 为 0.49，第 50 步起为零。归零后跳过 Analyzer/Teacher 评分。
+Teacher 在第 1–10 步使用初始 Student；第 11 步开始使用完成 10 次更新的 Student，
+依此类推。Teacher 不使用 EMA，也不进行独立优化。负优势仍参与 PPO 学习。
+四卡与 Siton 保留模型 2B、1024 回答长度、batch 16、clip 0.2/0.2 和 reference KL 0.01；
+未自动照搬上游 8B、4096 长度或关闭 KL 的设置。4000 题一轮为 250 步，50 步占 20%。
+
+四卡正式运行示例（应在 GPU 可用时使用新的实验名）：
+
+```bash
+TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=qwen35-2b-rlsd-positive-unique-run \
+  bash scripts/train_a800_4gpu.sh
+```
+
+在同一命令前添加 `GROOVE_DRY_RUN=true` 只检查配置，不分配 Ray/GPU worker。
+Siton 使用 `scripts/train_siton_2gpu.sh` 和相同的模式及变量。
+原方案对照设置 `OPSD_ADVANTAGE_MODE=opsd`；命令行 Hydra 参数仍具有最终优先级。
+纯 GRPO/DAPO 不启用 RLSD。本机两卡 `train_a800_2gpu_nokl.sh` 支持同样的
+`grpo_opsd` 模式与 RLSD 变量，使用上文的 batch 32、无 KL 设置。
+
+冻结 Teacher 以各 rank 的 CPU 分片驻留，评分前临时加载、评分后恢复 Student。
+这增加 CPU 内存和状态复制开销，不额外常驻一份 GPU Teacher。
+Teacher 快照随 actor 检查点保存，最佳检查点包含相同文件；当前只支持 FSDP/FSDP2、
+同步检查点和本地/共享文件系统。不能在冻结周期中间从缺少 Teacher 分片的旧检查点
+静默恢复。衰减结束后不再需要教师快照。
+
+诊断新增 `rlsd/lambda`、`rlsd/teacher_snapshot_step`、正优势/激活 token 比例、
+权重均值与范围、上下界裁剪比例和实际修正与 GRPO 的 RMS 比值。
+token 审计保留有效权重及实际优势修正，并标记 `advantage_mode=rlsd_positive`。
 
 原生 V1 需要 **TransferQueue 0.1.10**。本机 groove 环境已安装；其他机器需要在其训练环境安装：
 
@@ -82,6 +145,9 @@ V1 的实现复用仓库内 `src/verl/trainer/ppo/v1/`；没有另写 DAPO 训�
 rollout 的 `score` 保存实际优化的最终奖励，奖励函数原始返回值另存为 `reward_function_score`。
 
 ## 共同实验参数
+
+以下是四卡与 Siton 两份入口的默认值；本机两卡无 KL 入口的 batch、验证/保存间隔
+和 KL 覆盖值见本文开头。
 
 - 模型 Qwen3.5-2B；训练 seed 20260904；全局 prompt batch / PPO mini-batch 均为 16。
 - 每题 8 个回答；TP=1；学习率 1e-6；PPO epoch 1；默认训练 epoch 1。
