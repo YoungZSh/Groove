@@ -102,6 +102,8 @@ def training_status(config: dict) -> dict:
     complete = final_step in steps and "Final validation metrics:" in text and checkpoint_ready
     alive = process_identity(config["training_pid"]) == config["training_start_ticks"]
     authorized_incomplete_exit = bool(config.get("allow_incomplete_training_exit", False) and steps)
+    # Explicit recovery also covers initialization failures before step one.
+    authorized_any_exit = config.get("restore_on_any_training_exit", False) is True
     return {
         "last_step": max(steps, default=None),
         "final_step": final_step,
@@ -109,7 +111,8 @@ def training_status(config: dict) -> dict:
         "completion_logged": complete,
         "training_process_alive": alive,
         "authorized_incomplete_exit": authorized_incomplete_exit,
-        "ready_to_launch": (complete or authorized_incomplete_exit) and not alive,
+        "authorized_any_exit": authorized_any_exit,
+        "ready_to_launch": (complete or authorized_incomplete_exit or authorized_any_exit) and not alive,
     }
 
 

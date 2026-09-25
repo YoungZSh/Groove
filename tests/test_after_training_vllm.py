@@ -70,6 +70,24 @@ class AfterTrainingVllmTest(unittest.TestCase):
         with patch.object(controller, "process_identity", return_value="original"):
             self.assertFalse(controller.training_status(self.config)["ready_to_launch"])
 
+    def test_authorized_any_exit_restores_even_before_first_step(self):
+        self.config["restore_on_any_training_exit"] = True
+        for text in (None, "Traceback: failed during model initialization\n"):
+            with self.subTest(log=text):
+                if text is not None:
+                    Path(self.config["training_log"]).write_text(text)
+                with patch.object(controller, "process_identity", return_value=None):
+                    state = controller.training_status(self.config)
+                    self.assertTrue(state["ready_to_launch"])
+                    self.assertFalse(state["completion_logged"])
+                with patch.object(controller, "process_identity", return_value="original"):
+                    self.assertFalse(controller.training_status(self.config)["ready_to_launch"])
+
+    def test_any_exit_override_requires_boolean_true(self):
+        self.config["restore_on_any_training_exit"] = "false"
+        with patch.object(controller, "process_identity", return_value=None):
+            self.assertFalse(controller.training_status(self.config)["ready_to_launch"])
+
     def test_reused_pid_is_not_the_original_training_process(self):
         self.completion_files()
         with patch.object(controller, "process_identity", return_value="different"):

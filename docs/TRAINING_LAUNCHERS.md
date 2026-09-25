@@ -44,6 +44,12 @@ GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练�
 服务；训练结束后只恢复这两张卡，其恢复配置使用 `training_world_size=2`。
 不要正常终止仍管理 GPU 3 的共享监督器：它的清理逻辑会停止所有受管服务。
 
+用户明确要求训练正常或异常退出后恢复推理时，恢复配置可设置
+`restore_on_any_training_exit: true`，覆盖第 1 步之前的初始化失败。
+该选项默认关闭，且始终等待所监控进程退出、所选 GPU 和端口释放。
+运行守护程序负责清理本次训练的进程，恢复配置只包含 GPU 1–2、端口 8101/8102，
+`training_world_size=2`；GPU 3 的独立监督器保持运行。
+
 ### 参数数组格式
 
 采用 [VERL 示例](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3_4b_fsdp.sh)
