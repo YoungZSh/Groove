@@ -4,6 +4,7 @@ import http.client
 import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, call, patch
 
 from groove.semantic_reward import (
@@ -18,6 +19,54 @@ from groove.semantic_reward import (
 
 
 class SemanticRewardLoopTest(unittest.TestCase):
+    def test_failed_judge_attempts_preserve_response_without_credentials(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        truncated = {"id": "truncated-request", "choices": [{"finish_reason": "length", "message": {
+            "content": "unfinished explanation", "reasoning_content": "unfinished reasoning"}}],
+            "usage": {"completion_tokens": 512}}
+        complete = {"choices": [{"finish_reason": "stop", "message": {"content": "Judgement: 1"}}]}
+        with (
+            TemporaryDirectory() as folder,
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "secret-test-key", "GROOVE_JUDGE_MAX_RETRIES": "1",
+                                      "GROOVE_JUDGE_AUDIT_DIR": folder}),
+            patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("groove.semantic_reward.json.load", side_effect=[truncated, complete]),
+            patch("groove.semantic_reward.time.sleep"),
+        ):
+            result = _judge_one("What color?", "green", "<answer>green</answer>")
+            files = sorted(Path(folder).glob("*.json"))
+            records = [json.loads(path.read_text()) for path in files]
+            self.assertEqual([r["status"] for r in records], ["retrying", "recovered"])
+            self.assertEqual(records[0]["response"], truncated)
+            self.assertEqual(records[0]["student_output"], "<answer>green</answer>")
+            self.assertEqual(records[0]["extracted_answer"], "green")
+            self.assertEqual(records[0]["request_id"], records[1]["request_id"])
+            self.assertTrue(all("secret-test-key" not in path.read_text() for path in files))
+            self.assertFalse(list(Path(folder).glob("*.tmp")))
+            for request in urlopen.call_args_list:
+                self.assertEqual(json.loads(request.args[0].data)["max_completion_tokens"], 512)
+            self.assertEqual(result["accuracy"], 1.)
+
+    def test_timeout_audit_does_not_reuse_previous_response(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        truncated = {"choices": [{"finish_reason": "length", "message": {"content": "partial"}}]}
+        with (
+            TemporaryDirectory() as folder,
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "secret-test-key", "GROOVE_JUDGE_MAX_RETRIES": "1",
+                                      "GROOVE_JUDGE_AUDIT_DIR": folder}),
+            patch("groove.semantic_reward.urllib.request.urlopen", side_effect=[response, TimeoutError("timed out")]),
+            patch("groove.semantic_reward.json.load", return_value=truncated),
+            patch("groove.semantic_reward.time.sleep"),
+        ):
+            with self.assertRaises(RuntimeError):
+                _judge_one("What color?", "green", "blue")
+            records = [json.loads(path.read_text()) for path in sorted(Path(folder).glob("*.json"))]
+            self.assertEqual(records[1]["status"], "failed")
+            self.assertEqual(records[1]["error_type"], "TimeoutError")
+            self.assertIsNone(records[1]["response"])
+
     def test_scalar_reward_adapter_forwards_question_and_answers(self):
         expected = {"score": 1.0, "accuracy": 1.0}
         with patch("groove.semantic_reward._judge_one", return_value=expected) as judge:

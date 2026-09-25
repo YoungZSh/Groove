@@ -106,6 +106,13 @@ numbers in the explanation are never interpreted as scores. The unique terminal
 legacy `0` or `1` is also accepted. Ambiguous, missing, or token-truncated verdicts retry
 and eventually raise an error rather than becoming an incorrect-answer label.
 
+An optional `GROOVE_JUDGE_AUDIT_DIR` records failed attempts and eventual recovery,
+with the request body, Student answer, full response (including reasoning fields
+and token usage), attempt number, and error type. Request headers are excluded
+and the API credential is redacted. Each call has a unique ID and atomic files
+for its retries; transport failures record a null response. This local diagnostic
+does not change the 512-token budget, retry schedule, prompt, or semantic score.
+
 The compact prompt uses four ordered criteria and five short examples. It judges the
 requested property: uncertainty about an unasked property (such as "coat or
 shirt" when the color remains blue) is not itself an error. Ordinary shade

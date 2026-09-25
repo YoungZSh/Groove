@@ -10,14 +10,18 @@ the deterministic option scorer is retained only as a diagnostic.
 from __future__ import annotations
 
 import concurrent.futures
+from datetime import datetime, timezone
 import http.client
 import json
 import math
 import os
+from pathlib import Path
 import re
 import time
 import urllib.error
 import urllib.request
+import uuid
+import warnings
 from typing import Any
 
 from groove.vstar_bench import (
@@ -288,6 +292,43 @@ def _configured_repetition_hit(output: str) -> RepetitionHit | None:
     )
 
 
+def _record_judge_attempt(directory, request_id, *, attempt, max_attempts, body,
+                          question, ground_truth, output, answer, payload, error):
+    """Persist failed/recovered requests locally without headers or credentials."""
+    if not directory:
+        return
+    record = {
+        "request_id": request_id, "attempt": attempt, "max_attempts": max_attempts,
+        "at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "recovered" if error is None else "failed" if attempt == max_attempts else "retrying",
+        "error_type": None if error is None else type(error).__name__,
+        "error": None if error is None else str(error),
+        "question": question, "ground_truth": ground_truth,
+        "student_output": output, "extracted_answer": answer,
+        "request_body": body, "response": payload,
+    }
+    credential = os.environ.get("GROOVE_JUDGE_API_KEY", "")
+
+    def redact(value):
+        if isinstance(value, str) and credential:
+            return value.replace(credential, "<redacted>")
+        if isinstance(value, dict):
+            return {key: redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    try:
+        folder = Path(directory)
+        folder.mkdir(parents=True, exist_ok=True)
+        destination = folder / f"{os.getpid()}-{request_id}-attempt{attempt:02d}.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(redact(record), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(destination)
+    except (OSError, TypeError, ValueError) as exc:
+        warnings.warn(f"Could not persist Judge diagnostic: {type(exc).__name__}", RuntimeWarning)
+
+
 def _judge_one(
     question: str,
     ground_truth: str,
@@ -338,7 +379,10 @@ def _judge_one(
         method="POST",
     )
     last_error: Exception | None = None
+    audit_dir = os.environ.get("GROOVE_JUDGE_AUDIT_DIR", "").strip()
+    request_id = uuid.uuid4().hex if audit_dir else None
     for attempt in range(max_retries + 1):
+        payload = None
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.load(response)
@@ -347,6 +391,12 @@ def _judge_one(
                 raise ValueError("judge response was truncated before completion")
             content = str(choice["message"].get("content") or "").strip()
             correct = float(parse_judgement(content))
+            if attempt > 0:
+                _record_judge_attempt(
+                    audit_dir, request_id, attempt=attempt + 1, max_attempts=max_retries + 1,
+                    body=body, question=question, ground_truth=ground_truth, output=output,
+                    answer=answer, payload=payload, error=None,
+                )
             answer_reward = 0.0 if severe_repetition and apply_training_shaping else correct
             format_reward = 0.0 if format_valid else -1.0
             weighted_answer_reward = answer_weight * answer_reward
@@ -385,6 +435,11 @@ def _judge_one(
             http.client.HTTPException, urllib.error.URLError,
         ) as exc:
             last_error = exc
+            _record_judge_attempt(
+                audit_dir, request_id, attempt=attempt + 1, max_attempts=max_retries + 1,
+                body=body, question=question, ground_truth=ground_truth, output=output,
+                answer=answer, payload=payload, error=exc,
+            )
             if attempt < max_retries:
                 time.sleep(0.5 * (2**attempt))
     raise RuntimeError(f"remote semantic judge failed after retries: {last_error}") from last_error
