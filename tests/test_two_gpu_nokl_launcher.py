@@ -127,6 +127,9 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
                 self.assertFalse(need_reference_policy(config))
                 self.assertTrue(config.groove.enabled)
                 self.assertEqual(config.groove.advantage_mode, 'rlsd_positive')
+                self.assertEqual(config.groove.teacher_evidence_mode, 'focus')
+                self.assertEqual(config.groove.focus_blur_alpha, 0.5)
+                self.assertEqual(config.groove.focus_blur_radius, 12.0)
                 self.assertEqual(config.groove.rlsd_lambda_initial, .5)
                 self.assertEqual(config.groove.rlsd_lambda_decay_steps, 40)
                 self.assertEqual(config.groove.rlsd_clip_range, .2)
@@ -166,6 +169,20 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
                 self.assertEqual(config.groove.rlsd_teacher_sync_interval, 5)
                 self.assertEqual(config.data.train_batch_size, 32)
                 self.assertFalse(need_reference_policy(config))
+
+    def test_teacher_evidence_switch_and_cli_priority(self):
+        for mode in ('crop', 'focus'):
+            with self.subTest(mode=mode):
+                _, config = self.config(self.launch({'TEACHER_EVIDENCE_MODE': mode,
+                    'FOCUS_BLUR_ALPHA': '0.7', 'FOCUS_BLUR_RADIUS': '9'}))
+                validate_objective_config(config)
+                self.assertEqual(config.groove.teacher_evidence_mode, mode)
+                self.assertEqual(config.groove.focus_blur_alpha, 0.7)
+                self.assertEqual(config.groove.focus_blur_radius, 9)
+        _, config = self.config(self.launch({'TEACHER_EVIDENCE_MODE': 'focus'},
+            ('groove.teacher_evidence_mode=crop', 'groove.focus_blur_alpha=0.25')))
+        self.assertEqual(config.groove.teacher_evidence_mode, 'crop')
+        self.assertEqual(config.groove.focus_blur_alpha, 0.25)
 
     def test_rejects_unsupported_modes(self):
         for mode in ('dapo', 'unknown'):

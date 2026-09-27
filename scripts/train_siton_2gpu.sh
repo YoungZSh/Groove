@@ -119,6 +119,9 @@ export GROOVE_REPETITION_SAMPLE_INTERVAL="${GROOVE_REPETITION_SAMPLE_INTERVAL:-3
 
 # ---- GRPO + OPSD only: training-only visual evidence and credit allocation. ----
 OPSD_ADVANTAGE_MODE="${OPSD_ADVANTAGE_MODE:-rlsd_positive}"
+TEACHER_EVIDENCE_MODE="${TEACHER_EVIDENCE_MODE:-focus}"
+FOCUS_BLUR_ALPHA="${FOCUS_BLUR_ALPHA:-0.5}"
+FOCUS_BLUR_RADIUS="${FOCUS_BLUR_RADIUS:-12.0}"
 RLSD_LAMBDA_INITIAL="${RLSD_LAMBDA_INITIAL:-0.5}"
 RLSD_LAMBDA_DECAY_STEPS="${RLSD_LAMBDA_DECAY_STEPS:-50}"
 RLSD_CLIP_RANGE="${RLSD_CLIP_RANGE:-0.2}"
@@ -329,6 +332,9 @@ REWARD=(
 OPSD=(
   "groove.enabled=$OPSD_ENABLED"
   "groove.advantage_mode=$OPSD_ADVANTAGE_MODE"
+  "groove.teacher_evidence_mode=$TEACHER_EVIDENCE_MODE"
+  "groove.focus_blur_alpha=$FOCUS_BLUR_ALPHA"
+  "groove.focus_blur_radius=$FOCUS_BLUR_RADIUS"
   "groove.rlsd_lambda_initial=$RLSD_LAMBDA_INITIAL"
   "groove.rlsd_lambda_decay_steps=$RLSD_LAMBDA_DECAY_STEPS"
   "groove.rlsd_clip_range=$RLSD_CLIP_RANGE"

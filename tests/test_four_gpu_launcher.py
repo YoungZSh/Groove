@@ -58,6 +58,7 @@ class FourGpuLauncherTest(unittest.TestCase):
             "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
             "OPSD_ADVANTAGE_MODE", "RLSD_LAMBDA_INITIAL", "RLSD_LAMBDA_DECAY_STEPS",
             "RLSD_CLIP_RANGE", "RLSD_TEACHER_SYNC_INTERVAL",
+            "TEACHER_EVIDENCE_MODE", "FOCUS_BLUR_ALPHA", "FOCUS_BLUR_RADIUS",
         ):
             self.env.pop(key, None)
         self.env.update(
@@ -160,6 +161,9 @@ class FourGpuLauncherTest(unittest.TestCase):
                     self.assertTrue({"127.0.0.1", "localhost", "::1"}.issubset(set(worker_env[key].split(","))))
                 if enabled:
                     self.assertEqual(config.groove.advantage_mode, "rlsd_positive")
+                    self.assertEqual(config.groove.teacher_evidence_mode, "focus")
+                    self.assertEqual(config.groove.focus_blur_alpha, 0.5)
+                    self.assertEqual(config.groove.focus_blur_radius, 12.0)
                     self.assertEqual(config.groove.rlsd_lambda_initial, 0.5)
                     self.assertEqual(config.groove.rlsd_lambda_decay_steps, 50)
                     self.assertEqual(config.groove.rlsd_clip_range, 0.2)
@@ -167,6 +171,22 @@ class FourGpuLauncherTest(unittest.TestCase):
                     self.assertEqual(config.groove.opsd_advantage_coef, 0.01)
                     self.assertIsNone(config.groove.opsd_advantage_clip)
         self.assertFalse((self.project / "outputs").exists())
+
+    def test_teacher_evidence_switch_and_cli_priority(self):
+        for mode in ("crop", "focus"):
+            with self.subTest(mode=mode):
+                result = self.run_launcher(overrides={"TRAINING_MODE": "grpo_opsd",
+                    "TEACHER_EVIDENCE_MODE": mode, "FOCUS_BLUR_ALPHA": "0.7", "FOCUS_BLUR_RADIUS": "9"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.resolved_config(json.loads(result.stdout))
+                self.assertEqual(config.groove.teacher_evidence_mode, mode)
+                self.assertEqual(config.groove.focus_blur_alpha, 0.7)
+                self.assertEqual(config.groove.focus_blur_radius, 9)
+        result = self.run_launcher(overrides={"TEACHER_EVIDENCE_MODE": "focus"},
+                                  args=("groove.teacher_evidence_mode=crop", "groove.focus_blur_alpha=0.25"))
+        config = self.resolved_config(json.loads(result.stdout))
+        self.assertEqual(config.groove.teacher_evidence_mode, "crop")
+        self.assertEqual(config.groove.focus_blur_alpha, 0.25)
 
     def test_rlsd_settings_and_legacy_mode_can_be_overridden(self):
         result = self.run_launcher(overrides={

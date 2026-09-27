@@ -15,6 +15,18 @@ from groove.verl_trainer import GrooveRayPPOTrainer
 
 
 class GrooveTrainerTest(unittest.TestCase):
+    def test_builder_reads_resolved_teacher_image_config(self):
+        trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
+        trainer.config = {"groove": {"teacher_evidence_mode": "focus", "focus_blur_alpha": 0.7,
+                                     "focus_blur_radius": 8.0}}
+        with patch("groove.verl_trainer.OpenAIAnalyzerConfig.from_env"), \
+                patch("groove.verl_trainer.OpenAICompatibleAnalyzer"), \
+                patch("groove.verl_trainer.GroundingDinoGrounder"):
+            builder = trainer._new_groove_builder()
+        self.assertEqual(builder.config.image_config.mode, "focus")
+        self.assertEqual(builder.config.image_config.blur_alpha, 0.7)
+        self.assertEqual(builder.config.image_config.blur_radius, 8.0)
+
     def test_vanilla_grpo_skips_online_teacher_construction(self):
         trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
         trainer.config = {"groove": {"enabled": False}}

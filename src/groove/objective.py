@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 
 from .rlsd import rlsd_lambda
+from .schemas import EvidenceImageConfig
 
 
 def validate_objective_config(config) -> None:
     groove = config.get("groove", {}) or {}
     if not groove.get("enabled", False):
         return
+    EvidenceImageConfig.from_groove(groove)
     mode = groove.get("advantage_mode", "opsd")
     if mode not in {"opsd", "rlsd_positive"}:
         raise ValueError("groove.advantage_mode must be opsd or rlsd_positive")

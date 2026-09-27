@@ -35,7 +35,7 @@ from .losses import combine_grpo_opsd_advantages, groove_opsd_advantages
 from .objective import validate_objective_config
 from .rlsd import positive_rlsd_advantages, rlsd_lambda
 from .reward import extract_option
-from .schemas import GroupRollout, Rollout
+from .schemas import EvidenceImageConfig, GroupRollout, Rollout
 from .trajectory_audit import write_trajectory_audit
 
 
@@ -47,7 +47,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 class GrooveRayPPOTrainer(RayPPOTrainer):
-    """Inject a shared hindsight Crop/Zoom prefix into every rollout of an analyzed group.
+    """Inject shared privileged visual evidence into every rollout of an analyzed group.
 
     The trainer scores both contexts before the actor update and fixes the
     resulting signed evidence advantages for every mini-batch in that update.
@@ -76,6 +76,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
         concurrent group gets its own Analyzer instance.  Evidence output paths
         are UID-scoped and therefore safe to write concurrently.
         """
+        image_config = EvidenceImageConfig.from_groove(self.config.get("groove", {}) or {})
         analyzer = OpenAICompatibleAnalyzer(OpenAIAnalyzerConfig.from_env())
         grounder = GroundingDinoGrounder(
             GroundingDinoConfig(
@@ -100,6 +101,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
                 mixed_groups_only=_env_bool("GROOVE_MIXED_GROUPS_ONLY", False),
                 min_rollouts=int(os.environ.get("GROOVE_MIN_ROLLOUTS", "2")),
                 reuse_cache=_env_bool("GROOVE_REUSE_CACHE", True),
+                image_config=image_config,
             ),
         )
 

@@ -129,6 +129,33 @@ class ObjectCrop(BaseModel):
         return self
 
 
+class EvidenceImageConfig(BaseModel):
+    """Teacher-only rendering, separate from Analyzer selection and the objective."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: Literal["crop", "focus"] = "crop"
+    blur_alpha: float = Field(default=0.5, ge=0.0, le=1.0, allow_inf_nan=False)
+    blur_radius: float = Field(default=12.0, gt=0.0, allow_inf_nan=False)
+
+    @classmethod
+    def from_groove(cls, config) -> "EvidenceImageConfig":
+        return cls(
+            mode=config.get("teacher_evidence_mode", "crop"),
+            blur_alpha=config.get("focus_blur_alpha", 0.5),
+            blur_radius=config.get("focus_blur_radius", 12.0),
+        )
+
+
+class FocusImage(BaseModel):
+    """Full-frame focus image and its actual, clipped pixel XYXY boxes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path
+    boxes: list[tuple[int, int, int, int]] = Field(min_length=1)
+
+
 class TeacherEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -140,9 +167,27 @@ class TeacherEvidence(BaseModel):
     teacher_prompt: list[dict] | None = None
     reason: str | None = None
     tool_trace: list[dict] = Field(default_factory=list)
+    image_config: EvidenceImageConfig = Field(default_factory=EvidenceImageConfig)
+    focus_image: FocusImage | None = None
+
+    @property
+    def image_paths(self) -> list[Path]:
+        if self.image_config.mode == "focus":
+            return [self.focus_image.path] if self.focus_image is not None else []
+        return [crop.path for crop in self.crops]
+
+    @property
+    def image_kinds(self) -> list[str]:
+        if self.image_config.mode == "focus":
+            return ["focus"] if self.focus_image is not None else []
+        return [crop.kind for crop in self.crops]
 
     @model_validator(mode="after")
     def ready_requires_evidence(self) -> "TeacherEvidence":
         if self.status == "ready" and (not self.crops or not self.teacher_prompt):
             raise ValueError("ready evidence requires crops and teacher_prompt")
+        if self.status == "ready" and self.image_config.mode == "focus" and self.focus_image is None:
+            raise ValueError("ready focus evidence requires a focus_image")
+        if self.image_config.mode == "crop" and self.focus_image is not None:
+            raise ValueError("crop evidence must not contain a focus_image")
         return self

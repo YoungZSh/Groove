@@ -4,7 +4,8 @@
 Analyzer。基于 Ground Truth 的轨迹复核、共用核验规则提炼、目标定位和候选选择
 都由同一个 Gemini 模型完成；
 本地仅校验坐标、裁剪图像并返回预览，不调用 DINO、OCR、Judge 或 Student。
-现有训练入口仍使用原 Analyzer；此实现没有接入训练路由或改动训练参数。
+现有训练入口仍使用原 Analyzer；Gemini 尚未接入训练路由。
+两者共用的 Teacher 证据层支持 Crop 和整图聚焦图，图像模式与 Analyzer 的选择相互独立。
 
 ## 官方协议依据
 
@@ -94,6 +95,9 @@ OPENAI_MODEL=gemini-3.8-flash
    审计和 Ground Truth 留在 Analyzer/审计侧，Teacher 只得到允许的共用核验规则及
    所选图像，Student 输入不变。现有规则式泄漏检查继续使用，但不保证所有语义泄漏
    都能被识别；规则与证据质量仍需人工抽查或独立评估。
+   默认 `crop` 模式保留所选裁剪；显式选择 `focus` 后，Teacher 的额外图像改为一张整图聚焦图。
+   它使用所有最终选中区域的边距框并集：框内清晰、框外按默认 50% 原图与 50% 高斯模糊混合，
+   每个框标红，保留原始空间布局。候选检查仍使用原来的 Crop 预览，不改变 Gemini 选框过程。
 
 文本区域也由 Gemini 定位和检查，不调用独立 OCR，也不向 Teacher 注入转录文本。
 计数可以选择包含相关对象的区域；此入口不生成现有 DINO 的实例框叠加图。
@@ -145,7 +149,11 @@ PYTHONPATH="$PWD/src" /data/home/yangzesheng/.conda/envs/groove/bin/python \
 ```
 
 去掉 `--dry-run` 才会调用中转站；支持 `--env-file`、`--max-tool-rounds` 和
-`--max-completion-tokens`。任何已有输出目录均拒绝使用，不覆盖历史记录。
+`--max-completion-tokens`。使用 `--teacher-evidence-mode focus` 生成整图聚焦证据；
+`--focus-blur-alpha 0.5` 设置框外的模糊图占比（原图占比 `1-alpha`），
+`--focus-blur-radius 12` 设置以原图像素为单位的高斯半径。
+默认仍为 `--teacher-evidence-mode crop`，便于复现已有离线对照。
+任何已有输出目录均拒绝使用，不覆盖历史记录。
 组内失败落盘后继续后续组，若存在失败最终退出码为 1；全部 ready 则为 0。
 
 输出包括：
@@ -156,6 +164,8 @@ PYTHONPATH="$PWD/src" /data/home/yangzesheng/.conda/envs/groove/bin/python \
   ID 等仅供本地追溯，模型请求字段以上述输入构造为准。
 - `group-000001/<uid>/evidence.json`：最终选择、像素框、Teacher 提示词、完整工具轨迹。
 - 同目录的 `tool-crop-*.jpg`：所选证据图像。
+- 聚焦模式在 `<uid>/focus-<参数哈希>/` 中保存 `evidence.json`、`focus.png` 和审计裁剪；
+  Teacher 只接收原图与 `focus.png`。`manifest.json` 和证据记录都保留图像模式、混合比例及半径。
 - `group-000001/api_trace.json`：逐轮请求结构、完整返回、usage、耗时；请求中的图片
   data URL 以 SHA-256 引用替代，可通过原图和工具框重建，不重复保存大量 base64。
   中转站请求异常只记录异常类型和 HTTP 状态，不保存可能回显凭证的原始报错正文。

@@ -35,3 +35,10 @@ class ObjectiveConfigTest(unittest.TestCase):
 
     def test_disabled_visual_evidence_does_not_constrain_other_training_modes(self):
         validate_objective_config({"groove": {"enabled": False}, "algorithm": {"adv_estimator": "gae"}})
+
+    def test_invalid_teacher_image_config_fails_before_evidence_generation(self):
+        for override in ({"teacher_evidence_mode": "other"}, {"focus_blur_alpha": -0.1},
+                         {"focus_blur_alpha": 1.1}, {"focus_blur_radius": 0},
+                         {"focus_blur_radius": float("nan")}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                validate_objective_config({"groove": {"enabled": True, **override}})

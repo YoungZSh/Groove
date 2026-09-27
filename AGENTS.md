@@ -297,6 +297,15 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 新的证据记录必须持久化完整的 `tool_trace` 数据；历史记录中缺失的轨迹无法重建。
 未选中的候选仍只能用于审计。
 
+三个当前训练入口的 GRPO + OPSD 默认 `TEACHER_EVIDENCE_MODE=focus`：Teacher 使用原图加一张
+整图聚焦图。选中框的并集保留原像素，框外按 `FOCUS_BLUR_ALPHA=0.5` 混合高斯模糊图和原图，
+`FOCUS_BLUR_RADIUS=12.0` 为原图像素半径，所有框画红色边界。原尺寸 PNG 保存，后续模型预处理
+仍可能缩小。`TEACHER_EVIDENCE_MODE=crop` 恢复原图加逐张放大裁剪；与优势模式独立。
+普通区域沿用 `expanded_box`，实例叠加图使用其逐实例框，不做去重。聚焦模式的裁剪只保留作审计。
+模式及参数写入 Hydra/W&B 和证据记录；聚焦缓存使用独立参数目录，不覆盖历史 Crop 证据。
+直接调用共用配置和离线 Gemini CLI 仍默认 Crop，可显式切换 Focus；正式训练 Analyzer 尚未切为 Gemini。
+实现位于 `src/groove/focus_image.py`、`evidence.py`，参数见 `docs/TRAINING_LAUNCHERS.md`。
+
 ## 当前 2B 实验设置
 
 本机另有明确的无 KL 两卡实验入口 `scripts/train_a800_2gpu_nokl.sh`：

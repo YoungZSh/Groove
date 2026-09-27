@@ -29,8 +29,11 @@ class TrainingLauncherTest(unittest.TestCase):
     def test_all_modes_accept_a_separate_validation_rollout_directory(self):
         self._check_launchers(override_data=False, override_validation_dump=True)
 
+    def test_teacher_evidence_accepts_crop_and_custom_blending(self):
+        self._check_launchers(override_data=False, evidence_override=True)
+
     def _check_launchers(self, *, override_data, override_validation=False, repetition_override="false",
-                         override_validation_dump=False):
+                         override_validation_dump=False, evidence_override=False):
         with TemporaryDirectory() as folder:
             project = Path(folder) / "project"
             (project / "scripts").mkdir(parents=True)
@@ -82,10 +85,13 @@ class TrainingLauncherTest(unittest.TestCase):
                         "DAPO_MAX_INFLIGHT_GEN_BATCHES", "ROLLOUT_ENFORCE_EAGER", "STEP_TIMING_DIR",
                         "OPSD_ADVANTAGE_MODE", "RLSD_LAMBDA_INITIAL", "RLSD_LAMBDA_DECAY_STEPS",
                         "RLSD_CLIP_RANGE", "RLSD_TEACHER_SYNC_INTERVAL",
+                        "TEACHER_EVIDENCE_MODE", "FOCUS_BLUR_ALPHA", "FOCUS_BLUR_RADIUS",
                     ):
                         env.pop(key, None)
                     if repetition_override is not None:
                         env["GROOVE_REPETITION_ZERO_REWARD"] = repetition_override
+                    if evidence_override:
+                        env.update(TEACHER_EVIDENCE_MODE="crop", FOCUS_BLUR_ALPHA="0.7", FOCUS_BLUR_RADIUS="9")
                     if override_data:
                         env["DATA_DIR"] = str(data_paths[name])
                     if override_validation:
@@ -105,6 +111,9 @@ class TrainingLauncherTest(unittest.TestCase):
                     self.assertIn("data.apply_chat_template_kwargs.enable_thinking=false", args)
                     self.assertIn("groove.enabled=" + enabled, args)
                     self.assertIn("groove.advantage_mode=rlsd_positive", args)
+                    self.assertIn("groove.teacher_evidence_mode=" + ("crop" if evidence_override else "focus"), args)
+                    self.assertIn("groove.focus_blur_alpha=" + ("0.7" if evidence_override else "0.5"), args)
+                    self.assertIn("groove.focus_blur_radius=" + ("9" if evidence_override else "12.0"), args)
                     self.assertIn("groove.rlsd_lambda_initial=0.5", args)
                     self.assertIn("groove.rlsd_lambda_decay_steps=50", args)
                     self.assertIn("groove.rlsd_clip_range=0.2", args)

@@ -386,6 +386,26 @@ class GeminiAnalyzerTest(unittest.TestCase):
             constructor.assert_not_called()
         self.assertFalse(output.exists())
 
+    def test_cli_focus_uses_selected_gemini_boxes_and_records_rendering_settings(self):
+        cli = self._cli()
+        groups_path = self.root / "focus-groups.jsonl"
+        groups_path.write_text(self.group.model_dump_json() + "\n")
+        output = self.root / "cli-focus"
+        self.responses = [self.tools(crop_call()), final_message()]
+        with patch.object(cli.GeminiAnalyzerConfig, "from_env", return_value=self.analyzer.config), \
+                patch.object(cli, "GeminiAPIAnalyzer", return_value=self.analyzer):
+            result = cli.main(["--groups", str(groups_path), "--output-dir", str(output),
+                               "--teacher-evidence-mode", "focus", "--focus-blur-alpha", "0.5"])
+        self.assertEqual(result, 0)
+        evidence = TeacherEvidence.model_validate_json(next(output.rglob("evidence.json")).read_text())
+        self.assertEqual(evidence.image_config.mode, "focus")
+        self.assertEqual(evidence.focus_image.boxes, [(152, 26, 648, 274)])
+        self.assertEqual(evidence.image_paths, [evidence.focus_image.path])
+        self.assertEqual(len(evidence.tool_trace), 1)
+        self.assertNotIn("box_2d", str(evidence.teacher_prompt))
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["image_config"], {"mode": "focus", "blur_alpha": 0.5, "blur_radius": 12.0})
+
     def test_cli_refuses_unaligned_training_dump(self):
         cli = self._cli()
         path = self.root / "raw.jsonl"

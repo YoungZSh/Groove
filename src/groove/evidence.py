@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .analyzer import Analyzer
+from .focus_image import build_focus_image
 from .grounding import Grounder, crop_tool_regions
-from .schemas import GroupRollout, TeacherEvidence
+from .schemas import EvidenceImageConfig, GroupRollout, TeacherEvidence
 
 
 CHOICE_PATTERN = re.compile(r"(?im)^\s*(?:\(([A-D])\)|([A-D])[.)])\s*(.+?)\s*$")
@@ -128,7 +130,7 @@ def build_teacher_prompt_from_student(
     if crop_count < 0:
         raise ValueError("crop_count must be non-negative")
     image_kinds = ["crop"] * crop_count if image_kinds is None else image_kinds
-    if len(image_kinds) != crop_count or any(kind not in {"crop", "instance_boxes"} for kind in image_kinds):
+    if len(image_kinds) != crop_count or any(kind not in {"crop", "instance_boxes", "focus"} for kind in image_kinds):
         raise ValueError("image_kinds must match the selected evidence images")
     prompt = student_prompt_template(student_prompt)
     user_indices = [index for index, message in enumerate(prompt) if message.get("role") == "user"]
@@ -136,9 +138,19 @@ def build_teacher_prompt_from_student(
         raise ValueError("Student prompt must contain a user message")
     user_index = user_indices[-1]
     content = str(prompt[user_index]["content"]).rstrip()
+    if "focus" in image_kinds and focus_instruction == SAFE_FOCUS_FALLBACK:
+        focus_instruction = "Inspect the highlighted regions and compare directly visible details relevant to the question."
     evidence_suffix = ["\n\nHindsight visual focus:\n", focus_instruction.strip()]
     for index, kind in enumerate(image_kinds):
-        if kind == "instance_boxes":
+        if kind == "focus":
+            evidence_suffix.extend([
+                "\n\nFull-image visual focus:\n", "<image>",
+                "\nThis copy preserves the original layout and scale. The selected regions "
+                "remain clear inside red outlines; the background is softened. The red "
+                "outlines are annotations, not part of the scene. Compare with the "
+                "unmodified image when needed.",
+            ])
+        elif kind == "instance_boxes":
             evidence_suffix.extend([
                 f"\n\nCandidate instance boxes {index + 1}:\n", "<image>",
                 "\nThe boxes are predicted candidates on a copy of the original image. "
@@ -193,13 +205,13 @@ def teacher_payload(
         return result
 
     images = [image_ref(evidence.original_image_path)]
-    images.extend(image_ref(crop.path) for crop in evidence.crops)
+    images.extend(image_ref(path) for path in evidence.image_paths)
     if evidence.teacher_prompt is None:
         prompt = build_teacher_prompt(
             question,
             evidence.focus.visible_focus_instruction if evidence.focus else "Inspect the relevant details.",
-            len(evidence.crops),
-            image_kinds=[crop.kind for crop in evidence.crops],
+            len(evidence.image_paths),
+            image_kinds=evidence.image_kinds,
         )
     else:
         prompt = evidence.teacher_prompt
@@ -212,6 +224,7 @@ class EvidenceBuilderConfig:
     mixed_groups_only: bool = False
     min_rollouts: int = 2
     reuse_cache: bool = True
+    image_config: EvidenceImageConfig = field(default_factory=EvidenceImageConfig)
 
 
 class TeacherEvidenceBuilder:
@@ -222,7 +235,13 @@ class TeacherEvidenceBuilder:
 
     def _record_path(self, group: GroupRollout) -> Path:
         safe_uid = "".join(char if char.isalnum() or char in "-_" else "_" for char in group.uid)
-        return self.config.output_dir / safe_uid / "evidence.json"
+        directory = self.config.output_dir / safe_uid
+        if self.config.image_config.mode == "focus":
+            # Keep legacy crop caches intact; a rendering change cannot silently
+            # reuse or overwrite an image produced with different parameters.
+            digest = hashlib.sha256(self.config.image_config.model_dump_json().encode()).hexdigest()[:16]
+            directory = directory / f"focus-{digest}"
+        return directory / "evidence.json"
 
     def build(
         self,
@@ -238,8 +257,8 @@ class TeacherEvidenceBuilder:
                     rebased_prompt = build_teacher_prompt_from_student(
                         student_prompt,
                         cached.focus.visible_focus_instruction,
-                        len(cached.crops),
-                        image_kinds=[crop.kind for crop in cached.crops],
+                        len(cached.image_paths),
+                        image_kinds=cached.image_kinds,
                     )
                     if cached.teacher_prompt != rebased_prompt:
                         cached = cached.model_copy(update={"teacher_prompt": rebased_prompt})
@@ -252,6 +271,7 @@ class TeacherEvidenceBuilder:
                 status="skipped",
                 original_image_path=group.image_path,
                 reason="insufficient_rollouts",
+                image_config=self.config.image_config,
             )
             return self._save(result, record_path)
         if self.config.mixed_groups_only and not group.is_mixed:
@@ -260,6 +280,7 @@ class TeacherEvidenceBuilder:
                 status="skipped",
                 original_image_path=group.image_path,
                 reason="uniform_reward_group",
+                image_config=self.config.image_config,
             )
             return self._save(result, record_path)
 
@@ -285,26 +306,33 @@ class TeacherEvidenceBuilder:
                 )
             if not crops:
                 raise RuntimeError("Grounding DINO produced no object crops")
+            focus_image = (
+                build_focus_image(group.image_path, crops, record_path.parent, self.config.image_config)
+                if self.config.image_config.mode == "focus" else None
+            )
+            image_kinds = ["focus"] if focus_image is not None else [crop.kind for crop in crops]
             result = TeacherEvidence(
                 uid=group.uid,
                 status="ready",
                 focus=focus,
                 original_image_path=group.image_path.resolve(),
                 crops=crops,
+                image_config=self.config.image_config,
+                focus_image=focus_image,
                 tool_trace=deepcopy(getattr(self.analyzer, "last_tool_trace", [])),
                 teacher_prompt=(
                     build_teacher_prompt_from_student(
                         student_prompt,
                         focus.visible_focus_instruction,
-                        len(crops),
-                        image_kinds=[crop.kind for crop in crops],
+                        len(image_kinds),
+                        image_kinds=image_kinds,
                     )
                     if student_prompt is not None
                     else build_teacher_prompt(
                         group.question,
                         focus.visible_focus_instruction,
-                        len(crops),
-                        image_kinds=[crop.kind for crop in crops],
+                        len(image_kinds),
+                        image_kinds=image_kinds,
                     )
                 ),
             )
@@ -314,6 +342,7 @@ class TeacherEvidenceBuilder:
                 status="error",
                 original_image_path=group.image_path,
                 reason=f"{type(exc).__name__}: {exc}",
+                image_config=self.config.image_config,
                 tool_trace=deepcopy(getattr(self.analyzer, "last_tool_trace", [])),
             )
         return self._save(result, record_path)

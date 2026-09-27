@@ -109,6 +109,56 @@ GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练�
 `trainer_routing.py` 拒绝“旧训练器开启组过滤”及“OPSD 同时开启 V1/组过滤”的无效组合，
 避免配置通过但算法未执行。
 
+### Teacher 特权图像：整图聚焦 / Crop 切换
+
+三个独立训练入口在 GRPO + OPSD 下默认使用 `TEACHER_EVIDENCE_MODE=focus`。
+`crop` 恢复原来的“原图 + 每个选中区域的放大裁剪”；`focus` 使用“原图 + 一张整图聚焦图”，
+把本组所有选中区域放在同一幅原始画面中。纯 GRPO/DAPO 不使用这些特权图像。
+此设置独立于 `OPSD_ADVANTAGE_MODE`，原加法 OPSD 和仅正优势 RLSD 都可使用任一图像模式。
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `TEACHER_EVIDENCE_MODE` | `focus` | `focus` 或 `crop` |
+| `FOCUS_BLUR_ALPHA` | `0.5` | 框外高斯模糊图的占比，范围 `[0,1]`；原图占比为 `1-alpha` |
+| `FOCUS_BLUR_RADIUS` | `12.0` | 高斯模糊半径，以原图像素为单位，必须为有限正数 |
+
+在 `focus` 模式下，框内并集直接保留原始 RGB 像素，框外为
+`(1-alpha) * original + alpha * GaussianBlur(original, radius)`。
+默认即模糊图 / 原图 = `0.5 : 0.5`。最后给每个框画红色边界，不填充、不标注答案或数量。
+重叠区域保持清晰，分离框之间的空隙仍按框外处理，不合成一个包围所有目标的大框。
+图像按原尺寸无损保存为 PNG；红框线覆盖的像素除外，其余框内像素不变。
+Teacher 的后续图像像素预算及上下文适配仍可能缩小整张图，此模式不提供 Crop 的局部放大效果。
+
+普通区域沿用选中裁剪的 `expanded_box`（包含原有上下文边距），以固定两种模式的关注范围。
+若选择了实例框叠加图，则使用其中每个实例框，不使用叠加图的整图外接框；不做 NMS 或 IoU 去重。
+所有证据仅进入 Teacher 前缀；Student 的原图、问题、采样回答与评分 token 对齐保持不变。
+没有有效证据时仍回退普通 GRPO。
+
+例如，本机两卡新模式（请使用新的实验名）：
+
+```bash
+TRAINING_MODE=grpo_opsd TEACHER_EVIDENCE_MODE=focus \
+FOCUS_BLUR_ALPHA=0.5 FOCUS_BLUR_RADIUS=12 \
+EXPERIMENT_NAME=qwen35-2b-focus-unique-run \
+  bash scripts/train_a800_2gpu_nokl.sh
+```
+
+原 Crop 对照把 `TEACHER_EVIDENCE_MODE` 改为 `crop`，并使用另一实验名。
+四卡和 Siton 使用同名变量。参数写入解析后的 Hydra/W&B 配置：
+`groove.teacher_evidence_mode`、`groove.focus_blur_alpha`、`groove.focus_blur_radius`；
+命令行参数保持最高优先级，例如在脚本后追加 `groove.teacher_evidence_mode=crop`。
+`GROOVE_DRY_RUN=true` 会验证并显示这些配置，不启动训练。
+
+共用配置 `configs/groove.yaml` 和直接构造 `EvidenceBuilderConfig` 的默认仍为 `crop`，
+保留旧调用者兼容性；三个独立启动脚本显式选择 `focus`。
+Gemini 当前仍为离线 Analyzer 入口，可用同一证据处理层生成聚焦图，见 `docs/GEMINI_ANALYZER.md`；
+本次图像模式切换不会自动将正式训练 Analyzer 改为 Gemini。
+
+审计仍保存选中的 `crops`、`focus.tool_regions` 及完整 `tool_trace`；聚焦模式的裁剪仅用于审计，
+Teacher 不再接收这些额外裁剪。`evidence.json` 新增 `image_config` 和 `focus_image`（图像路径及实际像素框）。
+旧证据缺少这些字段时按 `crop` 解释。聚焦记录存入 `<uid>/focus-<参数哈希>/`，
+模式、混合比例或半径改变时不会复用/覆盖其他模式的缓存；Crop 保持原 `<uid>/evidence.json` 路径。
+
 ### 本分支：仅正优势 RLSD
 
 `TRAINING_MODE=grpo_opsd` 默认选择 `OPSD_ADVANTAGE_MODE=rlsd_positive`。

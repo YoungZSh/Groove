@@ -20,7 +20,7 @@ from groove.gemini_analyzer import (
     NoDetectorFallback,
     build_gemini_analysis_text,
 )
-from groove.schemas import GroupRollout
+from groove.schemas import EvidenceImageConfig, GroupRollout
 
 
 def load_groups(path: Path) -> list[GroupRollout]:
@@ -63,12 +63,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, help="Analyze at most this many prepared groups")
     parser.add_argument("--max-tool-rounds", type=int, default=3)
     parser.add_argument("--max-completion-tokens", type=int, default=16384)
+    parser.add_argument("--teacher-evidence-mode", choices=("crop", "focus"), default="crop")
+    parser.add_argument("--focus-blur-alpha", type=float, default=0.5,
+                        help="Blurred-image fraction outside selected boxes, in [0, 1]")
+    parser.add_argument("--focus-blur-radius", type=float, default=12.0,
+                        help="Gaussian blur radius in original-image pixels")
     parser.add_argument("--dry-run", action="store_true", help="Validate input and configuration without an API call or output writes")
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     if args.output_dir.exists():
         parser.error("--output-dir already exists; choose a new directory to preserve previous evidence")
+    try:
+        image_config = EvidenceImageConfig(
+            mode=args.teacher_evidence_mode,
+            blur_alpha=args.focus_blur_alpha,
+            blur_radius=args.focus_blur_radius,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     config = replace(
         GeminiAnalyzerConfig.from_env(args.env_file),
         max_tool_rounds=args.max_tool_rounds,
@@ -89,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         "group_count": len(groups),
         "analysis_protocol": "ground-truth-shared-rule-v1",
         "system_prompt_sha256": hashlib.sha256(GEMINI_SYSTEM_PROMPT.encode()).hexdigest(),
+        "image_config": image_config.model_dump(mode="json"),
         "config": {item.name: getattr(config, item.name) for item in fields(config) if item.name != "api_key"},
     })
     analyzer = GeminiAPIAnalyzer(config)
@@ -102,12 +116,14 @@ def main(argv: list[str] | None = None) -> int:
             _write_json(group_dir / "group.json", group.model_dump(mode="json"))
             builder = TeacherEvidenceBuilder(
                 analyzer, NoDetectorFallback(),
-                EvidenceBuilderConfig(output_dir=group_dir, reuse_cache=False, min_rollouts=1),
+                EvidenceBuilderConfig(output_dir=group_dir, reuse_cache=False, min_rollouts=1,
+                                      image_config=image_config),
             )
             evidence = builder.build(group)
             _write_json(group_dir / "api_trace.json", analyzer.last_api_trace)
             counts[evidence.status] += 1
-            print(f"[{index}/{len(groups)}] {evidence.status}; {len(evidence.crops)} selected crops", flush=True)
+            print(f"[{index}/{len(groups)}] {evidence.status}; {len(evidence.crops)} selected regions; "
+                  f"{len(evidence.image_paths)} Teacher evidence images ({image_config.mode})", flush=True)
     finally:
         analyzer.close()
         _write_json(args.output_dir / "summary.json", counts)
