@@ -76,7 +76,7 @@ class FocusProgram(BaseModel):
     group_summary: str
     crucial_evidence: str = ""
     crucial_evidence_type: Literal["text", "visual"] = "visual"
-    tool_route: Literal["ocr", "dino"] = "dino"
+    tool_route: Literal["ocr", "dino", "gemini"] = "dino"
     visible_focus_instruction: str
     grounding_queries: list[str] = Field(min_length=1, max_length=3)
     selected_candidate_ids: list[str] = Field(default_factory=list, max_length=3)

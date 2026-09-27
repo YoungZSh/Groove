@@ -331,6 +331,21 @@ there is no IoU deduplication or implicit latest-round preference. Unselected bo
 remain audit-only. Exact grounding phrases stay in the private execution record and
 are not Student targets.
 
+### Offline Gemini API Analyzer
+
+`groove.gemini_analyzer.GeminiAPIAnalyzer` is an opt-in offline alternative for
+replaying prepared rollout groups. Its complete system prompt is a single literal
+in `GEMINI_SYSTEM_PROMPT`, independent of the original Analyzer prompt and without
+fragment composition. It preserves the evidence and candidate-selection contract.
+Gemini 3.8 Flash predicts the boxes itself via
+an OpenAI-compatible `crop_image` function call with `reasoning_effort="high"`.
+The local tool only validates and crops; it never calls DINO or OCR. Returned
+previews are inspected before selection. Its `FocusProgram.tool_route` is
+`gemini`; native normalized boxes and original-image pixel boxes stay in the
+private tool trace. Existing training routes remain unchanged. Configuration,
+input preparation, audit records and usage are documented in
+[GEMINI_ANALYZER.md](GEMINI_ANALYZER.md).
+
 ### Full-image instance boxes for counting
 
 Counting can opt into `ANALYZER_ENABLE_INSTANCE_BOXES=true`. This exposes the

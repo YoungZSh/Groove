@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gemini-analyzer = ["openai>=1.61", "python-dotenv>=1"]
 grounding = ["transformers>=4.57", "torch>=2.4"]
 data = ["datasets>=3", "pandas>=2", "pyarrow>=17"]
 native-training = ["TransferQueue==0.1.10"]
