@@ -47,6 +47,14 @@ TRAINING_MODE=grpo EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
 四卡和 Siton 默认仍为 50 步，衰减设置不按 batch 或总训练步数自动缩放。
 设置 `OPSD_ADVANTAGE_MODE=opsd` 可以运行相同两卡、batch 32、无 KL 的原加法对照。
 
+当前 GPU 0、3 运行可使用 `scripts/training_service_handoff.py` 管理训练与推理接管。
+它读取单次运行的 JSON 配置，核验原服务的 PID/启动 tick、所有者、完整命令、GPU UUID 和 tmux pane，
+先启动独立恢复监控，再停止原服务。训练使用独立的本地 Ray 实例、临时目录和唯一进程标记。
+训练正常结束、初始化失败、被终止，或管理训练的进程被强制结束后，独立监控只清理本次带标记的进程，
+等待 GPU 与端口释放，使用保存的原始启动脚本恢复 GPU 0/8000、GPU 3/8003 的推理服务。
+模型、上下文长度、端口及推理参数沿用原服务；恢复后执行实际推理请求确认可用。
+这一接管需要用户明确授权停止服务和启动训练；GPU 1、2 不参与。模型重载期间存在短暂启动时间。
+
 历史 GPU 1、2 训练配置中，当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
 GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练前只停止 GPU 1–2
 服务；训练结束后只恢复这两张卡，其恢复配置使用 `training_world_size=2`。

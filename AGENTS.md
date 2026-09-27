@@ -306,7 +306,9 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 GRPO + OPSD 默认采用仅正优势 RLSD，Teacher 每 5 步同步、第 40 步衰减到零
 （占一轮 125 步的 32%），此后普通 GRPO 更新；`OPSD_ADVANTAGE_MODE=opsd` 可选原加法对照。
 GRPO 使用原生 V1 和默认在线 W&B；GRPO + OPSD 使用项目 Trainer 和离线 W&B。
-检查点 world size 为 2。
+当前只接管 GPU 0、3 的推理服务，训练结束或终止后恢复原端口 8000/8003 和原推理参数，
+GPU 1、2 不动，检查点 world size 为 2。`scripts/training_service_handoff.py` 使用独立 tmux
+恢复监控和本次运行的唯一进程标记，禁止用全局 Ray 停止命令或跨运行清理代替。
 这是用户指定的无 KL 实验，不改变下面四卡与 Siton 基线入口的默认 KL。
 
 独立实验脚本使用以下设置：
