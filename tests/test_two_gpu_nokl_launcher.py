@@ -26,6 +26,7 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         (self.project / 'scripts').mkdir(parents=True)
         self.launcher = self.project / 'scripts/train_a800_2gpu_nokl.sh'
         shutil.copy2(ROOT / 'scripts/train_a800_2gpu_nokl.sh', self.launcher)
+        (self.project / '.env').write_text('OPENAI_MODEL=gemini-test\n')
         for filename in ('data/vstar_grpo_4000_seed20260917/train.parquet',
                          'data/vstar_opsd_4000_seed20260917/train.parquet',
                          'data/vstar_bench/validation.parquet'):
@@ -68,6 +69,12 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         self.assertEqual(actor.ppo_epochs, 1)
         self.assertEqual(actor.optim.lr, 1e-6)
         self.assertEqual(actor.entropy_coeff, 0.001)
+        self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_PROVIDER, 'qwen')
+        self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_BASE_URL,
+                         'http://127.0.0.1:8005/v1')
+        self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_MODEL, 'Qwen3.8-27B')
+        self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_ENV_FILE,
+                         str(self.project / '.env'))
         self.assertEqual(trainer_backend(config), 'verl_v1_sync')
         self.assertFalse(actor.use_kl_loss)
         self.assertEqual(actor.kl_loss_coef, 0)
@@ -120,6 +127,9 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
                 self.assertEqual(config.data.train_batch_size * rollout.n, 256)
                 self.assertEqual(actor.optim.lr, 1e-6)
                 self.assertEqual(actor.entropy_coeff, 0)
+                self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_PROVIDER, 'qwen')
+                self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_BASE_URL,
+                                 'http://127.0.0.1:8002/v1')
                 self.assertEqual(actor.ppo_epochs, 1)
                 self.assertEqual(actor.clip_ratio_low, .2)
                 self.assertEqual(actor.clip_ratio_high, .2)
@@ -205,6 +215,26 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         self.assertEqual(config.actor_rollout_ref.actor.entropy_coeff, 0.002)
         self.assertEqual(captured['args'][-1], 'actor_rollout_ref.actor.entropy_coeff=0.002')
         self.assertFalse(need_reference_policy(config))
+
+    def test_judge_provider_override_and_missing_gemini_credentials_file(self):
+        _, config = self.config(self.launch({'TRAINING_MODE': 'grpo', 'GROOVE_JUDGE_PROVIDER': 'gemini',
+                                             'LEARNING_RATE': '5e-7'}))
+        self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.GROOVE_JUDGE_PROVIDER, 'gemini')
+        self.assertEqual(config.actor_rollout_ref.actor.optim.lr, 5e-7)
+        self.assertEqual(config.actor_rollout_ref.actor.entropy_coeff, .001)
+        result = self.launch({'TRAINING_MODE': 'grpo', 'GROOVE_JUDGE_PROVIDER': 'gemini',
+                              'GROOVE_JUDGE_ENV_FILE': '/missing/judge.env'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Missing Gemini Judge env file', result.stderr)
+
+    def test_qwen_endpoint_and_model_overrides_reach_workers_without_credentials(self):
+        _, config = self.config(self.launch({'TRAINING_MODE': 'grpo',
+            'GROOVE_JUDGE_BASE_URL': 'http://127.0.0.1:9005/v1',
+            'GROOVE_JUDGE_MODEL': 'test-qwen'}))
+        worker_env = config.ray_kwargs.ray_init.runtime_env.env_vars
+        self.assertEqual(worker_env.GROOVE_JUDGE_BASE_URL, 'http://127.0.0.1:9005/v1')
+        self.assertEqual(worker_env.GROOVE_JUDGE_MODEL, 'test-qwen')
+        self.assertNotIn('GROOVE_JUDGE_API_KEY', worker_env)
 
     def test_cli_priority_and_quoted_paths_survive_array_expansion(self):
         path = str(self.project / 'validation outputs')

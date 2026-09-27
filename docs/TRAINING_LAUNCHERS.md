@@ -24,6 +24,18 @@ GPU 0、3 同时默认 `NCCL_P2P_DISABLE=1`，通过 SHM 通信，规避实测�
 GRPO + OPSD 保持学习率 `1e-6`、熵系数 `0`。
 两种模式均可用 `LEARNING_RATE`、`ENTROPY_COEFF` 覆盖，命令行 Hydra 参数仍具有最高优先级。
 复现旧纯 GRPO 配置时显式使用 `LEARNING_RATE=1e-6 ENTROPY_COEFF=0`。
+按本次运行要求，两卡纯 GRPO 默认 `GROOVE_JUDGE_PROVIDER=qwen`，Judge 使用
+`http://127.0.0.1:8005/v1`，端点实际登记模型名为 `Qwen3.8-27B`。
+`GROOVE_JUDGE_BASE_URL`、`GROOVE_JUDGE_MODEL` 可覆盖，并随配置传给 Ray worker；凭证不写入配置。
+Qwen 保留 `enable_thinking=false`。GRPO + OPSD 默认仍使用 `8002/v1`，Analyzer 地址不变。
+复现上一轮半学习率/Gemini 配置时显式设置 `LEARNING_RATE=5e-7 GROOVE_JUDGE_PROVIDER=gemini`；
+Gemini 从 `GROOVE_JUDGE_ENV_FILE`（默认仓库 `.env`）读取 `OPENAI_BASE_URL`、
+`OPENAI_API_KEY` 和 `OPENAI_MODEL`，不把凭证写入 Hydra 配置或日志。
+Gemini 请求不传任何 thinking / reasoning_effort / chat_template_kwargs 参数，使用服务默认强度；
+温度 0、512-token 预算、唯一末尾 `Judgement: 0/1`、首次加 5 次重试及耗尽归零策略保持不变。
+训练及 V*Bench 验证共用这一 Judge，仍分别使用塑形奖励与原始语义准确率。
+GRPO + OPSD 默认继续使用 `GROOVE_JUDGE_PROVIDER=qwen`；可显式选择 provider。
+本次与上一轮同时改变学习率和 Judge，不能把分数差异全部归给学习率或熵奖励。
 每 5 步验证和保存一次，对应处理 160 道训练题，保持与原 batch 16、每 10 步验证相同的题数间隔。
 默认 `TRAINING_MODE=grpo_opsd`（别名 `groove`），运行 GRPO + OPSD 的仅正优势 RLSD 模式。
 纯 GRPO 对照需显式设置 `TRAINING_MODE=grpo`；每次运行仍须指定新的 `EXPERIMENT_NAME`。

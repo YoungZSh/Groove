@@ -21,6 +21,68 @@ from groove.semantic_reward import (
 
 
 class SemanticRewardLoopTest(unittest.TestCase):
+    def test_gemini_judge_uses_env_file_without_any_thinking_override(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        with TemporaryDirectory() as folder:
+            env_file = Path(folder) / 'judge.env'
+            env_file.write_text('OPENAI_BASE_URL=https://example.test/v1\n'
+                                'OPENAI_API_KEY=gemini-test-secret\nOPENAI_MODEL=gemini-test\n')
+            with (
+                patch.dict('os.environ', {'GROOVE_JUDGE_PROVIDER': 'gemini',
+                    'GROOVE_JUDGE_ENV_FILE': str(env_file), 'GROOVE_JUDGE_MAX_RETRIES': '0',
+                    'GROOVE_JUDGE_API_KEY': 'old-qwen-key', 'GROOVE_JUDGE_MODEL': 'old-qwen'}),
+                patch('groove.semantic_reward.urllib.request.urlopen', return_value=response) as request,
+                patch('groove.semantic_reward.json.load', return_value={'choices': [
+                    {'finish_reason': 'stop', 'message': {'content': 'Reason: Equivalent.\nJudgement: 1'}}]}),
+            ):
+                result = _judge_one('What color?', 'green', '<answer>green</answer>')
+            sent = request.call_args.args[0]
+            self.assertEqual(sent.full_url, 'https://example.test/v1/chat/completions')
+            self.assertEqual(sent.get_header('Authorization'), 'Bearer gemini-test-secret')
+            body = json.loads(sent.data)
+            self.assertEqual(set(body), {'model', 'messages', 'temperature', 'max_completion_tokens'})
+            self.assertEqual(body['model'], 'gemini-test')
+            self.assertEqual(body['temperature'], 0)
+            self.assertEqual(body['max_completion_tokens'], 512)
+            self.assertEqual(result['accuracy'], 1)
+            self.assertEqual(result['score'], 1)
+
+    def test_gemini_env_file_configuration_errors_do_not_become_incorrect_answers(self):
+        with TemporaryDirectory() as folder:
+            env_file = Path(folder) / 'judge.env'
+            env_file.write_text('OPENAI_MODEL=gemini-test\n')
+            with (
+                patch.dict('os.environ', {'GROOVE_JUDGE_PROVIDER': 'gemini',
+                    'GROOVE_JUDGE_ENV_FILE': str(env_file)}),
+                patch('groove.semantic_reward.urllib.request.urlopen') as request,
+                self.assertRaises(RuntimeError),
+            ):
+                _judge_one('What color?', 'green', 'green')
+            request.assert_not_called()
+
+    def test_gemini_failed_request_audit_redacts_the_env_file_credential(self):
+        with TemporaryDirectory() as folder:
+            env_file = Path(folder) / 'judge.env'
+            env_file.write_text('OPENAI_BASE_URL=https://example.test/v1\n'
+                                'OPENAI_API_KEY=gemini-test-secret\nOPENAI_MODEL=gemini-test\n')
+            audit = Path(folder) / 'audit'
+            with (
+                patch.dict('os.environ', {'GROOVE_JUDGE_PROVIDER': 'gemini',
+                    'GROOVE_JUDGE_ENV_FILE': str(env_file), 'GROOVE_JUDGE_MAX_RETRIES': '0',
+                    'GROOVE_JUDGE_AUDIT_DIR': str(audit), 'GROOVE_JUDGE_API_KEY': 'old-key'}),
+                patch('groove.semantic_reward.urllib.request.urlopen',
+                      side_effect=ConnectionError('failure with gemini-test-secret')),
+            ):
+                result = _judge_one('What color?', 'green', 'green')
+            records = list(audit.glob('*.json'))
+            self.assertEqual(len(records), 1)
+            self.assertNotIn('gemini-test-secret', records[0].read_text())
+            self.assertIn('<redacted>', records[0].read_text())
+            self.assertEqual(result['judge_retries_exhausted'], 1)
+            self.assertEqual(result['accuracy'], 0)
+            self.assertAlmostEqual(result['score'], -0.2)
+
     def test_failed_judge_attempts_preserve_response_without_credentials(self):
         response = MagicMock()
         response.__enter__.return_value = response

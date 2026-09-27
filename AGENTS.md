@@ -314,6 +314,14 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 下一次纯 GRPO 默认恢复学习率 `1e-6`、保留标准熵奖励系数 `0.001`，在 actor 损失中减去 `0.001 * H`。
 GRPO + OPSD 保持学习率 `1e-6`、熵系数 `0`；两者支持 `LEARNING_RATE`、`ENTROPY_COEFF` 覆盖。
 旧纯 GRPO 的 `1e-6`、熵系数 `0` 需显式覆盖，奖励和优势计算方式不变。
+本次两卡纯 GRPO 按用户要求默认 `GROOVE_JUDGE_PROVIDER=qwen`，Judge 地址为
+`http://127.0.0.1:8005/v1`，实际服务模型名为 `Qwen3.8-27B`，保留 `enable_thinking=false`。
+`GROOVE_JUDGE_BASE_URL`、`GROOVE_JUDGE_MODEL` 可覆盖并传入 Ray worker，凭证不写入 Hydra 配置。
+上一轮半学习率/Gemini 配方可显式设置 `LEARNING_RATE=5e-7 GROOVE_JUDGE_PROVIDER=gemini`，
+从 `GROOVE_JUDGE_ENV_FILE`（默认 `.env`）读取 `OPENAI_BASE_URL/API_KEY/MODEL`。
+Gemini Judge 不传 thinking、reasoning_effort 或 chat_template_kwargs，使用 API 默认强度；
+保留温度 0、512 tokens、判定解析和重试耗尽策略。训练与验证共用此 Judge。
+GRPO + OPSD 默认 Qwen 地址仍为 `8002/v1`；比较新旧实验须注明学习率和 Judge 同时改变。
 默认 Python 为 `/data/home/yangzesheng/.conda/envs/groove/bin/python`，
 模型为 `/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`，均支持相应环境变量覆盖。
 该两卡入口默认 `NCCL_CUMEM_HOST_ENABLE=0` 并传给 Ray worker，规避本机通信初始化崩溃。

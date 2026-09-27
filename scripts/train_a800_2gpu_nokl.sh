@@ -36,6 +36,8 @@ case "$TRAINING_MODE" in
     OPSD_ENABLED=false; USE_VERL_V1=true
     DEFAULT_LEARNING_RATE=1e-6
     DEFAULT_ENTROPY_COEFF=0.001
+    DEFAULT_JUDGE_PROVIDER=qwen
+    DEFAULT_JUDGE_BASE_URL=http://127.0.0.1:8005/v1
     export WANDB_MODE="${WANDB_MODE:-online}"
     ;;
   grpo_opsd|groove)
@@ -44,6 +46,8 @@ case "$TRAINING_MODE" in
     OPSD_ENABLED=true; USE_VERL_V1=false
     DEFAULT_LEARNING_RATE=1e-6
     DEFAULT_ENTROPY_COEFF=0.0
+    DEFAULT_JUDGE_PROVIDER=qwen
+    DEFAULT_JUDGE_BASE_URL=http://127.0.0.1:8002/v1
     export WANDB_MODE=offline
     ;;
   *) echo "TRAINING_MODE must be grpo or grpo_opsd (groove) for this two-GPU no-KL experiment." >&2; exit 2 ;;
@@ -108,9 +112,21 @@ CUSTOM_REWARD_FUNCTION_PATH="$PROJECT_ROOT/src/groove/semantic_reward.py"
 CUSTOM_REWARD_FUNCTION_NAME=compute_score
 ANSWER_REWARD_WEIGHT=1.0
 FORMAT_REWARD_WEIGHT=0.2
-export GROOVE_JUDGE_BASE_URL="${GROOVE_JUDGE_BASE_URL:-http://127.0.0.1:8002/v1}"
-export GROOVE_JUDGE_API_KEY="${GROOVE_JUDGE_API_KEY:-remote-qwen38}"
-export GROOVE_JUDGE_MODEL=Qwen3.8-27B
+export GROOVE_JUDGE_PROVIDER="${GROOVE_JUDGE_PROVIDER:-$DEFAULT_JUDGE_PROVIDER}"
+export GROOVE_JUDGE_ENV_FILE="${GROOVE_JUDGE_ENV_FILE:-$PROJECT_ROOT/.env}"
+case "$GROOVE_JUDGE_PROVIDER" in
+  gemini)
+    # Reward workers read OPENAI_BASE_URL/API_KEY/MODEL directly from this file.
+    # Credentials never enter Hydra arguments or its printed configuration.
+    [[ -f "$GROOVE_JUDGE_ENV_FILE" ]] || { echo "Missing Gemini Judge env file." >&2; exit 2; }
+    ;;
+  qwen)
+    export GROOVE_JUDGE_BASE_URL="${GROOVE_JUDGE_BASE_URL:-$DEFAULT_JUDGE_BASE_URL}"
+    export GROOVE_JUDGE_API_KEY="${GROOVE_JUDGE_API_KEY:-remote-qwen38}"
+    export GROOVE_JUDGE_MODEL="${GROOVE_JUDGE_MODEL:-Qwen3.8-27B}"
+    ;;
+  *) echo "GROOVE_JUDGE_PROVIDER must be qwen or gemini." >&2; exit 2 ;;
+esac
 export GROOVE_JUDGE_CONCURRENCY=128
 export GROOVE_JUDGE_TIMEOUT_SECONDS=180
 export GROOVE_JUDGE_MAX_RETRIES=5
@@ -385,9 +401,14 @@ RAY=(
   transfer_queue.backend.SimpleStorage.num_data_storage_units=2
 )
 
-for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_CUMEM_HOST_ENABLE NCCL_P2P_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS; do
+for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_CUMEM_HOST_ENABLE NCCL_P2P_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS GROOVE_JUDGE_PROVIDER GROOVE_JUDGE_ENV_FILE; do
   RAY+=("++ray_kwargs.ray_init.runtime_env.env_vars.$variable=\"${!variable}\"")
 done
+if [[ "$GROOVE_JUDGE_PROVIDER" == "qwen" ]]; then
+  for variable in GROOVE_JUDGE_BASE_URL GROOVE_JUDGE_MODEL; do
+    RAY+=("++ray_kwargs.ray_init.runtime_env.env_vars.$variable=\"${!variable}\"")
+  done
+fi
 
 # Optional experiment-specific Hydra overrides. CLI arguments take precedence.
 EXTRA=()

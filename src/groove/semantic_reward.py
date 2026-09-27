@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from datetime import datetime, timezone
+from functools import lru_cache
 import http.client
 import json
 import logging
@@ -21,6 +22,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 import warnings
 from typing import Any
@@ -296,8 +298,28 @@ def _configured_repetition_hit(output: str) -> RepetitionHit | None:
     )
 
 
+@lru_cache(maxsize=8)
+def _gemini_judge_connection(env_file: str) -> tuple[str, str, str]:
+    """Read only the selected API settings; never source shell code or log keys."""
+    from dotenv import dotenv_values
+
+    path = Path(env_file)
+    if not path.is_file():
+        raise FileNotFoundError("Gemini Judge requires a readable GROOVE_JUDGE_ENV_FILE")
+    values = dotenv_values(path, interpolate=False)
+    fields = tuple(str(values.get(key) or "").strip() for key in
+                   ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"))
+    if not all(fields):
+        raise RuntimeError("Gemini Judge requires OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL in its env file")
+    parsed = urlsplit(fields[0])
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("Gemini Judge requires a credential-free HTTP(S) API base URL")
+    return fields[0].rstrip("/"), fields[1], fields[2]
+
+
 def _record_judge_attempt(directory, request_id, *, attempt, max_attempts, body,
-                          question, ground_truth, output, answer, payload, error):
+                          question, ground_truth, output, answer, payload, error, credential=None):
     """Persist failed/recovered requests locally without headers or credentials."""
     if not directory:
         return
@@ -314,7 +336,7 @@ def _record_judge_attempt(directory, request_id, *, attempt, max_attempts, body,
         "judge_retries_exhausted": exhausted,
         "fallback_accuracy": 0.0 if exhausted else None,
     }
-    credential = os.environ.get("GROOVE_JUDGE_API_KEY", "")
+    credential = credential or os.environ.get("GROOVE_JUDGE_API_KEY", "")
 
     def redact(value):
         if isinstance(value, str) and credential:
@@ -345,9 +367,16 @@ def _judge_one(
     format_reward_weight: float = DEFAULT_FORMAT_REWARD_WEIGHT,
     apply_training_shaping: bool = True,
 ) -> dict[str, float]:
-    base_url = os.environ.get("GROOVE_JUDGE_BASE_URL", "http://127.0.0.1:8002/v1").rstrip("/")
-    api_key = os.environ.get("GROOVE_JUDGE_API_KEY", "")
-    model = os.environ.get("GROOVE_JUDGE_MODEL", "Qwen3.8-27B")
+    provider = os.environ.get("GROOVE_JUDGE_PROVIDER", "qwen").strip().lower()
+    if provider == "gemini":
+        base_url, api_key, model = _gemini_judge_connection(
+            os.environ.get("GROOVE_JUDGE_ENV_FILE", ".env"))
+    elif provider == "qwen":
+        base_url = os.environ.get("GROOVE_JUDGE_BASE_URL", "http://127.0.0.1:8002/v1").rstrip("/")
+        api_key = os.environ.get("GROOVE_JUDGE_API_KEY", "")
+        model = os.environ.get("GROOVE_JUDGE_MODEL", "Qwen3.8-27B")
+    else:
+        raise ValueError("GROOVE_JUDGE_PROVIDER must be qwen or gemini")
     timeout = float(os.environ.get("GROOVE_JUDGE_TIMEOUT_SECONDS", "180"))
     max_retries = int(os.environ.get("GROOVE_JUDGE_MAX_RETRIES", "5"))
     if not api_key:
@@ -376,8 +405,11 @@ def _judge_one(
         ],
         "temperature": 0.0,
         "max_completion_tokens": 512,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    if provider == "qwen":
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    # Gemini uses the API's default thinking strength: no reasoning_effort,
+    # thinking budget, enable_thinking or chat-template overrides are sent.
     request = urllib.request.Request(
         base_url + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -405,7 +437,7 @@ def _judge_one(
                 _record_judge_attempt(
                     audit_dir, request_id, attempt=attempt + 1, max_attempts=max_retries + 1,
                     body=body, question=question, ground_truth=ground_truth, output=output,
-                    answer=answer, payload=payload, error=None,
+                    answer=answer, payload=payload, error=None, credential=api_key,
                 )
             break
         except (
@@ -416,7 +448,7 @@ def _judge_one(
             _record_judge_attempt(
                 audit_dir, request_id, attempt=attempt + 1, max_attempts=max_retries + 1,
                 body=body, question=question, ground_truth=ground_truth, output=output,
-                answer=answer, payload=payload, error=exc,
+                answer=answer, payload=payload, error=exc, credential=api_key,
             )
             if attempt < max_retries:
                 time.sleep(0.5 * (2**attempt))
