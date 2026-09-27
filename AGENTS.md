@@ -83,7 +83,7 @@
 使用现有环境，不要使用 `/usr/bin/python3`：
 
 ```bash
-PYTHON_BIN=/ssd/home/zc/miniconda3/envs/groove/bin/python
+PYTHON_BIN=/data/home/yangzesheng/.conda/envs/groove/bin/python
 PYTHONPATH="$PWD/src" "$PYTHON_BIN" -m unittest discover -s tests -v
 ```
 
@@ -91,7 +91,7 @@ PYTHONPATH="$PWD/src" "$PYTHON_BIN" -m unittest discover -s tests -v
 
 ```bash
 PYTHONPATH="$PWD/src" \
-  /ssd/home/zc/miniconda3/envs/groove/bin/python \
+  /data/home/yangzesheng/.conda/envs/groove/bin/python \
   -m unittest discover -s tests -p 'test_semantic_reward.py' -v
 ```
 
@@ -114,8 +114,9 @@ Siton 使用 `/home/yzs/miniconda3/envs/vision-opd/bin/python`。原生 V1 需�
 
 本机四卡、本机两卡无 KL 和 Siton 启动脚本在 `TRAINING_MODE=grpo_opsd` 下默认使用
 `OPSD_ADVANTAGE_MODE=rlsd_positive`；`opsd` 可选回原加法目标。
-纯 GRPO/DAPO 不启用此机制。本机两卡无 KL 入口默认仍是纯 GRPO，显式选择
-`TRAINING_MODE=grpo_opsd`（别名 `groove`）启用 RLSD，batch 保持 32。
+纯 GRPO/DAPO 不启用此机制。本机两卡无 KL 入口默认选择
+`TRAINING_MODE=grpo_opsd`（别名 `groove`）启用 RLSD，batch 保持 32；
+纯 GRPO 对照需显式设置 `TRAINING_MODE=grpo`。
 
 ```text
 decay_steps = 40  # 本机两卡试验；四卡和 Siton 默认 50
@@ -126,8 +127,8 @@ A_total,t = A_GRPO * w_t
 
 - 正优势按已有塑形奖励计算，不附加 `accuracy=1` 条件。负优势和零优势不重加权。
 - 不再叠加旧的 `0.01 * delta`；不添加独立蒸馏损失或序列归一化。
-- Teacher 初始化为 Student，完成每 10 次外循环更新后完整复制一次参数，期间冻结。
-  默认第 1–10 步使用初始 Teacher，第 11–20 步使用第 10 步 Student，依此类推。
+- Teacher 初始化为 Student，本机两卡每完成 5 次外循环更新后完整复制一次参数，期间冻结。
+  第 1–5 步使用初始 Teacher，第 6–10 步使用第 5 步 Student，依此类推；四卡/Siton 仍每 10 步同步。
 - 评分使用同一批采样 token，在 actor 更新前固定权重；Student 从不读取特权输入。
 - 快照保存为每 rank 的 CPU 分片，临时装入 actor 评分后在 finally 中恢复 Student；
   不更新 optimizer 和 reference policy。检查点保存 Teacher 分片及对应步数。
@@ -293,14 +294,19 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 ## 当前 2B 实验设置
 
 本机另有明确的无 KL 两卡实验入口 `scripts/train_a800_2gpu_nokl.sh`：
-默认 GPU `1,2`，默认纯 GRPO，也支持 `TRAINING_MODE=grpo_opsd`（别名 `groove`）；
+默认 GPU `0,3`，默认 `TRAINING_MODE=grpo_opsd`（别名 `groove`）启用 RLSD，
+显式设置 `TRAINING_MODE=grpo` 可选择纯 GRPO；
+默认 Python 为 `/data/home/yangzesheng/.conda/envs/groove/bin/python`，
+模型为 `/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`，均支持相应环境变量覆盖。
+该两卡入口默认 `NCCL_CUMEM_HOST_ENABLE=0` 并传给 Ray worker，规避本机通信初始化崩溃。
+同时默认 `NCCL_P2P_DISABLE=1`，GPU 0、3 使用已实测通过的 SHM 通信路径。
 两种模式的损失/奖励 KL 都关闭且系数为 0，全局 batch 为
 32 组 × 8 条回答，PPO mini-batch 32，单卡 token 预算 32768。
 4,000 条数据的一轮为 125 步，每 5 步验证并保存，保持每 160 道题的验证间隔。
-GRPO + OPSD 默认采用仅正优势 RLSD，Teacher 每 10 步同步、第 40 步衰减到零
+GRPO + OPSD 默认采用仅正优势 RLSD，Teacher 每 5 步同步、第 40 步衰减到零
 （占一轮 125 步的 32%），此后普通 GRPO 更新；`OPSD_ADVANTAGE_MODE=opsd` 可选原加法对照。
 GRPO 使用原生 V1 和默认在线 W&B；GRPO + OPSD 使用项目 Trainer 和离线 W&B。
-GPU 3 推理独立接管原进程；训练结束只恢复 GPU 1–2，检查点 world size 为 2。
+检查点 world size 为 2。
 这是用户指定的无 KL 实验，不改变下面四卡与 Siton 基线入口的默认 KL。
 
 独立实验脚本使用以下设置：

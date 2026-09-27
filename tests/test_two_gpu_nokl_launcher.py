@@ -37,6 +37,8 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         binary.write_text(f'#!{sys.executable}\nimport json,os,sys\n'
                           'print(json.dumps({"args":sys.argv[1:],'
                           '"gpus":os.environ["CUDA_VISIBLE_DEVICES"],'
+                          '"nccl_cumem_host":os.environ["NCCL_CUMEM_HOST_ENABLE"],'
+                          '"nccl_p2p_disable":os.environ["NCCL_P2P_DISABLE"],'
                           '"wandb":os.environ["WANDB_MODE"]}))\n')
         binary.chmod(0o755)
         self.env = {key: value for key, value in os.environ.items() if key in
@@ -54,11 +56,11 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         with initialize_config_dir(version_base=None, config_dir=str(ROOT / 'configs')):
             return captured, compose(config_name='groove', overrides=captured['args'][2:])
 
-    def test_two_gpu_training_uses_batch_32_and_removes_reference_policy(self):
-        captured, config = self.config(self.launch())
+    def test_explicit_grpo_uses_batch_32_and_removes_reference_policy(self):
+        captured, config = self.config(self.launch({'TRAINING_MODE': 'grpo'}))
         actor = config.actor_rollout_ref.actor
         rollout = config.actor_rollout_ref.rollout
-        self.assertEqual(captured['gpus'], '1,2')
+        self.assertEqual(captured['gpus'], '0,3')
         self.assertEqual(config.trainer.n_gpus_per_node, 2)
         self.assertEqual(config.data.train_batch_size, 32)
         self.assertEqual(actor.ppo_mini_batch_size, 32)
@@ -94,14 +96,21 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertNotEqual(self.launch(overrides).returncode, 0)
 
-    def test_rlsd_and_alias_use_two_gpu_batch_32_without_reference_kl(self):
-        for mode in ('grpo_opsd', 'groove'):
+    def test_default_rlsd_explicit_mode_and_alias_use_two_gpu_batch_32_without_reference_kl(self):
+        for mode in (None, 'grpo_opsd', 'groove'):
             with self.subTest(mode=mode):
-                captured, config = self.config(self.launch({'TRAINING_MODE': mode}))
+                overrides = {} if mode is None else {'TRAINING_MODE': mode}
+                captured, config = self.config(self.launch(overrides))
                 validate_objective_config(config)
                 self.assertEqual(trainer_backend(config), 'groove_opsd')
+                self.assertEqual(config.actor_rollout_ref.model.path,
+                                 '/data/home/yangzesheng/models/ckpts/Qwen3.5-2B')
                 actor, rollout = config.actor_rollout_ref.actor, config.actor_rollout_ref.rollout
-                self.assertEqual(captured['gpus'], '1,2')
+                self.assertEqual(captured['gpus'], '0,3')
+                self.assertEqual(captured['nccl_cumem_host'], '0')
+                self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.NCCL_CUMEM_HOST_ENABLE, '0')
+                self.assertEqual(captured['nccl_p2p_disable'], '1')
+                self.assertEqual(config.ray_kwargs.ray_init.runtime_env.env_vars.NCCL_P2P_DISABLE, '1')
                 self.assertEqual(config.trainer.n_gpus_per_node, 2)
                 self.assertEqual(config.data.train_batch_size, 32)
                 self.assertEqual(actor.ppo_mini_batch_size, 32)
@@ -121,7 +130,7 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
                 self.assertEqual(config.groove.rlsd_lambda_initial, .5)
                 self.assertEqual(config.groove.rlsd_lambda_decay_steps, 40)
                 self.assertEqual(config.groove.rlsd_clip_range, .2)
-                self.assertEqual(config.groove.rlsd_teacher_sync_interval, 10)
+                self.assertEqual(config.groove.rlsd_teacher_sync_interval, 5)
                 self.assertFalse(config.trainer.use_v1)
                 self.assertFalse(config.algorithm.filter_groups.enable)
                 self.assertEqual(captured['wandb'], 'offline')
@@ -165,9 +174,12 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
 
     def test_cli_priority_and_quoted_paths_survive_array_expansion(self):
         path = str(self.project / 'validation outputs')
+        model_path = str(self.project / 'model weights')
         captured, config = self.config(self.launch(
-            {'VALIDATION_DATA_DIR': path}, ('actor_rollout_ref.actor.optim.lr=5e-7',)))
+            {'VALIDATION_DATA_DIR': path, 'MODEL_PATH': model_path},
+            ('actor_rollout_ref.actor.optim.lr=5e-7',)))
         self.assertEqual(config.trainer.validation_data_dir, path)
+        self.assertEqual(config.actor_rollout_ref.model.path, model_path)
         self.assertEqual(config.actor_rollout_ref.actor.optim.lr, 5e-7)
         self.assertEqual(captured['args'][-1], 'actor_rollout_ref.actor.optim.lr=5e-7')
 

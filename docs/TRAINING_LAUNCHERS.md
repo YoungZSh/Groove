@@ -9,11 +9,19 @@
 
 ### 本机两卡、batch 32、无 KL
 
-`scripts/train_a800_2gpu_nokl.sh` 是完整独立的本机实验脚本，默认只选择 GPU `1,2`。
+`scripts/train_a800_2gpu_nokl.sh` 是完整独立的本机实验脚本，默认只选择 GPU `0,3`。
+默认 Python 为 `/data/home/yangzesheng/.conda/envs/groove/bin/python`，
+模型为 `/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`，
+仍支持通过 `PYTHON_BIN`、`MODEL_PATH` 覆盖。
+本机两卡默认 `NCCL_CUMEM_HOST_ENABLE=0` 并传入 Ray worker，规避本机驱动在
+`ncclCuMemHostEnable/cuMemCreate` 的初始化崩溃；此设置仅改变通信内存分配路径。
+GPU 0、3 同时默认 `NCCL_P2P_DISABLE=1`，通过 SHM 通信，规避实测的直接 P2P all-reduce 超时。
+这两个设置下已通过双卡 NCCL、FSDP 初始化和冻结 Teacher 评分/每 5 步同步测试。
 它使用全局 prompt batch 和 PPO mini-batch 均为 `32`，每题 `8` 条 rollout，
 学习率 `1e-6`、回答上限 `1024`、一个 PPO epoch；4,000 条训练数据的一轮为 125 步。
 每 5 步验证和保存一次，对应处理 160 道训练题，保持与原 batch 16、每 10 步验证相同的题数间隔。
-默认运行纯 GRPO，也支持 `TRAINING_MODE=grpo_opsd`（别名 `groove`）运行仅正优势 RLSD。
+默认 `TRAINING_MODE=grpo_opsd`（别名 `groove`），运行 GRPO + OPSD 的仅正优势 RLSD 模式。
+纯 GRPO 对照需显式设置 `TRAINING_MODE=grpo`；每次运行仍须指定新的 `EXPERIMENT_NAME`。
 两种模式的损失 KL 和奖励 KL 都关闭，两个系数均为 0，因此不加载参考策略。
 现有四卡及 Siton 脚本的默认 KL 设置保持原样。
 
@@ -22,24 +30,24 @@
 验证一次提交全部 191 题，验证温度为 0。完整验证回答、最佳检查点及 W&B 日志照常保存。
 
 ```bash
-EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
+EXPERIMENT_NAME=qwen35-2b-rlsd-positive-nokl-2gpu-unique-run \
   bash scripts/train_a800_2gpu_nokl.sh
 
-TRAINING_MODE=grpo_opsd EXPERIMENT_NAME=qwen35-2b-rlsd-positive-nokl-2gpu-unique-run \
+TRAINING_MODE=grpo EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
   bash scripts/train_a800_2gpu_nokl.sh
 ```
 
 纯 GRPO 使用原生 V1 Trainer，默认在线 W&B；GRPO + OPSD 使用项目 Trainer，W&B 离线。
 训练集分别默认选择 `vstar_grpo_4000_seed20260917` / `vstar_opsd_4000_seed20260917`，
 均支持 `DATA_DIR` 覆盖，验证文件仍独立使用全部 191 题。
-本机两卡试验采用 **40 步线性衰减**，Teacher 每 10 步同步：
+本机两卡试验采用 **40 步线性衰减**，Teacher 每 5 步同步：
 `lambda_s = 0.5 * max(1 - global_step / 40, 0)`。
 第 40 步起权重归一，跳过 Analyzer/Teacher 评分，使用普通 GRPO 更新。
 在这一轮 125 步训练中，40 步占 32%。可用 `RLSD_LAMBDA_DECAY_STEPS` 独立调整；
 四卡和 Siton 默认仍为 50 步，衰减设置不按 batch 或总训练步数自动缩放。
 设置 `OPSD_ADVANTAGE_MODE=opsd` 可以运行相同两卡、batch 32、无 KL 的原加法对照。
 
-当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
+历史 GPU 1、2 训练配置中，当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
 GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练前只停止 GPU 1–2
 服务；训练结束后只恢复这两张卡，其恢复配置使用 `training_world_size=2`。
 不要正常终止仍管理 GPU 3 的共享监督器：它的清理逻辑会停止所有受管服务。
@@ -107,12 +115,13 @@ GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练�
 | `RLSD_LAMBDA_INITIAL` | `0.5` | 混合系数的 step 0 值 |
 | `RLSD_LAMBDA_DECAY_STEPS` | 本机两卡 `40`；四卡/Siton `50` | 按日志 global step 线性衰减至零的步数 |
 | `RLSD_CLIP_RANGE` | `0.2` | 原始概率比限制在 `[0.8, 1.2]` |
-| `RLSD_TEACHER_SYNC_INTERVAL` | `10` | 每完成多少次外循环更新复制一次 Student 参数 |
+| `RLSD_TEACHER_SYNC_INTERVAL` | 本机两卡 `5`；四卡/Siton `10` | 每完成多少次外循环更新复制一次 Student 参数 |
 
 本机两卡第 1 步 lambda 为 0.4875，第 40 步起为零；
 四卡/Siton 第 1 步 lambda 为 0.49，第 50 步起为零。归零后跳过 Analyzer/Teacher 评分。
-Teacher 在第 1–10 步使用初始 Student；第 11 步开始使用完成 10 次更新的 Student，
-依此类推。Teacher 不使用 EMA，也不进行独立优化。负优势仍参与 PPO 学习。
+本机两卡 Teacher 在第 1–5 步使用初始 Student，第 6–10 步使用完成第 5 步更新的 Student，依此类推。
+四卡/Siton 仍在第 1–10 步使用初始 Student，第 11 步开始使用完成 10 次更新的 Student。
+Teacher 不使用 EMA，也不进行独立优化。负优势仍参与 PPO 学习。
 四卡与 Siton 保留模型 2B、1024 回答长度、batch 16、clip 0.2/0.2 和 reference KL 0.01；
 未自动照搬上游 8B、4096 长度或关闭 KL 的设置。4000 题一轮为 250 步，50 步占 20%。
 
@@ -139,7 +148,8 @@ Teacher 快照随 actor 检查点保存，最佳检查点包含相同文件；�
 权重均值与范围、上下界裁剪比例和实际修正与 GRPO 的 RMS 比值。
 token 审计保留有效权重及实际优势修正，并标记 `advantage_mode=rlsd_positive`。
 
-原生 V1 需要 **TransferQueue 0.1.10**。本机 groove 环境已安装；其他机器需要在其训练环境安装：
+原生 V1 的纯 GRPO/DAPO 需要 **TransferQueue 0.1.10**；GRPO + OPSD 的项目 Trainer
+不需要这一可选依赖。使用原生 V1 前需确认训练环境已安装：
 
 ```bash
 python -m pip install 'TransferQueue==0.1.10'

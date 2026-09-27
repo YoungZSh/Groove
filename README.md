@@ -87,7 +87,7 @@ checkpoints/      训练检查点
 本机已建立的环境：
 
 ```bash
-PYTHONPATH="$PWD/src" /ssd/home/zc/miniconda3/envs/groove/bin/python \
+PYTHONPATH="$PWD/src" /data/home/yangzesheng/.conda/envs/groove/bin/python \
   -m unittest discover -s tests -v
 bash -n scripts/train_a800_4gpu.sh
 bash -n scripts/train_siton_2gpu.sh

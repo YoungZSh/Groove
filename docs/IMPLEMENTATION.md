@@ -173,13 +173,16 @@ The four-card profile uses 16 agent workers, 8 reward workers for DAPO
 8, 1 and 32768 respectively.
 See [standalone launchers](TRAINING_LAUNCHERS.md) for full machine settings.
 
-The additional local `scripts/train_a800_2gpu_nokl.sh` profile uses GPUs 1,2,
+The additional local `scripts/train_a800_2gpu_nokl.sh` profile uses GPUs 0,3,
 global prompt/PPO mini-batch 32, 8 rollouts, 32768-token per-GPU budgets,
 16 agent workers, 4 reward workers and full-set validation. Both loss and reward
-KL are disabled. It defaults to native-V1 GRPO and also supports `grpo_opsd`
-(`groove` alias), which selects the project Trainer and positive-only RLSD with
-offline W&B. Its 4000-row epoch is 125 steps, with validation and checkpoints
-every 5 steps. RLSD retains 10-step Teacher synchronization and uses the requested
+KL are disabled. It defaults to `grpo_opsd` (`groove` alias), selecting the
+project Trainer and positive-only RLSD with offline W&B. Explicit `TRAINING_MODE=grpo`
+selects the native-V1 baseline. Its local Python and model defaults are
+`/data/home/yangzesheng/.conda/envs/groove/bin/python` and
+`/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`, with environment overrides supported.
+Its 4000-row epoch is 125 steps, with validation and checkpoints
+every 5 steps. RLSD uses 5-step Teacher synchronization and the requested
 40-step linear decay (32% of this epoch), then ordinary GRPO updates. The batch
 change does not automatically rescale the schedule.
 

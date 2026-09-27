@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Standalone Qwen3.5-2B GRPO or GRPO + OPSD without KL on two local A800 GPUs.
 # This file is complete: it never sources or calls another launcher.
-# Global prompt batch is 32 with 8 rollouts; GPU 3 is reserved for inference.
-# Select TRAINING_MODE=grpo (default) or grpo_opsd (groove is an alias).
+# Global prompt batch is 32 with 8 rollouts on physical GPUs 0 and 3.
+# Defaults to grpo_opsd with positive-only RLSD; select grpo for the baseline.
+# groove is an alias for grpo_opsd.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # ---- Machine settings: edit these when copying this file to a new experiment. ----
-export PYTHON_BIN="${PYTHON_BIN:-/ssd/home/zc/miniconda3/envs/groove/bin/python}"
-MODEL_PATH="${MODEL_PATH:-/ssd/home/zc/yzs/models/ckpts/Qwen3.5-2B}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2}"
+export PYTHON_BIN="${PYTHON_BIN:-/data/home/yangzesheng/.conda/envs/groove/bin/python}"
+MODEL_PATH="${MODEL_PATH:-/data/home/yangzesheng/models/ckpts/Qwen3.5-2B}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,3}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export N_GPUS="${N_GPUS:-2}"
 EXPECTED_GPUS=2
@@ -26,7 +27,7 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-null}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 # ---- Experiment and datasets. Each formal run must have its own name. ----
-TRAINING_MODE="${TRAINING_MODE:-grpo}"
+TRAINING_MODE="${TRAINING_MODE:-grpo_opsd}"
 : "${EXPERIMENT_NAME:?Set a new EXPERIMENT_NAME for each experiment.}"
 SEED="${SEED:-20260904}"
 case "$TRAINING_MODE" in
@@ -120,7 +121,7 @@ OPSD_ADVANTAGE_MODE="${OPSD_ADVANTAGE_MODE:-rlsd_positive}"
 RLSD_LAMBDA_INITIAL="${RLSD_LAMBDA_INITIAL:-0.5}"
 RLSD_LAMBDA_DECAY_STEPS="${RLSD_LAMBDA_DECAY_STEPS:-40}"
 RLSD_CLIP_RANGE="${RLSD_CLIP_RANGE:-0.2}"
-RLSD_TEACHER_SYNC_INTERVAL="${RLSD_TEACHER_SYNC_INTERVAL:-10}"
+RLSD_TEACHER_SYNC_INTERVAL="${RLSD_TEACHER_SYNC_INTERVAL:-5}"
 export ANALYZER_BASE_URL="${ANALYZER_BASE_URL:-http://127.0.0.1:8002/v1}"
 export ANALYZER_API_KEY="${ANALYZER_API_KEY:-unused}"
 export ANALYZER_MODEL=Qwen3.8-27B
@@ -160,6 +161,10 @@ export RAY_OBJECT_STORE_GIB="${RAY_OBJECT_STORE_GIB:-8}"
 export RAY_MEMORY_MONITOR_REFRESH_MS="${RAY_MEMORY_MONITOR_REFRESH_MS:-100}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+# This host's driver crashes in ncclCuMemHostEnable/cuMemCreate during FSDP init.
+export NCCL_CUMEM_HOST_ENABLE="${NCCL_CUMEM_HOST_ENABLE:-0}"
+# Physical GPUs 0 and 3 require SHM transport; direct P2P all-reduce times out.
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_proxy}"
 for address in $(hostname -I 2>/dev/null || true); do NO_PROXY+=",$address"; done
 export no_proxy="$NO_PROXY"
@@ -368,7 +373,7 @@ RAY=(
   transfer_queue.backend.SimpleStorage.num_data_storage_units=2
 )
 
-for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS; do
+for variable in NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_CUMEM_HOST_ENABLE NCCL_P2P_DISABLE NO_PROXY no_proxy OMP_NUM_THREADS; do
   RAY+=("++ray_kwargs.ray_init.runtime_env.env_vars.$variable=\"${!variable}\"")
 done
 

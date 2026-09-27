@@ -40,6 +40,24 @@ def _check_sharded_teacher(rank, folder):
 
 
 class FrozenTeacherTest(unittest.TestCase):
+    def test_five_step_schedule_keeps_initial_teacher_through_step_five(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        teacher = FrozenTeacher()
+        teacher.sync(model, 0, 5)
+        initial = model.weight.detach().clone()
+        for step in range(1, 11):
+            teacher.sync(model, step - 1, 5)
+            expected = initial if step <= 5 else after_five
+            with teacher.apply(model):
+                torch.testing.assert_close(model.weight, expected)
+            with torch.no_grad():
+                model.weight.add_(1.)
+            if step == 5:
+                after_five = model.weight.detach().clone()
+            if step % 5 == 0:
+                teacher.sync(model, step, 5)
+        self.assertEqual(teacher.step, 10)
+
     def test_two_rank_cpu_shards_roundtrip_and_restore_independently(self):
         with TemporaryDirectory() as folder:
             torch.multiprocessing.spawn(_check_sharded_teacher, args=(folder,), nprocs=2, join=True)
