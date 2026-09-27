@@ -13,7 +13,13 @@ from pathlib import Path
 from PIL import Image
 
 from groove.evidence import EvidenceBuilderConfig, TeacherEvidenceBuilder
-from groove.gemini_analyzer import GeminiAnalyzerConfig, GeminiAPIAnalyzer, NoDetectorFallback
+from groove.gemini_analyzer import (
+    GEMINI_SYSTEM_PROMPT,
+    GeminiAnalyzerConfig,
+    GeminiAPIAnalyzer,
+    NoDetectorFallback,
+    build_gemini_analysis_text,
+)
 from groove.schemas import GroupRollout
 
 
@@ -28,6 +34,10 @@ def load_groups(path: Path) -> list[GroupRollout]:
             raise ValueError(f"Line {line_number} must be a GroupRollout record; see docs/GEMINI_ANALYZER.md") from None
         if not group.rollouts:
             raise ValueError(f"Line {line_number} has no rollouts")
+        try:
+            build_gemini_analysis_text(group)
+        except ValueError:
+            raise ValueError(f"Line {line_number} requires a nonempty ground_truth answer") from None
         image_path = group.image_path
         if not image_path.is_absolute():
             image_path = path.parent / image_path
@@ -77,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
         "groups_file": str(args.groups.resolve()),
         "groups_sha256": hashlib.sha256(args.groups.read_bytes()).hexdigest(),
         "group_count": len(groups),
+        "analysis_protocol": "ground-truth-shared-rule-v1",
+        "system_prompt_sha256": hashlib.sha256(GEMINI_SYSTEM_PROMPT.encode()).hexdigest(),
         "config": {item.name: getattr(config, item.name) for item in fields(config) if item.name != "api_key"},
     })
     analyzer = GeminiAPIAnalyzer(config)

@@ -298,6 +298,7 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
             "groove/evidence_error_fraction": status_counts["error"] / group_count,
             "groove/route_visual_fraction": route_counts["visual"] / ready_count,
             "groove/route_text_fraction": route_counts["text"] / ready_count,
+            "groove/route_unknown_fraction": route_counts["unknown"] / ready_count,
             "groove/focus_sanitized_fraction": sanitized_count / ready_count,
             "groove/mixed_group_fraction": mixed_group_count / group_count,
             "groove/correct_rollout_fraction": sum(correct_counts) / max(batch_size, 1),

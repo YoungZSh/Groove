@@ -75,7 +75,7 @@ def main() -> None:
         "## Aggregate signal",
         "",
         f"- Evidence ready rate: {statuses['ready']}/{len(evidence)} ({statuses['ready'] / max(len(evidence), 1):.1%})",
-        f"- Analyzer routes: visual/DINO {routes['visual']}, text/OCR {routes['text']}",
+        f"- Evidence types: visual {routes['visual']}, text {routes['text']}, unknown {routes['unknown']}",
         f"- Mean signed OPSD advantage: {mean(values('actor/groove_opsd_advantage_mean')):.6f}",
         f"- Mean OPSD active-token ratio: {mean(values('actor/groove_opsd_active_token_ratio')):.1%}",
         f"- Mean positive/negative OPSD token fractions: "

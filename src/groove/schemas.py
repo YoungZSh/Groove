@@ -25,6 +25,8 @@ class GroupRollout(BaseModel):
     question: str
     image_path: Path
     rollouts: list[Rollout]
+    # Optional for legacy analyzers; required by the GT-assisted Gemini path.
+    ground_truth: str | None = None
 
     @property
     def is_mixed(self) -> bool:
@@ -75,13 +77,13 @@ class FocusProgram(BaseModel):
 
     group_summary: str
     crucial_evidence: str = ""
-    crucial_evidence_type: Literal["text", "visual"] = "visual"
+    crucial_evidence_type: Literal["text", "visual", "unknown"] = "visual"
     tool_route: Literal["ocr", "dino", "gemini"] = "dino"
     visible_focus_instruction: str
     grounding_queries: list[str] = Field(min_length=1, max_length=3)
     selected_candidate_ids: list[str] = Field(default_factory=list, max_length=3)
     context_margin: float = Field(default=0.12, ge=0.10, le=0.15)
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    confidence: float | None = Field(default=0.5, ge=0.0, le=1.0)
     tool_regions: list[ToolRegion] = Field(default_factory=list)
 
     @field_validator("grounding_queries")

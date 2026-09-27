@@ -262,8 +262,14 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 - 系统提示词描述的是视觉证据任务，不是自我进化任务。
   不要重新引入“self evolution”措辞或相关产物。
 - 输入包含原始图像、问题，以及由程序分别整理的成功/失败推理列表。
-- 不得接收标准答案、数值奖励、解析后的预测标签或 rollout ID。
-- 不得重新判断结果标签，也不得回答问题。
+- 原 Qwen Analyzer 不接收标准答案、数值奖励、解析后的预测标签或 rollout ID，
+  不重新判断结果标签，也不回答问题。
+- 独立 Gemini 离线入口按用户要求接收 `ground_truth`，以标准答案为主要参考复核轨迹；
+  原成功/失败标签可能有误，推理仍需图像核验，冲突写入私有诊断，不回写训练奖励。
+  Gemini 最终只输出 `group_summary`、`visible_focus_instruction`、`selected_candidate_ids`：
+  分别为一句诊断、答案中立的共用核验规则、已检查的候选 ID。
+  路由和查询由程序从工具记录补齐；未分类证据记 `unknown`，未自评置信度记 `null`。
+  Ground Truth 和诊断不得直接拼进 Teacher/Student 输入；其他 Analyzer 的输入边界不变。
 - 工具描述通过原生工具注册，并由 Qwen 聊天模板注入；
   不要在系统提示词中重复工具描述。
 - Grounding 和 OCR 查询必须使用简短的英文视觉目标描述。

@@ -83,7 +83,7 @@ class GrooveTrainerTest(unittest.TestCase):
                 return SimpleNamespace(
                     status="ready",
                     focus=SimpleNamespace(
-                        crucial_evidence_type="visual",
+                        crucial_evidence_type="unknown" if group.uid.endswith("group-a") else "visual",
                         visible_focus_instruction="Inspect the object.",
                         tool_regions=[],
                     ),
@@ -137,6 +137,9 @@ class GrooveTrainerTest(unittest.TestCase):
         self.assertEqual(tracker["max_active"], 2)
         self.assertEqual(metrics["groove/evidence_concurrency"], 2.0)
         self.assertEqual(metrics["groove/group_count"], 2.0)
+        self.assertEqual(metrics["groove/route_visual_fraction"], 0.5)
+        self.assertEqual(metrics["groove/route_text_fraction"], 0.0)
+        self.assertEqual(metrics["groove/route_unknown_fraction"], 0.5)
         self.assertEqual(metrics["groove/correct_rollout_fraction"], 0.5)
         self.assertEqual(metrics["groove/analyzer_repetition_trimmed_fraction"], 0.125)
         self.assertIn("timing_s/groove/evidence_build_wall", metrics)
