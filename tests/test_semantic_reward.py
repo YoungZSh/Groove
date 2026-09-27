@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from groove.semantic_reward import (
     JUDGE_SYSTEM_PROMPT,
     _judge_one,
     compute_score,
+    compute_score_batched,
     extract_answer,
     find_inner_repetition,
     judge_prompt,
@@ -47,6 +49,10 @@ class SemanticRewardLoopTest(unittest.TestCase):
             for request in urlopen.call_args_list:
                 self.assertEqual(json.loads(request.args[0].data)["max_completion_tokens"], 512)
             self.assertEqual(result["accuracy"], 1.)
+            self.assertEqual(result["judge_attempts"], 2.)
+            self.assertEqual(result["judge_retries_exhausted"], 0.)
+            self.assertFalse(records[1]["judge_retries_exhausted"])
+            self.assertIsNone(records[1]["fallback_accuracy"])
 
     def test_timeout_audit_does_not_reuse_previous_response(self):
         response = MagicMock()
@@ -60,12 +66,17 @@ class SemanticRewardLoopTest(unittest.TestCase):
             patch("groove.semantic_reward.json.load", return_value=truncated),
             patch("groove.semantic_reward.time.sleep"),
         ):
-            with self.assertRaises(RuntimeError):
-                _judge_one("What color?", "green", "blue")
+            result = _judge_one("What color?", "green", "blue")
+            self.assertEqual(result["accuracy"], 0.)
+            self.assertAlmostEqual(result["score"], -0.2)
+            self.assertEqual(result["judge_attempts"], 2.)
+            self.assertEqual(result["judge_retries_exhausted"], 1.)
             records = [json.loads(path.read_text()) for path in sorted(Path(folder).glob("*.json"))]
             self.assertEqual(records[1]["status"], "failed")
             self.assertEqual(records[1]["error_type"], "TimeoutError")
             self.assertIsNone(records[1]["response"])
+            self.assertTrue(records[1]["judge_retries_exhausted"])
+            self.assertEqual(records[1]["fallback_accuracy"], 0.)
 
     def test_scalar_reward_adapter_forwards_question_and_answers(self):
         expected = {"score": 1.0, "accuracy": 1.0}
@@ -125,6 +136,8 @@ class SemanticRewardLoopTest(unittest.TestCase):
         self.assertEqual(body["max_completion_tokens"], 512)
         self.assertEqual(result["score"], 1.0)
         self.assertEqual(result["format_reward"], 0.0)
+        self.assertEqual(result["judge_attempts"], 1.0)
+        self.assertEqual(result["judge_retries_exhausted"], 0.0)
 
     def test_judge_retries_disconnects_and_resets_without_changing_reward(self):
         response = MagicMock()
@@ -162,18 +175,87 @@ class SemanticRewardLoopTest(unittest.TestCase):
         self.assertEqual(result["accuracy"], 0.0)
         self.assertEqual(result["score"], 0.0)
 
-    def test_disconnect_retries_are_bounded_and_do_not_fabricate_a_score(self):
+    def test_disconnect_retries_are_bounded_and_flag_incorrect_fallback(self):
         error = http.client.RemoteDisconnected("closed before response")
         with (
             patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "2"}),
             patch("groove.semantic_reward.urllib.request.urlopen", side_effect=error) as urlopen,
             patch("groove.semantic_reward.time.sleep") as sleep,
         ):
-            with self.assertRaisesRegex(RuntimeError, "failed after retries") as caught:
-                _judge_one("What color?", "green", "<answer>green</answer>")
+            with self.assertLogs("groove.semantic_reward", level="WARNING") as logs:
+                result = _judge_one("What color?", "green", "<answer>green</answer>")
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(sleep.call_args_list, [call(0.5), call(1.0)])
-        self.assertIs(caught.exception.__cause__, error)
+        self.assertEqual(result["accuracy"], 0.0)
+        self.assertEqual(result["score"], 0.0)
+        self.assertEqual(result["judge_retries_exhausted"], 1.0)
+        self.assertEqual(result["judge_attempts"], 3.0)
+        self.assertIn("attempts=3 error_type=RemoteDisconnected; accuracy=0", logs.output[0])
+        self.assertNotIn("test-key", logs.output[0])
+
+    def test_invalid_judge_responses_exhaust_retries_without_losing_format_penalty(self):
+        invalid_payloads = [
+            {"choices": [{"finish_reason": "length", "message": {"content": "Judgement: 1"}}]},
+            {"choices": [{"message": {"content": "Still considering both possibilities."}}]},
+            {"choices": [{"message": {"content": "Judgement: 1\nJudgement: 0"}}]},
+            {"choices": []}, {"choices": None}, {},
+        ]
+        for payload in invalid_payloads:
+            for output, expected_score in [("<answer>green</answer>", 0.0), ("green", -0.2)]:
+                response = MagicMock()
+                response.__enter__.return_value = response
+                with (
+                    self.subTest(payload=payload, output=output),
+                    patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key",
+                                              "GROOVE_JUDGE_MAX_RETRIES": "1"}),
+                    patch("groove.semantic_reward.urllib.request.urlopen", return_value=response) as request,
+                    patch("groove.semantic_reward.json.load", return_value=payload),
+                    patch("groove.semantic_reward.time.sleep") as sleep,
+                ):
+                    result = _judge_one("What color?", "green", output)
+                    self.assertEqual(request.call_count, 2)
+                    sleep.assert_called_once_with(0.5)
+                    self.assertEqual(result["accuracy"], 0.0)
+                    self.assertAlmostEqual(result["score"], expected_score)
+                    self.assertEqual(result["judge_retries_exhausted"], 1.0)
+                    self.assertEqual(result["judge_attempts"], 2.0)
+
+    def test_default_six_attempts_and_mixed_batch_keep_other_rollouts(self):
+        def response(request, **_):
+            prompt = json.loads(request.data)["messages"][1]["content"]
+            if "[Model_answer]: ambiguous\n" in prompt:
+                payload = {"choices": [{"finish_reason": "length", "message": {"content": "Reason: still unsure"}}]}
+            else:
+                payload = {"choices": [{"finish_reason": "stop", "message": {"content": "Judgement: 1"}}]}
+            return io.StringIO(json.dumps(payload))
+
+        with (
+            patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "5",
+                                      "GROOVE_JUDGE_CONCURRENCY": "2"}),
+            patch("groove.semantic_reward.urllib.request.urlopen", side_effect=response) as request,
+            patch("groove.semantic_reward.time.sleep") as sleep,
+        ):
+            results = compute_score_batched(
+                ["visual_qa"] * 2, ["<answer>ambiguous</answer>", "<answer>green</answer>"],
+                ["green"] * 2, [{"question": "What color?"}] * 2,
+            )
+        self.assertEqual(request.call_count, 7)
+        self.assertEqual(sleep.call_args_list, [call(0.5), call(1.0), call(2.0), call(4.0), call(8.0)])
+        self.assertEqual([r["accuracy"] for r in results], [0., 1.])
+        self.assertEqual([r["score"] for r in results], [0., 1.])
+        self.assertEqual([r["judge_attempts"] for r in results], [6., 1.])
+        self.assertEqual([r["judge_retries_exhausted"] for r in results], [1., 0.])
+
+    def test_invalid_local_configuration_still_fails_before_judging(self):
+        for key, retries, error in [("", "5", RuntimeError), ("test-key", "-1", ValueError)]:
+            with (
+                self.subTest(key=bool(key), retries=retries),
+                patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": key, "GROOVE_JUDGE_MAX_RETRIES": retries}),
+                patch("groove.semantic_reward.urllib.request.urlopen") as request,
+                self.assertRaises(error),
+            ):
+                _judge_one("What color?", "green", "<answer>green</answer>")
+            request.assert_not_called()
 
     def test_bare_correct_answer_gets_format_penalty(self):
         response = MagicMock()

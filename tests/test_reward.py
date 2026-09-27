@@ -109,6 +109,38 @@ class RewardTest(unittest.TestCase):
         self.assertEqual(compute_score("generic", text, "Blue")["score"], 1.0)
         self.assertTrue(answers_match("**blue**", "blue"))
 
+    def test_trainer_logs_judge_exhaustion_for_each_batch_including_healthy_steps(self):
+        from groove.verl_trainer import GrooveRayPPOTrainer
+
+        trainer = GrooveRayPPOTrainer.__new__(GrooveRayPPOTrainer)
+        trainer.config = {"groove": {"enabled": False}}
+        for flags, count in [([1., 0., 0.], 1.), ([0., 0., 0.], 0.)]:
+            with self.subTest(flags=flags):
+                _, metrics = trainer._postprocess_advantages(object(), None, {
+                    "judge_retries_exhausted": flags, "judge_attempts": [6., 1., 6.],
+                })
+                self.assertEqual(metrics["reward/judge_retries_exhausted_count"], count)
+                self.assertAlmostEqual(metrics["reward/judge_retries_exhausted_fraction"], count / 3)
+                self.assertAlmostEqual(metrics["reward/judge_attempts_mean"], 13 / 3)
+                self.assertEqual(metrics["reward/judge_attempts_max"], 6.)
+
+    def test_rollout_dump_preserves_judge_flags_with_step_and_score(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+        with TemporaryDirectory() as folder:
+            RayPPOTrainer._write_generations(
+                ["question", "question"], ["answer A", "answer B"], ["B", "B"], [0., 1.],
+                {"judge_attempts": [6., 1.], "judge_retries_exhausted": [1., 0.]}, folder, 3,
+            )
+            rows = [json.loads(line) for line in (Path(folder) / "3.jsonl").read_text().splitlines()]
+        self.assertEqual([r["step"] for r in rows], [3, 3])
+        self.assertEqual([r["score"] for r in rows], [0., 1.])
+        self.assertEqual([r["judge_attempts"] for r in rows], [6., 1.])
+        self.assertEqual([r["judge_retries_exhausted"] for r in rows], [1., 0.])
+
     def test_final_line_must_be_last_nonempty_line(self):
         text = "FINAL: A\nI will revise this later."
         self.assertEqual(extract_option(text), "A")

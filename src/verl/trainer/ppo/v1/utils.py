@@ -39,6 +39,7 @@ class MetricsAggregator:
     def _init_aggregation_rules(self) -> dict[str, list[str]]:
         return {
             "sum": [
+                "reward/judge_retries_exhausted_count",
                 "training/off_policy/evicted_samples",
                 "validation/off_policy/evicted_samples",
                 "training/filter_groups/evicted_samples",

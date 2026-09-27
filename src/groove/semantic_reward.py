@@ -13,6 +13,7 @@ import concurrent.futures
 from datetime import datetime, timezone
 import http.client
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -30,6 +31,9 @@ from groove.vstar_bench import (
     compute_validation_score,
     question_without_response_format,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # Retain DeepEyes' question/reference/model-answer comparison and semantic
@@ -297,6 +301,7 @@ def _record_judge_attempt(directory, request_id, *, attempt, max_attempts, body,
     """Persist failed/recovered requests locally without headers or credentials."""
     if not directory:
         return
+    exhausted = error is not None and attempt == max_attempts
     record = {
         "request_id": request_id, "attempt": attempt, "max_attempts": max_attempts,
         "at_utc": datetime.now(timezone.utc).isoformat(),
@@ -306,6 +311,8 @@ def _record_judge_attempt(directory, request_id, *, attempt, max_attempts, body,
         "question": question, "ground_truth": ground_truth,
         "student_output": output, "extracted_answer": answer,
         "request_body": body, "response": payload,
+        "judge_retries_exhausted": exhausted,
+        "fallback_accuracy": 0.0 if exhausted else None,
     }
     credential = os.environ.get("GROOVE_JUDGE_API_KEY", "")
 
@@ -345,6 +352,8 @@ def _judge_one(
     max_retries = int(os.environ.get("GROOVE_JUDGE_MAX_RETRIES", "5"))
     if not api_key:
         raise RuntimeError("GROOVE_JUDGE_API_KEY is required")
+    if max_retries < 0:
+        raise ValueError("GROOVE_JUDGE_MAX_RETRIES must be non-negative")
 
     answer_weight, format_weight = _validate_reward_weights(
         answer_reward_weight,
@@ -380,7 +389,8 @@ def _judge_one(
     )
     last_error: Exception | None = None
     audit_dir = os.environ.get("GROOVE_JUDGE_AUDIT_DIR", "").strip()
-    request_id = uuid.uuid4().hex if audit_dir else None
+    request_id = uuid.uuid4().hex
+    exhausted = False
     for attempt in range(max_retries + 1):
         payload = None
         try:
@@ -397,41 +407,9 @@ def _judge_one(
                     body=body, question=question, ground_truth=ground_truth, output=output,
                     answer=answer, payload=payload, error=None,
                 )
-            answer_reward = 0.0 if severe_repetition and apply_training_shaping else correct
-            format_reward = 0.0 if format_valid else -1.0
-            weighted_answer_reward = answer_weight * answer_reward
-            weighted_format_reward = format_weight * format_reward
-            combined_reward = weighted_answer_reward + weighted_format_reward
-            # A repeated trajectory must never receive a positive reward, but
-            # it must not escape an already-negative format penalty either.
-            rewarded = min(combined_reward, 0.0) if severe_repetition and apply_training_shaping else combined_reward
-            return {
-                "score": rewarded,
-                # Preserve semantic accuracy for Analyzer grouping and
-                # diagnosis. Only score is consumed by GRPO/OPSD.
-                "accuracy": correct,
-                "answer_reward": answer_reward,
-                "format_reward": format_reward,
-                "weighted_answer_reward": weighted_answer_reward,
-                "weighted_format_reward": weighted_format_reward,
-                "answer_reward_weight": answer_weight,
-                "format_reward_weight": format_weight,
-                "format_valid": float(format_valid),
-                # Retain the established metric name, now with strict
-                # terminal-tag semantics.
-                "has_answer_tag": float(format_valid),
-                "answer_characters": float(len(answer)),
-                "severe_repetition": float(severe_repetition),
-                "repetition_zeroed_reward": float(apply_training_shaping and severe_repetition and correct > 0.0),
-                "repetition_start_character": float(repetition_hit.start if repetition_hit else -1),
-                "repetition_period_characters": float(repetition_hit.period if repetition_hit else 0),
-                "repetition_count": float(repetition_hit.repeats if repetition_hit else 0),
-                "repetition_total_characters": float(
-                    repetition_hit.total_characters if repetition_hit else 0
-                ),
-            }
+            break
         except (
-            KeyError, ValueError, TimeoutError, ConnectionError,
+            KeyError, ValueError, TypeError, IndexError, TimeoutError, ConnectionError,
             http.client.HTTPException, urllib.error.URLError,
         ) as exc:
             last_error = exc
@@ -442,7 +420,51 @@ def _judge_one(
             )
             if attempt < max_retries:
                 time.sleep(0.5 * (2**attempt))
-    raise RuntimeError(f"remote semantic judge failed after retries: {last_error}") from last_error
+    else:
+        # Explicit run policy: an unscorable rollout is treated as incorrect,
+        # with diagnostics separating this fallback from a valid Judge verdict.
+        correct = 0.0
+        exhausted = True
+        logger.warning(
+            "Judge retries exhausted: request_id=%s attempts=%d error_type=%s; accuracy=0",
+            request_id, max_retries + 1, type(last_error).__name__,
+        )
+
+    answer_reward = 0.0 if severe_repetition and apply_training_shaping else correct
+    format_reward = 0.0 if format_valid else -1.0
+    weighted_answer_reward = answer_weight * answer_reward
+    weighted_format_reward = format_weight * format_reward
+    combined_reward = weighted_answer_reward + weighted_format_reward
+    # A repeated trajectory must never receive a positive reward, but
+    # it must not escape an already-negative format penalty either.
+    rewarded = min(combined_reward, 0.0) if severe_repetition and apply_training_shaping else combined_reward
+    return {
+        "score": rewarded,
+        # Analyzer uses accuracy, including the explicit zero fallback above.
+        # Only score, with format/repetition shaping, is optimized by GRPO/OPSD.
+        "accuracy": correct,
+        "judge_attempts": float(attempt + 1),
+        "judge_retries_exhausted": float(exhausted),
+        "answer_reward": answer_reward,
+        "format_reward": format_reward,
+        "weighted_answer_reward": weighted_answer_reward,
+        "weighted_format_reward": weighted_format_reward,
+        "answer_reward_weight": answer_weight,
+        "format_reward_weight": format_weight,
+        "format_valid": float(format_valid),
+        # Retain the established metric name, now with strict
+        # terminal-tag semantics.
+        "has_answer_tag": float(format_valid),
+        "answer_characters": float(len(answer)),
+        "severe_repetition": float(severe_repetition),
+        "repetition_zeroed_reward": float(apply_training_shaping and severe_repetition and correct > 0.0),
+        "repetition_start_character": float(repetition_hit.start if repetition_hit else -1),
+        "repetition_period_characters": float(repetition_hit.period if repetition_hit else 0),
+        "repetition_count": float(repetition_hit.repeats if repetition_hit else 0),
+        "repetition_total_characters": float(
+            repetition_hit.total_characters if repetition_hit else 0
+        ),
+    }
 
 
 def _judge_vstar_validation(output: str, ground_truth: str, extra_info: dict) -> dict[str, float]:

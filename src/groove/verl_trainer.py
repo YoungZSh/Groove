@@ -18,6 +18,7 @@ from PIL import Image
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.reward_metrics import judge_retry_metrics
 from verl.utils.model import compute_position_id_with_mask
 
 from .analyzer import OpenAIAnalyzerConfig, OpenAICompatibleAnalyzer
@@ -323,10 +324,10 @@ class GrooveRayPPOTrainer(RayPPOTrainer):
 
     @staticmethod
     def _reward_component_metrics(reward_extra_infos_dict: dict[str, list] | None) -> dict[str, float]:
-        """Expose the two terminal-reward components in the normal trainer logs."""
+        """Expose terminal-reward components and Judge retry health per step."""
         if not reward_extra_infos_dict:
             return {}
-        metrics = {}
+        metrics = judge_retry_metrics(reward_extra_infos_dict)
         for key in (
             "answer_reward",
             "format_reward",

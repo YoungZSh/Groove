@@ -229,7 +229,15 @@ Judge 使用与训练相同的“简短依据 + 最终二值判定”协议、�
 提示词拒绝单答案题中未消解的候选枚举和矛盾结论，同时允许真正的多属性答案。
 校准后的简短提示词以所问属性为准，允许普通色差、次要点缀和明确区分对象的附加描述，
 不因未询问属性的不确定性而自动判错；固定说明与示例总量控制在 400 英文词以内。
-重试耗尽会报错，不静默回退成规则分数。与旧版宽松 Judge 比较时须统一协议重评。
+按用户指定策略，首次请求加默认 5 次重试仍无有效判定时，该 rollout 以 `accuracy=0`
+按错误答案处理，保留格式扣分并继续训练；请求超时/连接中断耗尽重试也采用该策略。
+训练期间验证同样设 `score=accuracy=0`，不使用规则分数替代。
+每条结果记录 `judge_attempts`、`judge_retries_exhausted`；重试内成功的耗尽标记为 0。
+每个训练 step 在常规日志与 W&B 中记录 `reward/judge_retries_exhausted_count`（rollout 数）、
+`reward/judge_retries_exhausted_fraction`、`reward/judge_attempts_mean`、`reward/judge_attempts_max`。
+未触发耗尽的 batch 也记录零值。逐条 rollout/验证 JSONL 保留对应字段；验证均值在 `val-aux` 下。
+`GROOVE_JUDGE_AUDIT_DIR` 继续保存失败响应，最终失败含 `fallback_accuracy=0`，
+另有含请求 ID 的警告日志。与旧版宽松 Judge 比较时须统一协议重评。
 修复格式指令污染前后的语义分数也需在同一协议下重评；原始回答、历史日志及 W&B 分数不自动回改。
 
 两份脚本的所有模式默认保存每次验证的全部 rollout（默认 191 条），包括训练前 step 0：

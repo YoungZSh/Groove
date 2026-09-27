@@ -166,6 +166,20 @@ class VisualQARewardManagerTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RewardDiagnosticsTest(unittest.TestCase):
+    def test_judge_exhaustion_counts_ignore_padding_and_absent_judge_fields(self):
+        fields = [
+            {"reward_extra_info": {"judge_retries_exhausted": 1., "judge_attempts": 6.}},
+            {"reward_extra_info": {"judge_retries_exhausted": 0., "judge_attempts": 6.}},
+            {"reward_extra_info": {"judge_retries_exhausted": 1., "judge_attempts": 100.}},
+            {"reward_extra_info": {"accuracy": 1.}},
+        ]
+        metrics = reward_extra_metrics(fields, [True, True, False, True])
+        self.assertEqual(metrics["reward/judge_retries_exhausted_count"], 1.)
+        self.assertEqual(metrics["reward/judge_retries_exhausted_fraction"], 0.5)
+        self.assertEqual(metrics["reward/judge_attempts_mean"], 6.)
+        self.assertEqual(metrics["reward/judge_attempts_max"], 6.)
+        self.assertEqual(reward_extra_metrics(fields, [False] * 4), {})
+
     def test_native_tensordict_field_access_preserves_per_row_reward_objects(self):
         from verl.utils.tensordict_utils import get_tensordict
 

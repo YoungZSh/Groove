@@ -217,14 +217,18 @@ class VStarValidationTest(unittest.TestCase):
         self.assertNotIn("Return the selected option letter.", prompt)
         self.assertEqual(info, before)
 
-    def test_validation_judge_failure_is_not_silently_converted_to_rule_score(self):
+    def test_validation_judge_exhaustion_is_flagged_zero_without_rule_fallback(self):
         with patch.dict("os.environ", {"GROOVE_JUDGE_API_KEY": "test-key", "GROOVE_JUDGE_MAX_RETRIES": "1"}), \
                 patch("groove.semantic_reward.urllib.request.urlopen",
                       side_effect=http.client.RemoteDisconnected("closed")) as request, \
                 patch("groove.semantic_reward.time.sleep"):
-            with self.assertRaisesRegex(RuntimeError, "failed after retries"):
-                compute_score("vstar_bench", "<answer>D</answer>", "D", self.info())
+            result = compute_score("vstar_bench", "<answer>D</answer>", "D", self.info())
         self.assertEqual(request.call_count, 2)
+        self.assertEqual(result["rule_accuracy"], 1.)
+        self.assertEqual(result["accuracy"], 0.)
+        self.assertEqual(result["score"], 0.)
+        self.assertEqual(result["judge_retries_exhausted"], 1.)
+        self.assertEqual(result["judge_attempts"], 2.)
 
     def test_training_reward_and_mixed_batch_order_are_preserved(self):
         expected = {"score": 0.8, "accuracy": 1.0}

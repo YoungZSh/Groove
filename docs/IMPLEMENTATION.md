@@ -103,8 +103,14 @@ decoding. `enable_thinking=false` remains set; the requested brief explanation i
 ordinary response text. Only the unique terminal verdict is used as `accuracy`;
 numbers in the explanation are never interpreted as scores. The unique terminal
 `Judgement` label may appear on the same line as the explanation; a standalone
-legacy `0` or `1` is also accepted. Ambiguous, missing, or token-truncated verdicts retry
-and eventually raise an error rather than becoming an incorrect-answer label.
+legacy `0` or `1` is also accepted. Ambiguous, missing, or token-truncated verdicts retry.
+Under the user-selected exhaustion policy, a rollout with no valid verdict after
+all attempts receives `accuracy=0` and normal format/repetition shaping. Training
+continues; Analyzer places this rollout in its failure group. This fallback is
+marked by `judge_retries_exhausted=1`, separately from a valid incorrect verdict.
+Every result includes `judge_attempts`; success on the final allowed attempt
+still has `judge_retries_exhausted=0`. Training-time validation shares this policy,
+retains `score=accuracy`, and never substitutes its diagnostic rule score.
 
 An optional `GROOVE_JUDGE_AUDIT_DIR` records failed attempts and eventual recovery,
 with the request body, Student answer, full response (including reasoning fields
@@ -112,6 +118,17 @@ and token usage), attempt number, and error type. Request headers are excluded
 and the API credential is redacted. Each call has a unique ID and atomic files
 for its retries; transport failures record a null response. This local diagnostic
 does not change the 512-token budget, retry schedule, prompt, or semantic score.
+An exhausted attempt additionally records `judge_retries_exhausted=true` and
+`fallback_accuracy=0`; a warning logs its request ID, attempt count, and error type
+without request text or credentials.
+
+Both training backends log per-update `reward/judge_retries_exhausted_count` and
+`reward/judge_retries_exhausted_fraction`, plus `reward/judge_attempts_mean` and
+`reward/judge_attempts_max`. Healthy batches explicitly log zero exhaustion.
+These metrics reach the normal console/file logger and the configured W&B logger
+(offline for GRPO + OPSD); the count measures rollouts, not failed HTTP attempts.
+Per-rollout JSONL files retain both fields alongside their step and reward;
+validation exports retain the same fields and expose their means under `val-aux`.
 
 The compact prompt uses four ordered criteria and five short examples. It judges the
 requested property: uncertainty about an unasked property (such as "coat or
@@ -129,9 +146,10 @@ reward dictionary or sent to the Student or Analyzer.
 
 Judge requests retry connection resets, disconnects before an HTTP response,
 and incomplete HTTP responses using the existing bounded exponential backoff.
-The default is five retries after the initial attempt. Exhaustion still raises
-an error, preserving its cause; transport failures never become fabricated
-correctness labels or zero rewards.
+The default is five retries after the initial attempt. Exhausted transport
+failures use the same explicitly flagged zero-accuracy policy. Local configuration
+errors, such as missing credentials or a negative retry count, still raise before
+sending a request. Existing historical records are not rewritten.
 
 The current launchers are `scripts/train_a800_4gpu.sh` and
 `scripts/train_siton_2gpu.sh`. Each is a complete independent experiment script;
