@@ -18,7 +18,12 @@
 GPU 0、3 同时默认 `NCCL_P2P_DISABLE=1`，通过 SHM 通信，规避实测的直接 P2P all-reduce 超时。
 这两个设置下已通过双卡 NCCL、FSDP 初始化和冻结 Teacher 评分/每 5 步同步测试。
 它使用全局 prompt batch 和 PPO mini-batch 均为 `32`，每题 `8` 条 rollout，
-学习率 `1e-6`、回答上限 `1024`、一个 PPO epoch；4,000 条训练数据的一轮为 125 步。
+回答上限 `1024`、一个 PPO epoch；4,000 条训练数据的一轮为 125 步。
+下一次纯 GRPO 实验恢复学习率 `1e-6`、保留熵奖励系数 `0.001`，
+使用原生 actor 损失 `L_PPO - 0.001 * H`，不改变 Judge 分数或 GRPO 优势。
+GRPO + OPSD 保持学习率 `1e-6`、熵系数 `0`。
+两种模式均可用 `LEARNING_RATE`、`ENTROPY_COEFF` 覆盖，命令行 Hydra 参数仍具有最高优先级。
+复现旧纯 GRPO 配置时显式使用 `LEARNING_RATE=1e-6 ENTROPY_COEFF=0`。
 每 5 步验证和保存一次，对应处理 160 道训练题，保持与原 batch 16、每 10 步验证相同的题数间隔。
 默认 `TRAINING_MODE=grpo_opsd`（别名 `groove`），运行 GRPO + OPSD 的仅正优势 RLSD 模式。
 纯 GRPO 对照需显式设置 `TRAINING_MODE=grpo`；每次运行仍须指定新的 `EXPERIMENT_NAME`。

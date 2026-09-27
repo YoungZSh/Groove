@@ -67,6 +67,8 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         self.assertEqual(rollout.n, 8)
         self.assertEqual(actor.ppo_epochs, 1)
         self.assertEqual(actor.optim.lr, 1e-6)
+        self.assertEqual(actor.entropy_coeff, 0.001)
+        self.assertEqual(trainer_backend(config), 'verl_v1_sync')
         self.assertFalse(actor.use_kl_loss)
         self.assertEqual(actor.kl_loss_coef, 0)
         self.assertFalse(config.algorithm.use_kl_in_reward)
@@ -117,6 +119,7 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
                 self.assertEqual(rollout.n, 8)
                 self.assertEqual(config.data.train_batch_size * rollout.n, 256)
                 self.assertEqual(actor.optim.lr, 1e-6)
+                self.assertEqual(actor.entropy_coeff, 0)
                 self.assertEqual(actor.ppo_epochs, 1)
                 self.assertEqual(actor.clip_ratio_low, .2)
                 self.assertEqual(actor.clip_ratio_high, .2)
@@ -188,6 +191,20 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         for mode in ('dapo', 'unknown'):
             with self.subTest(mode=mode):
                 self.assertNotEqual(self.launch({'TRAINING_MODE': mode}).returncode, 0)
+
+    def test_grpo_optimizer_environment_overrides_and_cli_priority(self):
+        overrides = {'TRAINING_MODE': 'grpo', 'LEARNING_RATE': '1e-6', 'ENTROPY_COEFF': '0'}
+        _, config = self.config(self.launch(overrides))
+        self.assertEqual(config.actor_rollout_ref.actor.optim.lr, 1e-6)
+        self.assertEqual(config.actor_rollout_ref.actor.entropy_coeff, 0)
+        captured, config = self.config(self.launch(overrides, (
+            'actor_rollout_ref.actor.optim.lr=3e-7',
+            'actor_rollout_ref.actor.entropy_coeff=0.002',
+        )))
+        self.assertEqual(config.actor_rollout_ref.actor.optim.lr, 3e-7)
+        self.assertEqual(config.actor_rollout_ref.actor.entropy_coeff, 0.002)
+        self.assertEqual(captured['args'][-1], 'actor_rollout_ref.actor.entropy_coeff=0.002')
+        self.assertFalse(need_reference_policy(config))
 
     def test_cli_priority_and_quoted_paths_survive_array_expansion(self):
         path = str(self.project / 'validation outputs')

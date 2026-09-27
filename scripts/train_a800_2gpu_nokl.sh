@@ -34,12 +34,16 @@ case "$TRAINING_MODE" in
   grpo)
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_grpo_4000_seed20260917}"
     OPSD_ENABLED=false; USE_VERL_V1=true
+    DEFAULT_LEARNING_RATE=1e-6
+    DEFAULT_ENTROPY_COEFF=0.001
     export WANDB_MODE="${WANDB_MODE:-online}"
     ;;
   grpo_opsd|groove)
     TRAINING_MODE=grpo_opsd
     DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/vstar_opsd_4000_seed20260917}"
     OPSD_ENABLED=true; USE_VERL_V1=false
+    DEFAULT_LEARNING_RATE=1e-6
+    DEFAULT_ENTROPY_COEFF=0.0
     export WANDB_MODE=offline
     ;;
   *) echo "TRAINING_MODE must be grpo or grpo_opsd (groove) for this two-GPU no-KL experiment." >&2; exit 2 ;;
@@ -60,7 +64,9 @@ RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 TRAIN_BATCH_SIZE=32
 PPO_MINI_BATCH_SIZE=32
 ROLLOUT_N=8
-LEARNING_RATE=1e-6
+# Pure GRPO restores the original learning rate while retaining the entropy bonus.
+LEARNING_RATE="${LEARNING_RATE:-$DEFAULT_LEARNING_RATE}"
+ENTROPY_COEFF="${ENTROPY_COEFF:-$DEFAULT_ENTROPY_COEFF}"
 PPO_CLIP_RATIO=0.2
 LOSS_AGG_MODE=token-mean
 MAX_PROMPT_LENGTH=9216
@@ -255,7 +261,7 @@ ACTOR=(
   actor_rollout_ref.actor.clip_ratio_low="$PPO_CLIP_RATIO"
   actor_rollout_ref.actor.clip_ratio_high="$PPO_CLIP_RATIO_HIGH"
   actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE"
-  actor_rollout_ref.actor.entropy_coeff=0.0
+  actor_rollout_ref.actor.entropy_coeff="$ENTROPY_COEFF"
   actor_rollout_ref.actor.use_dynamic_bsz=true
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU"
   actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD"

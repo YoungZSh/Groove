@@ -311,6 +311,9 @@ Analyzer 的行为约定定义在 `src/groove/analyzer.py` 中。
 本机另有明确的无 KL 两卡实验入口 `scripts/train_a800_2gpu_nokl.sh`：
 默认 GPU `0,3`，默认 `TRAINING_MODE=grpo_opsd`（别名 `groove`）启用 RLSD，
 显式设置 `TRAINING_MODE=grpo` 可选择纯 GRPO；
+下一次纯 GRPO 默认恢复学习率 `1e-6`、保留标准熵奖励系数 `0.001`，在 actor 损失中减去 `0.001 * H`。
+GRPO + OPSD 保持学习率 `1e-6`、熵系数 `0`；两者支持 `LEARNING_RATE`、`ENTROPY_COEFF` 覆盖。
+旧纯 GRPO 的 `1e-6`、熵系数 `0` 需显式覆盖，奖励和优势计算方式不变。
 默认 Python 为 `/data/home/yangzesheng/.conda/envs/groove/bin/python`，
 模型为 `/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`，均支持相应环境变量覆盖。
 该两卡入口默认 `NCCL_CUMEM_HOST_ENABLE=0` 并传给 Ray worker，规避本机通信初始化崩溃。
