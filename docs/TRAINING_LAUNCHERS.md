@@ -32,7 +32,9 @@ Qwen 保留 `enable_thinking=false`。GRPO + OPSD 默认仍使用 `8002/v1`，An
 Gemini 从 `GROOVE_JUDGE_ENV_FILE`（默认仓库 `.env`）读取 `OPENAI_BASE_URL`、
 `OPENAI_API_KEY` 和 `OPENAI_MODEL`，不把凭证写入 Hydra 配置或日志。
 Gemini 请求不传任何 thinking / reasoning_effort / chat_template_kwargs 参数，使用服务默认强度；
-温度 0、512-token 预算、唯一末尾 `Judgement: 0/1`、首次加 5 次重试及耗尽归零策略保持不变。
+Qwen 和 Gemini Judge 的默认温度统一为 0.3；512-token 预算、唯一末尾 `Judgement: 0/1`、
+首次加 5 次重试及耗尽归零策略保持不变。
+此温度调整适用于后续运行，已启动运行的源码快照保持原协议；跨温度比较须统一重评。
 训练及 V*Bench 验证共用这一 Judge，仍分别使用塑形奖励与原始语义准确率。
 GRPO + OPSD 默认继续使用 `GROOVE_JUDGE_PROVIDER=qwen`；可显式选择 provider。
 本次与上一轮同时改变学习率和 Judge，不能把分数差异全部归给学习率或熵奖励。
@@ -307,7 +309,7 @@ Judge 接收题目、全部有效选项以及标准答案的字母和文本，�
 把 Student 指令改为允许字母或答案文本，不改写文件；末尾 answer 标签约定保持不变。
 格式和重复仍记录为诊断；旧规则的结果另存为 `rule_accuracy`、`rule_unparsed`，不再决定得分。
 Judge 使用与训练相同的“简短依据 + 最终二值判定”协议、超时与重试。
-后续运行取消仅允许输出 `0/1` 的 choice 约束，生成预算为 512 tokens，温度仍为 0；
+后续运行取消仅允许输出 `0/1` 的 choice 约束，生成预算为 512 tokens，Judge 默认温度为 0.3；
 `enable_thinking=false` 下的依据是普通响应文本。解析器只读取唯一的末尾
 `Judgement: 0/1` 判定（允许紧接依据出现在同行，兼容旧版纯数字响应），
 缺失、冲突或生成截断时重试。

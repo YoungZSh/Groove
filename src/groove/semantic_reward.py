@@ -96,6 +96,7 @@ ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 ANSWER_TAG_PATTERN = re.compile(r"</?\s*answer\b[^>]*>", re.IGNORECASE)
 DEFAULT_ANSWER_REWARD_WEIGHT = 1.0
 DEFAULT_FORMAT_REWARD_WEIGHT = 0.2
+DEFAULT_JUDGE_TEMPERATURE = 0.3
 
 
 class RepetitionHit:
@@ -403,7 +404,7 @@ def _judge_one(
                 "content": judge_prompt(question, ground_truth, answer),
             },
         ],
-        "temperature": 0.0,
+        "temperature": DEFAULT_JUDGE_TEMPERATURE,
         "max_completion_tokens": 512,
     }
     if provider == "qwen":

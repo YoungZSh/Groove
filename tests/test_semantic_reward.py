@@ -43,7 +43,7 @@ class SemanticRewardLoopTest(unittest.TestCase):
             body = json.loads(sent.data)
             self.assertEqual(set(body), {'model', 'messages', 'temperature', 'max_completion_tokens'})
             self.assertEqual(body['model'], 'gemini-test')
-            self.assertEqual(body['temperature'], 0)
+            self.assertEqual(body['temperature'], 0.3)
             self.assertEqual(body['max_completion_tokens'], 512)
             self.assertEqual(result['accuracy'], 1)
             self.assertEqual(result['score'], 1)
@@ -182,6 +182,7 @@ class SemanticRewardLoopTest(unittest.TestCase):
         payload = {"choices": [{"message": {"content":
             "Reason: Both answers identify green as the color.\nJudgement: 1"}, "finish_reason": "stop"}]}
         environment = {
+            "GROOVE_JUDGE_PROVIDER": "qwen",
             "GROOVE_JUDGE_API_KEY": "test-key",
             "GROOVE_JUDGE_MAX_RETRIES": "0",
         }
@@ -194,6 +195,8 @@ class SemanticRewardLoopTest(unittest.TestCase):
 
         body = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(body["messages"][0]["content"], JUDGE_SYSTEM_PROMPT)
+        self.assertEqual(body["temperature"], 0.3)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertNotIn("structured_outputs", body)
         self.assertEqual(body["max_completion_tokens"], 512)
         self.assertEqual(result["score"], 1.0)

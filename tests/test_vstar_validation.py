@@ -125,6 +125,7 @@ class VStarValidationTest(unittest.TestCase):
                 self.assertEqual(result["format_reward_weight"], 0.0)
                 self.assertEqual(result["answer_reward_weight"], 1.0)
                 self.assertNotIn("structured_outputs", body)
+                self.assertEqual(body["temperature"], 0.3)
                 self.assertEqual(body["max_completion_tokens"], 512)
                 prompt = body["messages"][1]["content"]
                 self.assertIn("[Standard Answer]: (D) leather\n", prompt)

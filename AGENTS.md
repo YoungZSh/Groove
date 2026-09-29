@@ -198,7 +198,7 @@ V1 名义上的 epoch 用于确定优化器更新次数；DAPO 补充采样可�
   不要将新语义验证分数与旧规则验证分数直接作为同一评分协议比较。
 - 远程 Judge 返回的语义 `accuracy` 只能是 `0` 或 `1`。
 - 后续运行的 Judge 先输出一到三句简短依据，再以唯一的 `Judgement: 0/1`
-  行结束；请求保留温度 0 和 `enable_thinking=false`，生成预算为 512 tokens，
+  行结束；Judge 默认温度为 0.3，Qwen 保留 `enable_thinking=false`，生成预算为 512 tokens，
   不再使用二值 choice 约束解码。解析器只读取唯一的末尾判定，允许其紧接简短依据
   出现在同一行，兼容旧版纯数字响应；
   判定缺失、冲突或生成截断时重试。按用户指定的新运行策略，首次请求加默认 5 次重试
@@ -320,7 +320,8 @@ GRPO + OPSD 保持学习率 `1e-6`、熵系数 `0`；两者支持 `LEARNING_RATE
 上一轮半学习率/Gemini 配方可显式设置 `LEARNING_RATE=5e-7 GROOVE_JUDGE_PROVIDER=gemini`，
 从 `GROOVE_JUDGE_ENV_FILE`（默认 `.env`）读取 `OPENAI_BASE_URL/API_KEY/MODEL`。
 Gemini Judge 不传 thinking、reasoning_effort 或 chat_template_kwargs，使用 API 默认强度；
-保留温度 0、512 tokens、判定解析和重试耗尽策略。训练与验证共用此 Judge。
+Judge 默认温度为 0.3，保留 512 tokens、判定解析和重试耗尽策略。训练与验证共用此 Judge。
+温度调整适用于后续运行；已启动运行的源码快照保持原协议，跨温度比较须统一重评。
 GRPO + OPSD 默认 Qwen 地址仍为 `8002/v1`；比较新旧实验须注明学习率和 Judge 同时改变。
 默认 Python 为 `/data/home/yangzesheng/.conda/envs/groove/bin/python`，
 模型为 `/data/home/yangzesheng/models/ckpts/Qwen3.5-2B`，均支持相应环境变量覆盖。

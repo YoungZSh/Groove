@@ -98,8 +98,10 @@ judging, format shaping, and repetition handling live in
 For subsequent runs, the Judge retains the DeepEyes question/reference/answer
 comparison and semantic-equivalence principle, but explains its decision in one
 to three sentences before ending with `Judgement: 0` or `Judgement: 1`. Requests
-use temperature 0, a 512-token completion budget, and no binary-choice constrained
-decoding. `enable_thinking=false` remains set; the requested brief explanation is
+use temperature 0.3 for both Qwen and Gemini, a 512-token completion budget, and no binary-choice constrained
+decoding. This default applies to subsequent runs; existing runtime source snapshots
+retain their original protocol. Comparisons across Judge temperatures require consistent rescoring.
+Qwen keeps `enable_thinking=false`; the requested brief explanation is
 ordinary response text. Only the unique terminal verdict is used as `accuracy`;
 numbers in the explanation are never interpreted as scores. The unique terminal
 `Judgement` label may appear on the same line as the explanation; a standalone
