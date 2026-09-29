@@ -162,6 +162,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
+    train_vision_merger: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
@@ -327,6 +328,14 @@ class FSDPActorConfig(ActorConfig):
         # EngineConfig.strategy defaults to None, so without this, engine_workers.py always
         # falls back to FSDP1 even when actor.strategy="fsdp2".
         object.__setattr__(self.engine, "strategy", self.strategy)
+        if self.train_vision_merger and not self.freeze_vision_tower:
+            raise ValueError("train_vision_merger requires freeze_vision_tower=True")
+        if self.freeze_vision_tower and self.strategy != "fsdp":
+            raise ValueError("Vision freezing currently requires the FSDP1 engine")
+        if self.freeze_vision_tower and self.strategy == "fsdp" and not self.engine.use_orig_params:
+            raise ValueError("Vision freezing with FSDP1 requires fsdp_config.use_orig_params=True")
+        object.__setattr__(self.engine, "freeze_vision_tower", self.freeze_vision_tower)
+        object.__setattr__(self.engine, "train_vision_merger", self.train_vision_merger)
 
         # backward compatibility
         if self.ulysses_sequence_parallel_size > 1:

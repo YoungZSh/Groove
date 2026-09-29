@@ -16,6 +16,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import json
 import logging
 import os
 import warnings
@@ -477,7 +478,10 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        parameters = module.parameters()
+        if getattr(self.engine_config, "freeze_vision_tower", False):
+            parameters = (parameter for parameter in parameters if parameter.requires_grad)
+        optimizer = build_optimizer(parameters, self.optimizer_config)
 
         return optimizer
 
@@ -571,6 +575,17 @@ class FSDPEngine(BaseEngine):
 
         # Load base model with specified configuration and dtype
         module = self._build_module()
+        self._vision_freeze_report = None
+        self._vision_freeze_audited = False
+        if getattr(self.engine_config, "freeze_vision_tower", False):
+            if self._is_lora or self.engine_config.strategy != "fsdp" or not self.engine_config.use_orig_params:
+                raise ValueError("Qwen3.5 vision freezing currently requires full tuning with FSDP1 use_orig_params=True")
+            from verl.workers.utils.vision_freezing import freeze_qwen35_vision
+
+            self._vision_freeze_report = freeze_qwen35_vision(
+                module, train_merger=self.engine_config.train_vision_merger
+            )
+            print(f"vision_freeze_parameters rank={self.rank}: {json.dumps(self._vision_freeze_report)}", flush=True)
         try:
             self.pass_packed_cu_seqlens = "cu_seqlens" in signature(module.forward).parameters
         except (TypeError, ValueError):
@@ -785,6 +800,13 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        freeze_audit = None
+        if (getattr(self, "_vision_freeze_report", None) and not self._vision_freeze_audited
+                and torch.isfinite(grad_norm) and grad_norm > 0):
+            from verl.workers.utils.vision_freezing import capture_vision_update
+
+            freeze_audit = capture_vision_update(self.module)
+
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
@@ -796,6 +818,13 @@ class FSDPEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+
+        if freeze_audit is not None:
+            from verl.workers.utils.vision_freezing import verify_vision_update
+
+            audit = verify_vision_update(self.module, freeze_audit)
+            print(f"vision_freeze_update_audit rank={self.rank}: {json.dumps(audit)}", flush=True)
+            self._vision_freeze_audited = True
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

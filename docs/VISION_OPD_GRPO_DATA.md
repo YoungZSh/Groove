@@ -42,3 +42,33 @@ PYTHONPATH="$PWD/src" /data/home/yangzesheng/.conda/envs/groove/bin/python \
 在停止 GPU 0/8000、GPU 3/8003 推理前先启动独立恢复监控。训练正常或异常退出后，
 只清理本次带唯一标记的进程并恢复原启动脚本，实际请求通过后记录 `RESTORED`。
 GPU 1、2 不参与；恢复需要模型加载时间。
+
+## 冻结 ViT、训练 merger 和 LLM 的无熵对照
+
+2026-09-29 用户指定的新实验保持同一份 3,000 条数据、基础 2B 模型和学习率，
+关闭熵奖励与 KL，同时把 PPO clip 上限从 0.2 改为 0.3、下限保持 0.2。
+冻结范围与 clip 上限同时变化，结果不能单独归因于冻结 ViT。
+
+两卡启动器通过以下环境覆盖选择这组行为，默认训练行为保持不变：
+
+```text
+TRAINING_MODE=grpo
+ENTROPY_COEFF=0
+FREEZE_VISION_TOWER=true
+TRAIN_VISION_MERGER=true
+PPO_CLIP_RATIO_HIGH=0.3
+```
+
+`FSDPActorConfig` 把两个视觉开关传给实际 FSDP engine。加载模型之后、FSDP 包装之前，
+先冻结 `model.visual` 全部参数，再只解冻 `model.visual.merger`；
+`model.language_model` 与 `lm_head` 保持可训练。当前实现明确支持 Qwen3.5 dense/MoE
+布局的 FSDP1 全参数训练；不支持的布局、LoRA 或引擎组合会报错，避免空开关。
+FSDP1 为混合冻结/训练参数使用 `use_orig_params=True`，启动器在启用冻结时默认设置它。
+优化器排除冻结参数；视觉前向仍然执行，Student 的输入边界不变。
+
+每个 rank 在初始化时打印 `vision_freeze_parameters`，报告 ViT、merger、LLM 的
+总参数量和可训练量。第一次有非零有限梯度的更新打印 `vision_freeze_update_audit`：
+验证冻结参数没有梯度、优化前后本 rank 冻结分片的 SHA256 完全相同，并记录 merger/LLM
+局部梯度范数和参数样本变化。merger 可能只分布在其中一个 rank，应汇总两卡判断其更新。
+后续更新继续依赖 `requires_grad=False` 和优化器参数排除保证冻结。
+实现及回归检查见 `src/verl/workers/utils/vision_freezing.py` 和 `tests/test_vision_freezing.py`。

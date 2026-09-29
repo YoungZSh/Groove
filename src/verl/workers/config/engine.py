@@ -255,6 +255,8 @@ class FSDPEngineConfig(EngineConfig):
         forward_prefetch (bool): Whether to prefetch parameters for next forward pass, default False
         model_dtype (str): Model data type used to initialize the transformers model. default "fp32"
         use_orig_params (bool): Whether to use original parameters when initialize FSDP1, default False
+        freeze_vision_tower (bool): Freeze the Qwen3.5 visual subtree before FSDP wrapping, default False.
+        train_vision_merger (bool): Reopen its merger when freezing vision, default False.
         seed (int): Random seed for reproducibility.
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
             in distributed training. Important: this will negatively impact performance, so only use it for
@@ -288,6 +290,8 @@ class FSDPEngineConfig(EngineConfig):
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False
+    freeze_vision_tower: bool = False
+    train_vision_merger: bool = False
     mixed_precision: Optional[dict[str, Any]] = None
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False

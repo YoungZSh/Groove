@@ -53,7 +53,8 @@ case "$TRAINING_MODE" in
   *) echo "TRAINING_MODE must be grpo or grpo_opsd (groove) for this two-GPU no-KL experiment." >&2; exit 2 ;;
 esac
 DYNAMIC_SAMPLING=false
-USE_REFERENCE_KL=false; REFERENCE_KL_COEF=0.0; PPO_CLIP_RATIO_HIGH=0.2
+USE_REFERENCE_KL=false; REFERENCE_KL_COEF=0.0
+PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
 REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-$DEFAULT_REWARD_NUM_WORKERS}"
 TRAIN_FILE="$DATA_DIR/train.parquet"
 TEST_FILE="${VALIDATION_FILE:-$PROJECT_ROOT/data/vstar_bench/validation.parquet}"
@@ -71,6 +72,10 @@ ROLLOUT_N=8
 # Pure GRPO restores the original learning rate while retaining the entropy bonus.
 LEARNING_RATE="${LEARNING_RATE:-$DEFAULT_LEARNING_RATE}"
 ENTROPY_COEFF="${ENTROPY_COEFF:-$DEFAULT_ENTROPY_COEFF}"
+FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
+TRAIN_VISION_MERGER="${TRAIN_VISION_MERGER:-false}"
+# FSDP1 requires original parameters for mixed frozen/trainable modules.
+FSDP_USE_ORIG_PARAMS="${FSDP_USE_ORIG_PARAMS:-$FREEZE_VISION_TOWER}"
 PPO_CLIP_RATIO=0.2
 LOSS_AGG_MODE=token-mean
 MAX_PROMPT_LENGTH=9216
@@ -278,6 +283,9 @@ ACTOR=(
   actor_rollout_ref.actor.clip_ratio_high="$PPO_CLIP_RATIO_HIGH"
   actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE"
   actor_rollout_ref.actor.entropy_coeff="$ENTROPY_COEFF"
+  actor_rollout_ref.actor.freeze_vision_tower="$FREEZE_VISION_TOWER"
+  actor_rollout_ref.actor.train_vision_merger="$TRAIN_VISION_MERGER"
+  actor_rollout_ref.actor.fsdp_config.use_orig_params="$FSDP_USE_ORIG_PARAMS"
   actor_rollout_ref.actor.use_dynamic_bsz=true
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU"
   actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD"

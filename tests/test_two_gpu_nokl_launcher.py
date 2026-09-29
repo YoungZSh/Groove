@@ -216,6 +216,25 @@ class TwoGpuNoKlLauncherTest(unittest.TestCase):
         self.assertEqual(captured['args'][-1], 'actor_rollout_ref.actor.entropy_coeff=0.002')
         self.assertFalse(need_reference_policy(config))
 
+    def test_frozen_vit_keeps_merger_trainable_and_only_changes_upper_clip(self):
+        from verl.utils.config import omega_conf_to_dataclass
+
+        env = {'TRAINING_MODE': 'grpo', 'ENTROPY_COEFF': '0',
+               'FREEZE_VISION_TOWER': 'true', 'TRAIN_VISION_MERGER': 'true',
+               'PPO_CLIP_RATIO_HIGH': '0.3'}
+        _, config = self.config(self.launch(env))
+        actor = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+        self.assertTrue(actor.engine.freeze_vision_tower)
+        self.assertTrue(actor.engine.train_vision_merger)
+        self.assertTrue(actor.engine.use_orig_params)
+        self.assertEqual(actor.entropy_coeff, 0)
+        self.assertEqual(actor.clip_ratio_low, .2)
+        self.assertEqual(actor.clip_ratio_high, .3)
+        self.assertFalse(actor.use_kl_loss)
+        self.assertFalse(config.algorithm.use_kl_in_reward)
+        _, overridden = self.config(self.launch(env, ('actor_rollout_ref.actor.clip_ratio_high=0.25',)))
+        self.assertEqual(overridden.actor_rollout_ref.actor.clip_ratio_high, .25)
+
     def test_judge_provider_override_and_missing_gemini_credentials_file(self):
         _, config = self.config(self.launch({'TRAINING_MODE': 'grpo', 'GROOVE_JUDGE_PROVIDER': 'gemini',
                                              'LEARNING_RATE': '5e-7'}))
