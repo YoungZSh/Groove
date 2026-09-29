@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -91,6 +92,49 @@ def pane_info(service):
     return pid, bool(dead)
 
 
+def resume_checkpoint(config):
+    """Accept only an explicit complete checkpoint, while keeping a new output run."""
+    env = config["training_env"]
+    mode = env.get("RESUME_MODE", "disable")
+    if mode == "disable":
+        return None
+    if mode != "resume_path":
+        raise ValueError("Service handoff resume requires RESUME_MODE=resume_path")
+    source = Path(env.get("RESUME_FROM_PATH", ""))
+    if (not source.is_absolute() or not source.name.startswith("global_step_")
+            or not source.name.removeprefix("global_step_").isdigit()):
+        raise ValueError("RESUME_FROM_PATH must name an absolute global_step_N checkpoint")
+    world_size = len(config["gpus"])
+    required = [source / "data.pt", source / "actor/fsdp_config.json"]
+    required.extend(source / "actor" / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
+                    for rank in range(world_size) for kind in ("model", "optim", "extra_state"))
+    if any(not path.is_file() or path.stat().st_size == 0 for path in required):
+        raise ValueError("Resume requires complete model, optimizer, RNG and dataloader checkpoints")
+    if json.loads((source / "actor/fsdp_config.json").read_text())["world_size"] != world_size:
+        raise ValueError("Resume checkpoint world size differs from the selected GPUs")
+    best = source.parent / "best_checkpoint"
+    if (best / "metadata.json").exists():
+        metadata = json.loads((best / "metadata.json").read_text())
+        if metadata["path"] != f"global_step_{int(metadata['step'])}":
+            raise ValueError("Invalid inherited best checkpoint path")
+        snapshot = best / metadata["path"]
+        if not (snapshot / "data.pt").is_file() or not (snapshot / "actor").is_dir():
+            raise ValueError("Inherited best checkpoint is incomplete")
+    return source
+
+
+def inherit_best_checkpoint(config):
+    source = resume_checkpoint(config)
+    if source is None or not (source.parent / "best_checkpoint/metadata.json").is_file():
+        return
+    destination = Path(config["project_root"]) / "checkpoints" / config["experiment"]
+    # Separate copies preserve the old run when the new best is replaced later.
+    destination.mkdir(parents=True, exist_ok=False)
+    shutil.copytree(source.parent / "best_checkpoint", destination / "best_checkpoint")
+    save(config["output_dir"], "resume_lineage", source_checkpoint=str(source),
+         inherited_best=json.loads((destination / "best_checkpoint/metadata.json").read_text()))
+
+
 def validate(config):
     if len(config["gpus"]) != 2 or len(set(config["gpus"])) != 2:
         raise ValueError("This handoff requires exactly two distinct GPUs")
@@ -123,6 +167,7 @@ def validate(config):
     checkpoint = Path(config["project_root"]) / "checkpoints" / config["experiment"]
     if checkpoint.exists():
         raise ValueError("Use a new experiment name")
+    resume_checkpoint(config)
 
 
 def stop_original(service):
@@ -154,6 +199,8 @@ def run_training(config, config_path):
     folder = Path(config["output_dir"])
     lock = (folder / "runner.lock").open("a+")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Finish checkpoint preparation before arming the watchdog or stopping services.
+    inherit_best_checkpoint(config)
     runner = {"pid": os.getpid(), "start_ticks": process_identity(os.getpid())}
     save(folder, "runner", **runner)
     watchdog_command = shlex.join([sys.executable, "-u", str(Path(__file__).resolve()),

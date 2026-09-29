@@ -18,6 +18,66 @@ sys.path.pop(0)
 
 
 class TrainingServiceHandoffTest(unittest.TestCase):
+    def make_resume_config(self, folder):
+        root = Path(folder)
+        source = root / 'checkpoints/old/global_step_5'
+        (source / 'actor').mkdir(parents=True)
+        (source / 'data.pt').write_bytes(b'dataloader')
+        (source / 'actor/fsdp_config.json').write_text(json.dumps({'world_size': 2}))
+        for rank in (0, 1):
+            for kind in ('model', 'optim', 'extra_state'):
+                (source / 'actor' / f'{kind}_world_size_2_rank_{rank}.pt').write_bytes(b'checkpoint')
+        return {'project_root': str(root), 'output_dir': str(root), 'experiment': 'resumed',
+                'gpus': [0, 3], 'training_env': {'RESUME_MODE': 'resume_path',
+                                               'RESUME_FROM_PATH': str(source)}}
+
+    def test_explicit_resume_requires_all_rank_states_and_dataloader(self):
+        with TemporaryDirectory() as folder:
+            config = self.make_resume_config(folder)
+            source = Path(config['training_env']['RESUME_FROM_PATH'])
+            self.assertEqual(handoff.resume_checkpoint(config), source)
+            (source / 'actor/optim_world_size_2_rank_1.pt').unlink()
+            with self.assertRaisesRegex(ValueError, 'complete model, optimizer'):
+                handoff.resume_checkpoint(config)
+
+    def test_resume_rejects_implicit_auto_and_mismatched_world_size(self):
+        with TemporaryDirectory() as folder:
+            config = self.make_resume_config(folder)
+            config['training_env']['RESUME_MODE'] = 'auto'
+            with self.assertRaisesRegex(ValueError, 'resume_path'):
+                handoff.resume_checkpoint(config)
+            config['training_env']['RESUME_MODE'] = 'resume_path'
+            source = Path(config['training_env']['RESUME_FROM_PATH'])
+            (source / 'actor/fsdp_config.json').write_text(json.dumps({'world_size': 4}))
+            with self.assertRaisesRegex(ValueError, 'world size'):
+                handoff.resume_checkpoint(config)
+
+    def test_resume_copies_best_threshold_without_linking_or_overwriting_old_run(self):
+        with TemporaryDirectory() as folder:
+            config = self.make_resume_config(folder)
+            source = Path(config['training_env']['RESUME_FROM_PATH'])
+            best = source.parent / 'best_checkpoint'
+            (best / 'global_step_0/actor').mkdir(parents=True)
+            (best / 'global_step_0/data.pt').write_bytes(b'original-data')
+            (best / 'global_step_0/actor/model.pt').write_bytes(b'original-model')
+            metadata = {'metric': 'val-core/vstar_bench/reward/mean@1', 'mode': 'max',
+                        'value': .81, 'step': 0, 'path': 'global_step_0'}
+            (best / 'metadata.json').write_text(json.dumps(metadata))
+            handoff.inherit_best_checkpoint(config)
+            copied = Path(folder) / 'checkpoints/resumed/best_checkpoint'
+            self.assertEqual(json.loads((copied / 'metadata.json').read_text()), metadata)
+            (copied / 'global_step_0/actor/model.pt').write_bytes(b'changed')
+            self.assertEqual((best / 'global_step_0/actor/model.pt').read_bytes(), b'original-model')
+            with self.assertRaises(FileExistsError):
+                handoff.inherit_best_checkpoint(config)
+
+    def test_fresh_handoff_does_not_inherit_checkpoints(self):
+        with TemporaryDirectory() as folder:
+            config = {'project_root': folder, 'experiment': 'fresh', 'training_env': {}}
+            self.assertIsNone(handoff.resume_checkpoint(config))
+            handoff.inherit_best_checkpoint(config)
+            self.assertFalse((Path(folder) / 'checkpoints').exists())
+
     def test_cleanup_only_signals_exact_tagged_process_and_preserves_other_process(self):
         marker = "handoff-test-" + str(os.getpid())
         tagged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],

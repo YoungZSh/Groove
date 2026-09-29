@@ -74,6 +74,14 @@ TRAINING_MODE=grpo EXPERIMENT_NAME=qwen35-2b-grpo-nokl-2gpu-unique-run \
 模型、上下文长度、端口及推理参数沿用原服务；恢复后执行实际推理请求确认可用。
 这一接管需要用户明确授权停止服务和启动训练；GPU 1、2 不参与。模型重载期间存在短暂启动时间。
 
+用户明确要求续训时，接管配置可设置 `RESUME_MODE=resume_path` 与绝对路径
+`RESUME_FROM_PATH=.../global_step_N`，同时使用新的实验名和进程标记，避免覆盖旧日志或回答。
+接管前核验各 rank 的模型、优化器、随机状态、world size 和 `data.pt`；只恢复完整检查点。
+原最佳快照及其阈值会独立复制到新分段，后续最佳轮换不影响旧运行。
+这一步在停止推理服务前完成。`TOTAL_STEPS` 仍指整个训练的目标步数，
+例如从 Step 5 恢复、目标 125 时，从 Step 6 继续；可以关闭重复的训练前验证。
+接管入口不接受隐式 `RESUME_MODE=auto`，也不复用已有输出实验目录。
+
 历史 GPU 1、2 训练配置中，当 GPU 3 需要持续提供推理时，服务监督器应拆分为 GPU 3 与 GPU 1–2 两个实例。
 GPU 3 实例通过 `existing_services` 接管原 PID，不重启服务。训练前只停止 GPU 1–2
 服务；训练结束后只恢复这两张卡，其恢复配置使用 `training_world_size=2`。
